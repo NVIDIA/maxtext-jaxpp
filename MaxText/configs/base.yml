@@ -124,7 +124,6 @@ logical_axis_rules: [
                       ['activation_vocab', 'sequence'],
                       ['mlp', ['fsdp_transpose', 'tensor', 'autoregressive']],
                       ['vocab', ['tensor', 'autoregressive']],
-                      ['embed', 'tensor'],
                       ['embed', ['fsdp', 'fsdp_transpose', 'sequence']],
                       ['embed', ['fsdp', 'sequence']],
                       ['norm', 'tensor'],
