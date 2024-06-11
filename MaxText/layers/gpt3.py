@@ -239,7 +239,7 @@ class Gpt3MultiHeadAttention(nn.Module):
         dtype=self.dtype,
     )
 
-    out = attention_op(query, key, value, decoder_segment_ids, model_mode)
+    out = attention_op(query, key, value, decoder_segment_ids, model_mode, deterministic)
 
     out = nn.with_logical_constraint(out, self.out_axis_names)
 

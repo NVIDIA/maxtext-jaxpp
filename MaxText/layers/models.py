@@ -28,6 +28,7 @@ from layers import attentions
 from layers import embeddings
 from layers import linears
 from layers import normalizations, quantizations
+import jaxpp.api as jaxpp
 
 Array = common_types.Array
 Config = common_types.Config
@@ -263,9 +264,12 @@ class Decoder(nn.Module):
                 "context",
             ),
         )
+      elif cfg.remat_policy == 'dots_saveable':
+        policy = jax.checkpoint_policies.dots_saveable
       else:
         assert cfg.remat_policy == "full", "Remat policy needs to be on list of remat policies"
         policy = None
+      OriginalBlockLayer = BlockLayer
       BlockLayer = nn.remat(  # pylint: disable=invalid-name
           BlockLayer,
           prevent_cse=not cfg.scan_layers,
@@ -305,8 +309,19 @@ class Decoder(nn.Module):
           model_mode,
       )
     else:
+      if cfg.use_jaxpp:
+        layers_per_stage = cfg.num_decoder_layers // cfg.num_stages
       for lyr in range(cfg.num_decoder_layers):
-        y = BlockLayer(config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant)(
+        if cfg.use_jaxpp:
+          s, enter = divmod(lyr, layers_per_stage)
+          if enter == 0 and lyr > 0 and s < cfg.num_stages:
+            print(f"ENTER STAGE {s} at {lyr}/{cfg.num_decoder_layers}")
+            y = jaxpp.pipeline_enter_stage(y, f"stage_{s}", s)
+        if cfg.remat_policy != 'none' and cfg.use_jaxpp:
+          block_layer = BlockLayer if s < cfg.num_stages - 1 else OriginalBlockLayer
+        else:
+          block_layer = BlockLayer
+        y = block_layer(config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant)(
             y,
             decoder_segment_ids,
             decoder_positions,

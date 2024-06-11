@@ -97,7 +97,6 @@ def _maybe_aqt_einsum(quant: Quant):
   """Maybe overwrite dot general with aqt_dot_general."""
   return jnp.einsum if quant is None else quant.einsum()
 
-
 class AttentionOp(nn.Module):
   mesh: Mesh
   attention_kernel: str
@@ -159,7 +158,7 @@ class AttentionOp(nn.Module):
 
     return jnp.where(output_mask, 0.0, DEFAULT_MASK_VALUE) if output_mask is not None else None
 
-  def apply_attention(self, query: Array, key: Array, value: Array, decoder_segment_ids: Array | None, model_mode: str):
+  def apply_attention(self, query: Array, key: Array, value: Array, decoder_segment_ids: Array | None, model_mode: str, deterministic: bool):
     self.check_attention_inputs(query, key, value)
     length = query.shape[-3]
     if (
@@ -182,8 +181,79 @@ class AttentionOp(nn.Module):
                            Use `dot_product` instead."""
         )
       return self.cudnn_flash_attention(query, key, value, decoder_segment_ids, model_mode), None, None
+    elif self.attention_kernel == "jaxpp_te":
+      if model_mode == common_types.MODEL_MODE_AUTOREGRESSIVE:
+        raise ValueError(
+            """Decode not supported with flash attention.
+                           Use `dot_product` instead."""
+        )
+      return self.te_flash_attention(query, key, value, decoder_segment_ids, model_mode, deterministic), None, None
+    elif self.attention_kernel == "jaxpp_cudnn_stablehlo":
+      if model_mode == common_types.MODEL_MODE_AUTOREGRESSIVE:
+        raise ValueError(
+            """Decode not supported with flash attention.
+                           Use `dot_product` instead."""
+        )
+      return self.cudnn_stablehlo_attention(query, key, value, decoder_segment_ids, model_mode), None, None
     else:
       raise ValueError(f"Unexpected attention kernel {self.attention_kernel=}.")
+
+  def te_flash_attention(self, query: Array, key: Array, value: Array, decoder_segment_ids: Array | None, model_mode: str, deterministic: bool) -> Array:
+    from transformer_engine.jax.fused_attn import fused_attn, AttnBiasType, AttnMaskType
+
+    mask = self.generate_attention_mask(query, key, decoder_segment_ids, model_mode)
+
+    dropout_rng = None
+    te_seed = jnp.zeros(2, dtype=jnp.uint32)
+    if not deterministic and self.dropout_rate > 0.0:
+        dropout_rng = self.make_rng("dropout")
+        te_seed = jax.random.split(dropout_rng, self.mesh.size)
+
+    def self_attention_call(q, k, v, mask):
+      return fused_attn(
+              q=q,
+              k=k,
+              v=v,
+              bias=None,
+              mask=mask,
+              seed=te_seed,
+              attn_bias_type=AttnBiasType.NO_BIAS,
+              attn_mask_type=AttnMaskType.CAUSAL_MASK, # TODO: maybe handle padding
+              scaling_factor=1 / math.sqrt(q.shape[-1]),
+              dropout_probability=self.dropout_rate,
+              is_training=(common_types.MODEL_MODE_TRAIN == model_mode) and not deterministic
+            )
+
+    sharded_self_attention = shard_map(
+      self_attention_call,
+      mesh=self.mesh,
+      in_specs=(*((nn.spmd.logical_to_mesh_axes((BATCH, LENGTH, HEAD, None)),) * 3), jax.sharding.PartitionSpec()),
+      out_specs=nn.spmd.logical_to_mesh_axes((BATCH, LENGTH, HEAD, None)),
+      check_rep=False,
+    )
+
+    return sharded_self_attention(query, key, value, mask)
+
+  def cudnn_stablehlo_attention(self, query: Array, key: Array, value: Array, decoder_segment_ids: Array | None, model_mode: str) -> Array:
+    from jaxpp.support.serializable_hlo_attention import self_attention
+    _, _, _, head_dim = query.shape  # pylint: disable=unused-variable
+    if decoder_segment_ids is None:
+      mask = None
+    else:
+      # FIXME create right mask as sdpa expects and set `has_mask = True`
+      mask = None
+
+    return self_attention(
+      query=query,
+      key=key,
+      value=value,
+      bias=jnp.zeros(0, dtype=query.dtype),
+      mask=mask,
+      scale=1.0 / math.sqrt(head_dim),
+      seed=42, # `self.make_rng("aqt")`, # TODO it seems sdpa doesn't support dynamic seed
+      dropout_rate=self.dropout_rate,
+      is_training = model_mode == common_types.MODEL_MODE_TRAIN
+    )
 
   def tpu_flash_attention(self, query: Array, key: Array, value: Array, decoder_segment_ids: Array | None) -> Array:
     """TPU Flash Attention."""
@@ -826,7 +896,7 @@ class AttentionOp(nn.Module):
     return attn_out
 
   @nn.compact
-  def __call__(self, query, key, value, decoder_segment_ids, model_mode):
+  def __call__(self, query, key, value, decoder_segment_ids, model_mode, deterministic):
     prefill_kv_cache, ar_kv_cache = self.kv_cache(key, value, decoder_segment_ids, model_mode)
 
     prefill_unnormalized_output, prefill_exponentials_max, prefill_exponentials_sum = self.apply_attention(
@@ -835,6 +905,7 @@ class AttentionOp(nn.Module):
         value=prefill_kv_cache[1],
         decoder_segment_ids=prefill_kv_cache[2],
         model_mode=model_mode,
+        deterministic=deterministic,
     )
 
     # Return the "prefill" cache if it actually the combined prefill+ar kv cache
@@ -1068,7 +1139,7 @@ class Attention(nn.Module):
         ar_value_axis_order = self.ar_value_axis_order,
     )
 
-    out = attention_op(query, key, value, decoder_segment_ids, model_mode)
+    out = attention_op(query, key, value, decoder_segment_ids, model_mode, deterministic)
 
     out = nn.with_logical_constraint(out, self.out_axis_names)
 
