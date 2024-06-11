@@ -32,9 +32,9 @@ OVERWRITE_WITH_GRADIENT = "_overwrite_with_gradient"
 
 def get_functional_train_with_signature(train_step, mesh, state_mesh_annotations, model, config):
   """Get the shardings (both state and data) for train_step"""
-  functional_train = get_functional_train_step(train_step, model, config)
+  functional_train = get_functional_train_step(train_step, model, config, state_pspec=state_mesh_annotations)
   functional_train.__name__ = "train_step"
-  data_pspec = P(*config.data_sharding)
+  data_pspec = P(None, None, *config.data_sharding) if config.use_jaxpp else P(*config.data_sharding)
   state_mesh_shardings = jax.tree_util.tree_map(lambda p: jax.sharding.NamedSharding(mesh, p), state_mesh_annotations)
   data_sharding = jax.tree_util.tree_map(lambda p: jax.sharding.NamedSharding(mesh, p), data_pspec)
   in_shardings = (state_mesh_shardings, data_sharding, None)  # State, batch, rng
@@ -43,9 +43,8 @@ def get_functional_train_with_signature(train_step, mesh, state_mesh_annotations
   donate_argnums = 0  # This is the index of the state - we allow the compiler to make use of this memory.
   return functional_train, in_shardings, out_shardings, static_argnums, donate_argnums
 
-
-def get_functional_train_step(train_step, model, config):
-  return functools.partial(train_step, model, config)
+def get_functional_train_step(train_step, model, config, state_pspec):
+  return functools.partial(train_step, model, config, state_pspec=state_pspec)
 
 
 def get_functional_eval_with_signature(eval_step, mesh, state_mesh_annotations, model, config):

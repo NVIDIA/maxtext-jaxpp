@@ -52,7 +52,7 @@ _yaml_types_to_parser = {str: str, int: int, float: float, bool: string_to_bool}
 
 
 def validate_attention_type(s: str) -> None:
-  valid_attention_types = ("autoselected", "dot_product", "flash", "cudnn_flash_te")
+  valid_attention_types = ("autoselected", "dot_product", "flash", "cudnn_flash_te", "jaxpp_cudnn_stablehlo", "jaxpp_te")
   if s not in valid_attention_types:  # currently supported attention
     raise ValueError("Invalid attention type was passed. Valid options ", valid_attention_types)
 
@@ -275,6 +275,10 @@ class _HyperParameters:
     raw_keys["logical_axis_rules"] = _lists_to_tuples(raw_keys["logical_axis_rules"])
     raw_keys["data_sharding"] = _lists_to_tuples(raw_keys["data_sharding"])
 
+    # JaxPP related
+    if raw_keys["use_jaxpp"]:
+        raw_keys["num_stages"] = raw_keys["num_workers"] if raw_keys["num_stages"] < 0 else raw_keys["num_stages"]
+
     validate_keys(raw_keys)
     validate_data_input(raw_keys)
 
@@ -292,7 +296,7 @@ class _HyperParameters:
     decay_end_step = math.ceil(108600.0 * 1536 / global_batch_size - 1e-6)
     raw_keys["learning_rate_schedule_steps"] = decay_end_step
     raw_keys["warmup_steps_fraction"] = warmup_steps / decay_end_step
-    global_batch_size_to_train_on = calculate_global_batch_sizes(raw_keys)[1]
+    global_batch_size_to_train_on = global_batch_size
     raw_keys["eval_interval"] = math.ceil(24567 / global_batch_size_to_train_on)
 
   @staticmethod
@@ -376,6 +380,9 @@ def calculate_global_batch_sizes(raw_keys):
 
 
 def get_num_target_devices(raw_keys):
+  if raw_keys["use_jaxpp"]:
+    from jaxpp.mesh import JaxWorkerMesh
+    return JaxWorkerMesh.current_worker_mesh().remote_mesh.size
   compile_topology = accelerator_to_spec_map.get_system_characteristics(raw_keys.get("compile_topology", ""))
   if compile_topology is not None:
     devices_per_slice = compile_topology.devices_per_slice
@@ -385,6 +392,8 @@ def get_num_target_devices(raw_keys):
 
 
 def get_num_slices(raw_keys):
+  if raw_keys["use_jaxpp"]:
+      return 0
   if int(raw_keys["compile_topology_num_slices"]) > 0:
     return raw_keys["compile_topology_num_slices"]
   else:

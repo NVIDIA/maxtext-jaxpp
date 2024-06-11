@@ -48,7 +48,7 @@ force_unroll: False # during generate_param_only_checkpoint should we unroll the
 ############################### END CHECKPOINTING ##################################
 
 
-reuse_example_batch: 0 # for testing TPU performance, this options repeated uses the same batch.
+reuse_example_batch: 1 # for testing TPU performance, this options repeated uses the same batch.
 
 metrics_file: "" # for testing, local file that stores scalar metrics. If empty, no metrics are written.
 # If true save metrics such as loss and TFLOPS to GCS in {base_output_directory}/{run_name}/metrics/
@@ -90,7 +90,7 @@ logits_dot_in_fp32: True  # whether to use fp32 in logits_dense or shared_embedd
 # Choose 'remat_policy' between 'minimal', 'save_dot_except_mlpwi', 'save_dot_except_mlp', 'save_qkv_proj', 'qkv_proj_offloaded', 'minimal_offloaded' and 'full'.
 # These options offer a trade-off between speed (fastest to slowest) and HBM usage (highest to lowest)
 remat_policy: 'full'
-scan_layers: True
+scan_layers: False
 param_scan_axis: 1
 attention: 'autoselected' # Supported attention: autoselected, dot_product, flash, cudnn_flash_te
 
@@ -111,7 +111,7 @@ jax_cache_dir: "~/jax_cache"
 hardware: 'tpu' # Supported hardware types are 'tpu', 'gpu', 'gpu_multiprocess' and 'cpu'
 
 # Parallelism
-mesh_axes: ['data', 'fsdp', 'fsdp_transpose', 'sequence', 'tensor', 'autoregressive']
+mesh_axes: ['data', 'fsdp', 'fsdp_transpose', 'sequence', 'autoregressive', 'tensor']
 logical_axis_rules: [
                       ['activation_batch', ['data', 'fsdp', 'fsdp_transpose',]],
                       ['activation_heads', ['tensor','sequence']],
@@ -124,6 +124,7 @@ logical_axis_rules: [
                       ['activation_vocab', 'sequence'],
                       ['mlp', ['fsdp_transpose', 'tensor', 'autoregressive']],
                       ['vocab', ['tensor', 'autoregressive']],
+                      ['embed', 'tensor'],
                       ['embed', ['fsdp', 'fsdp_transpose', 'sequence']],
                       ['embed', ['fsdp', 'sequence']],
                       ['norm', 'tensor'],
@@ -134,7 +135,7 @@ logical_axis_rules: [
                       ['cache_kv', []],
                       ['cache_sequence', []],
                     ]
-data_sharding: [['data', 'fsdp', 'fsdp_transpose', 'sequence', 'tensor', 'autoregressive']]
+data_sharding: [['data']]
 
 # One axis for each parallelism type may hold a placeholder (-1)
 # value to auto-shard based on available slices and devices.
@@ -147,7 +148,7 @@ dcn_sequence_parallelism: 1  # never recommended
 dcn_tensor_parallelism: 1 # never recommended
 dcn_autoregressive_parallelism: 1 # never recommended
 ici_data_parallelism: 1
-ici_fsdp_parallelism: -1 # recommended ICI axis to be auto-sharded
+ici_fsdp_parallelism: 1 # recommended ICI axis to be auto-sharded
 ici_fsdp_transpose_parallelism: 1
 ici_sequence_parallelism: 1
 ici_tensor_parallelism: 1
@@ -261,6 +262,16 @@ decode_sampling_temperature: 1.
 
 eval_interval: -1  # the specific number of train step between eval_step
 target_eval_loss: 0.  # early stop once reaching target eval_loss
+
+## BEGIN: JaxPP related parameters
+use_jaxpp: False
+distributed_initialization: False
+num_workers: 1
+num_stages: -1
+num_microbatches: 1
+schedule: "eager_1f1b"
+use_pgle: True
+## END: JaxPP related parameters
 
 # Goodput parameters
 enable_goodput_recording: False

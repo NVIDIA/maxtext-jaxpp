@@ -23,11 +23,13 @@ import socket
 import subprocess
 
 import max_logging
+import logging
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.experimental import mesh_utils
+from jaxpp.mesh import JaxWorkerMesh
 
 
 import json
@@ -43,6 +45,7 @@ from typing import Tuple
 from tensorboardX import writer
 
 from google.cloud import storage
+import tensorflow as tf
 
 
 def find_nans_and_infs(pytree):
@@ -200,9 +203,28 @@ def maybe_initialize_jax_distributed_system(raw_keys):
     jax.distributed.initialize()
     max_logging.log("Jax distributed system initialized!")
   elif is_gpu_backend(raw_keys):
-    max_logging.log("Attempting to initialize the jax distributed system for GPU backend...")
-    initialize_jax_for_gpu()
-    max_logging.log("Jax distributed system initialized on GPU!")
+    if raw_keys["use_jaxpp"]:
+      # Need to clear all backends as pyconfig has initialized once
+      JaxWorkerMesh._push_current_worker_mesh(JaxWorkerMesh(
+        (raw_keys["dcn_data_parallelism"], raw_keys["num_workers"]),
+        (
+          raw_keys["ici_data_parallelism"],
+          raw_keys["ici_fsdp_parallelism"],
+          raw_keys["ici_fsdp_transpose_parallelism"],
+          raw_keys["ici_sequence_parallelism"],
+          raw_keys["ici_autoregressive_parallelism"],
+          raw_keys["ici_tensor_parallelism"],
+        ),
+        raw_keys["mesh_axes"],
+        import_modules=["transformer_engine.jax.cpp_extensions"],
+      ))
+      tf.config.set_visible_devices([], "GPU")
+      jax.config.update("jax_default_prng_impl", "unsafe_rbg")
+      jax.config.update("jax_default_device", jax.local_devices(backend="cpu")[0])
+    else:
+      max_logging.log("Attempting to initialize the jax distributed system for GPU backend...")
+      initialize_jax_for_gpu()
+      max_logging.log("Jax distributed system initialized on GPU!")
   elif is_cpu_backend(raw_keys):
     max_logging.log("Attempting to initialize the jax distributed system for CPU backend...")
     initialize_jax_for_cpu()
@@ -321,8 +343,8 @@ def create_device_mesh(config, devices=None):
       config.ici_fsdp_parallelism,
       config.ici_fsdp_transpose_parallelism,
       config.ici_sequence_parallelism,
-      config.ici_tensor_parallelism,
       config.ici_autoregressive_parallelism,
+      config.ici_tensor_parallelism,
   ]
 
   # Find possible unspecified parallelisms
@@ -375,7 +397,12 @@ def init_initial_state(model, tx, config, is_training, key):
 
   Args: model, tx, config, is_training, key
   """
-  input_shape = (config.global_batch_size_to_load, config.max_target_length)
+  microbatch_size, rem = divmod(config.global_batch_size_to_load, config.num_microbatches)
+  assert rem == 0, f"Global batch size {config.global_batch_size_to_load=} should be divisible by {config.num_microbatches=}"
+  input_shape = (
+      config.global_batch_size_to_load if not config.use_jaxpp else microbatch_size,
+      config.max_target_length
+  )
   model_vars = model.init(
       {"params": key, "dropout": key, "aqt": key},
       jnp.ones(input_shape, dtype=jnp.int32),
@@ -425,6 +452,9 @@ def setup_initial_state(model, data_iterator, tx, config, rng, mesh, checkpoint_
   unboxed_abstract_state, state_mesh_annotations, state_mesh_shardings = get_abstract_state(
       model, tx, config, rng, mesh, is_training
   )
+
+  if config.use_jaxpp:
+      return unboxed_abstract_state, state_mesh_annotations, data_iterator
 
   # Initialization
   with nn_partitioning.axis_rules(config.logical_axis_rules):

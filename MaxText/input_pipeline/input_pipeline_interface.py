@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 """Input pipeline"""
+import itertools as it
 
 import numpy as np
 import tensorflow as tf
@@ -221,6 +222,15 @@ def make_mixed_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos):
 
 def create_data_iterator_with_tokenizer(config, mesh, add_bos=True, add_eos=True):
   if config.dataset_type == "synthetic":
+    data_iter = None
+    if config.use_jaxpp:
+      def microbatched(a):
+        return a.reshape(config.dcn_data_parallelism, config.num_microbatches, -1, config.max_target_length)
+      data_iter = it.repeat(jax.tree.map(microbatched, SyntheticDataIterator.raw_generate_synthetic_data(config)))
+    else:
+      data_iter = SyntheticDataIterator(config, mesh)
+    return data_iter, None, get_tokenizer(config.tokenizer_path, add_bos, add_eos)
+  elif config.dataset_type in ("c4", "c4-array_record", "c4_mlperf", "hf"):
     return SyntheticDataIterator(config, mesh), None, get_tokenizer(config.tokenizer_path, add_bos, add_eos)
   elif config.dataset_type in ("c4", "c4-array_record", "c4_mlperf", "hf"):
     return make_mixed_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos)
