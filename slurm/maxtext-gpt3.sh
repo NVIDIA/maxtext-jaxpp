@@ -37,7 +37,8 @@ fi
 
 command="python /workdir/maxtext/MaxText/train.py /workdir/maxtext/MaxText/configs/base.yml \
         run_name=runner_jaxpp_${timestamp} base_output_directory=$container_logs_dir        \
-        model_name=gpt3-175b ici_tensor_parallelism=${TP} dtype=${DTYPE} steps=${STEPS}     \
+        model_name=gpt3-175b dtype=${DTYPE} steps=${STEPS}                                  \
+        ici_tensor_parallelism=${TP} dcn_data_parallelism=${DP}                             \
         hardware=gpu dataset_type=synthetic enable_checkpointing=False                      \
         per_device_batch_size=$(( ($MBS * $GA) / ($PP * $TP) ))                             \
         num_microbatches=${GA} max_target_length=${SEQ_LEN}                                 \
@@ -49,6 +50,6 @@ sbatch_flags="--chdir=${output_dir}                                             
         -A ${SLURM_ACCOUNT} -J ${SLURM_JOB} -p ${partition}                                 \
         -N ${NUM_NODES} ${gpus_per_node:+--gpus-per-node=${gpus_per_node}}                  \
         --time=${SLURM_TIME} -o slurm_out.log -e slurm_err.log"
-common_srun_flags="--label --container-image=${CONTAINER_IMAGE} --container-mounts=$(realpath .):/workdir/maxtext,$(realpath $output_dir)/logs:$container_logs_dir"
+common_srun_flags="--label --container-image=${CONTAINER_IMAGE} --container-mounts=$(realpath .):/workdir/maxtext,$(realpath $output_dir):$container_logs_dir"
 
 sbatch ${sbatch_flags} "../jaxpp/script/slurm/ray-on-slurm.sh" "${command}" "${common_srun_flags}"
