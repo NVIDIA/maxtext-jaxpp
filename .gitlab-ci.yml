@@ -25,12 +25,12 @@ stages:
 variables:
   GIT_SUBMODULE_STRATEGY: recursive
   GIT_SUBMODULE_FORCE_HTTPS: "true"
-  JAX_VERSION: "0.4.28"
+  JAX_VERSION: "0.4.29"
   CI_DEV_BRANCH: "jaxpp_main"
   TEST_IMAGE: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
   LATEST_IMAGE: "$CI_REGISTRY_IMAGE:latest"
   DOCKERFILE: "jaxpp.Dockerfile"
-  BASE_IMAGE: "gitlab-master.nvidia.com:5005/cml/jaxpp_dev/jaxpp:cde7a016-base"
+  BASE_IMAGE: "gitlab-master.nvidia.com:5005/cml/jaxpp_dev/jaxpp:0231a2d4-base"
 
 build_image:
   stage: build
