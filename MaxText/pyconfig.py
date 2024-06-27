@@ -73,6 +73,10 @@ def validate_keys(keys):
       keys["load_parameters_path"] == "" or keys["load_full_state_path"] == ""
   ), "At most one of `load_parameters_path` or `load_full_state_path` should be set"
 
+  if keys["use_jaxpp"]:
+    assert (keys["gradient_clipping_threshold"] <= 0), "JAXPP does not allow global operations currently"
+    assert not keys["scan_layers"], "JAXPP does not support `scan_layers=True`"
+
 
 def validate_data_input(keys):
   if keys["dataset_type"] == "hf":
@@ -87,6 +91,10 @@ def validate_model_name(s: str) -> bool:
   # currently supported models
   valid_model_names = (
       "default",
+      "llama2-0_1b",
+      "llama2-0_5b",
+      "llama2-1b",
+      "llama2-3b",
       "llama2-7b",
       "llama2-13b",
       "llama2-70b",
@@ -362,7 +370,10 @@ def calculate_global_batch_sizes(raw_keys):
   """Calculates target global batch size from target devices and per_device_batch"""
   per_device_batch_size = raw_keys["per_device_batch_size"]
   expansion_factor_real_data = raw_keys["expansion_factor_real_data"]
+
   num_devices = get_num_target_devices(raw_keys)
+  max_logging.log(f"Num Target Devices: {num_devices}")
+
   if per_device_batch_size < 1.0:
     # For per_device_batch_size<1, we load the data as if per_device_batch_size=1
     if expansion_factor_real_data != -1:

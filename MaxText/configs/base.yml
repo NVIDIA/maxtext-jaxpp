@@ -208,7 +208,7 @@ prefill_cache_dir: "" # If set and load_from_prefill_dir, decode.py reads from d
 autoregressive_decode_assert: ""
 
 # For nsys profiler, pass the training command to nsys command
-# e.g. nsys profile -s none --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop {training command} 
+# e.g. nsys profile -s none --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop {training command}
 profiler: "" # Supported profiler: '', xplane, nsys
 # If set to true, upload all profiler results from all hosts. Otherwise, only upload the profiler result from the first host.
 upload_all_profiler_results: False
@@ -226,7 +226,8 @@ data_shuffle_seed: 0
 init_weights_seed: 0
 
 # You may disable clipping by setting gradient_clipping_threshold to zero.
-gradient_clipping_threshold: 1.0
+# JAXPP: DO NOT TURN THIS > 0 currently
+gradient_clipping_threshold: 0.
 
 # AdamW optimizer parameters
 # We use AdamW following Llama2's training details, see https://arxiv.org/pdf/2307.09288.pdf section 2.2
@@ -285,7 +286,7 @@ vertex_tensorboard_project: ""
 # Vertex AI supported regions: https://cloud.google.com/vertex-ai/docs/general/locations#available-regions
 vertex_tensorboard_region: ""
 
-# If set to True, MaxText will perform extra checks using jax.checkify. Note that this will effect performance. 
+# If set to True, MaxText will perform extra checks using jax.checkify. Note that this will effect performance.
 max_checkify: False
 
 # Inference
