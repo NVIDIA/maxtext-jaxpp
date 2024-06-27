@@ -21,6 +21,7 @@ default:
 stages:
   - build
   - deploy
+  - test
 
 variables:
   GIT_SUBMODULE_STRATEGY: recursive
@@ -54,3 +55,26 @@ tag_latest:
     - docker rmi ${LATEST_IMAGE}
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEV_BRANCH'
+
+llama2-jax:
+  stage: test
+  script:
+    - docker run --gpus=all --shm-size=10.24gb --ulimit memlock=-1 --ulimit stack=67108864
+      -e RAY_ADDRESS=local --rm --workdir /workdir/maxtext ${TEST_IMAGE}
+      "nvidia-smi && bash /workdir/maxtext/scripts/1gpu_jax.sh --max_target_length=8 --model=llama2-0_1b"
+
+  after_script:
+    - docker rmi $TEST_IMAGE
+
+
+llama2-jaxpp:
+  stage: test
+  script:
+    - docker run --gpus=all --shm-size=10.24gb --ulimit memlock=-1 --ulimit stack=67108864
+      -e RAY_ADDRESS=local --rm --workdir /workdir/maxtext ${TEST_IMAGE}
+      "nvidia-smi && bash /workdir/maxtext/scripts/multigpu_jaxpp.sh --dp=1 --pp=1 --mp=1 --batch_size_per_device=1 --max_target_length=8 --num_microbatches=1 --model=llama2-0_1b"
+
+  after_script:
+    - docker rmi $TEST_IMAGE
+
+

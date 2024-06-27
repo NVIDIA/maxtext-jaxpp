@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# model config for llama2-7b
+# model config for llama2-70b
 
 base_emb_dim: 8192
 base_num_query_heads: 64
@@ -25,3 +25,5 @@ vocab_size: 32000
 logits_via_embedding: False
 normalization_layer_epsilon: 1.0e-5
 decoder_block: "llama2"
+attention: "jaxpp_te"
+remat_policy: "minimal"

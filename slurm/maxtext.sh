@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 
+if [ -z ${MODEL} ]; then
+  echo "Expect a model name: gpt3-175b or llama2-70b"
+  exit 1
+fi
+
 set -x
 
 # Overwritable vars
@@ -24,6 +29,8 @@ CONTAINER_IMAGE=${CONTAINER_IMAGE:-"gitlab-master.nvidia.com/cml/jaxpp_dev/maxte
 # Non-overwritable vars
 container_logs_dir=/tmp/logs
 timestamp=$(date +%Y%m%d-%H%M%S)
+jaxpp_dir="./third_party/jaxpp"
+log_dir="/workdir/maxtext/third_party/jaxpp/logs/"
 # NOTE: output_dir should not contain `:` or `,` since that breaks
 #   pyxis' `--container-mounts`
 output_dir=$(mktemp -d -p ${SLURM_LOG_DIR} "maxtext-${SLURM_LOG_TAG:+${SLURM_LOG_TAG}_}$timestamp""_XXXX")
@@ -37,7 +44,7 @@ fi
 
 command="python /workdir/maxtext/MaxText/train.py /workdir/maxtext/MaxText/configs/base.yml \
         run_name=runner_jaxpp_${timestamp} base_output_directory=$container_logs_dir        \
-        model_name=gpt3-175b dtype=${DTYPE} steps=${STEPS}                                  \
+        model_name=${MODEL} dtype=${DTYPE} steps=${STEPS}                                   \
         ici_tensor_parallelism=${TP} dcn_data_parallelism=${DP}                             \
         hardware=gpu dataset_type=synthetic enable_checkpointing=False                      \
         per_device_batch_size=$(( ($MBS * $GA) / ($PP * $TP) ))                             \
@@ -50,6 +57,7 @@ sbatch_flags="--chdir=${output_dir}                                             
         -A ${SLURM_ACCOUNT} -J ${SLURM_JOB} -p ${partition}                                 \
         -N ${NUM_NODES} ${gpus_per_node:+--gpus-per-node=${gpus_per_node}}                  \
         --time=${SLURM_TIME} -o slurm_out.log -e slurm_err.log"
-common_srun_flags="--label --container-image=${CONTAINER_IMAGE} --container-mounts=$(realpath .):/workdir/maxtext,$(realpath $output_dir):$container_logs_dir"
 
-sbatch ${sbatch_flags} "../jaxpp/script/slurm/ray-on-slurm.sh" "${command}" "${common_srun_flags}"
+common_srun_flags="--label --container-image=${CONTAINER_IMAGE} --container-mounts=$(realpath $output_dir):${log_dir},$(realpath .):/workdir/maxtext"
+
+sbatch ${sbatch_flags} "${jaxpp_dir}/script/slurm/ray-on-slurm.sh" "${command}" "${common_srun_flags}"

@@ -2,6 +2,85 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "Debug LLama2 JAXPP 1x2",
+      "type": "debugpy",
+      "env": {
+        "RAY_DEDUP_LOGS": "0",
+        "RAY_ADDRESS": "local"
+      },
+      "request": "launch",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "python": "python3",
+      "program": "${workspaceFolder}/MaxText/train.py",
+      "args": [
+        "MaxText/configs/base.yml",
+        "run_name=runner_jaxpp_$(date +%Y-%m-%d-%H-%M)",
+        "base_output_directory=/tmp/log",
+        "hardware=gpu",
+        "dataset_type=synthetic",
+        "dataset_path=local",
+        //
+        "model_name=llama2-0_5b",
+        "steps=10",
+        // "dtype=bfloat16",
+        // "quantization=fp8",
+        "max_target_length=1024",
+        "per_device_batch_size=2",
+        // "dcn_data_parallelism=2",
+        // "ici_tensor_parallelism=2",
+        "enable_checkpointing=false",
+        "use_jaxpp=True", // Flags below are ignored when `use_jaxpp=False`
+        "distributed_initialization=True",
+        "num_workers=1",
+        "num_microbatches=1",
+        "use_pgle=False",
+        "attention=dot_product",
+        "remat_policy=minimal_flash",
+        "scan_layers=true",
+      ]
+    },
+    {
+      "name": "Debug LLama2 JAXPP 2x2",
+      "type": "debugpy",
+      "env": {
+        "RAY_DEDUP_LOGS": "0",
+        "RAY_ADDRESS": "local",
+        "JAX_TRACEBACK_FILTERING": "off"
+      },
+      "request": "launch",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "python": "python3",
+      "program": "${workspaceFolder}/MaxText/train.py",
+      "args": [
+        "MaxText/configs/base.yml",
+        "run_name=runner_jaxpp_$(date +%Y-%m-%d-%H-%M)",
+        "base_output_directory=/tmp/log",
+        "hardware=gpu",
+        "dataset_type=synthetic",
+        // "dataset_path=local",
+        //
+        "model_name=llama2-7b",
+        "steps=10",
+        "dtype=bfloat16",
+        // "quantization=fp8",
+        "max_target_length=256",
+        "per_device_batch_size=1",
+        "dcn_data_parallelism=2",
+        "ici_tensor_parallelism=2",
+        "enable_checkpointing=false",
+        "attention=dot_product",
+        // "remat_policy=minimal_flash",
+        // "scan_layers=true",
+        "use_jaxpp=True", // Flags below are ignored when `use_jaxpp=False`
+        "distributed_initialization=True",
+        "num_workers=2",
+        "num_microbatches=2",
+        "use_pgle=False",
+      ]
+    },
+    {
       "name": "Debug MaxText Decode",
       "type": "python",
       "request": "launch",
