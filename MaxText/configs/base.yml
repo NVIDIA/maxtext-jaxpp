@@ -208,15 +208,15 @@ prefill_cache_dir: "" # If set and load_from_prefill_dir, decode.py reads from d
 autoregressive_decode_assert: ""
 
 # For nsys profiler, pass the training command to nsys command
-# e.g. nsys profile -s none --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop {training command}
-profiler: "" # Supported profiler: '', xplane, nsys
+# e.g. nsys profile -s none --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop {training command} 
+profiler: "xplane" # Supported profiler: '', xplane, nsys
 # If set to true, upload all profiler results from all hosts. Otherwise, only upload the profiler result from the first host.
 upload_all_profiler_results: False
 # Skip first n steps for profiling, to omit things like compilation and to give
 # the iteration time a chance to stabilize.
-skip_first_n_steps_for_profiler: 1
+skip_first_n_steps_for_profiler: 5
 # Profile for a small number of steps to avoid a large profile file size.
-profiler_steps: 5
+profiler_steps: 1
 
 # When dropout is false the model is a deterministic function of the
 # data_shuffle_seed and init_weights_seed (i.e. reproducible losses)

@@ -77,6 +77,7 @@ EPS = 1e-8
 JaxPP related imports
 """
 # system
+import subprocess
 from statistics import mean
 
 # jax
@@ -712,6 +713,7 @@ def train_loop(config, state=None):
     if step == last_profiling_step:
       if config.use_jaxpp and config.profiler == "xplane":
         mesh.stop_trace()
+        max_logging.log(subprocess.run([f"merge_multihost_xplanes ./*/*/*/*/*.pb"], shell=True, cwd=config.tensorboard_dir))
       else:
         prof.deactivate()
 
@@ -720,8 +722,10 @@ def train_loop(config, state=None):
   if not config.use_jaxpp:
     write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, config.steps - 1, config) # final step metrics
   max_utils.close_summary_writer(writer)
-  max_logging.log(f"excluding the first two steps: avg time per step {mean(step_time[2:])}")
-  max_utils.close_summary_writer(writer)
+  # last_profiling_step + 2 as (1) we count steps from 0, and (2) the execution time for merge_multihost_xplanes is
+  # counted toward the execution time for the step right after the last profiling step.
+  num_warmup_steps = (last_profiling_step + 2) if config.profiler != "" else 6
+  max_logging.log(f"excluding the first {num_warmup_steps} steps: avg time per step {mean(step_time[num_warmup_steps:])}")
   record_goodput(recorder, config, job_end=True)
   return state
 
