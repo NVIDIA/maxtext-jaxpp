@@ -15,7 +15,7 @@ TP=${TP:-8}
 VP=${VP:-3}
 SEQ_LEN=${SEQ_LEN:-2048}
 DTYPE=${DTYPE:-"bfloat16"}
-STEPS=${STEPS:-10}
+STEPS=${STEPS:-20}
 MBS=${MBS:-2}
 GA=${GA:-64}
 USE_PGLE=${USE_PGLE:-"False"}
@@ -27,10 +27,9 @@ SLURM_LOG_DIR=${SLURM_LOG_DIR:-"."}
 CONTAINER_IMAGE=${CONTAINER_IMAGE:-"gitlab-master.nvidia.com/cml/jaxpp_dev/maxtext:7b7eecce"}
 
 # Non-overwritable vars
-container_logs_dir=/tmp/logs
 timestamp=$(date +%Y%m%d-%H%M%S)
 jaxpp_dir="./third_party/jaxpp"
-log_dir="/workdir/maxtext/third_party/jaxpp/logs/"
+log_dir=/tmp/logs
 # NOTE: output_dir should not contain `:` or `,` since that breaks
 #   pyxis' `--container-mounts`
 output_dir=$(mktemp -d -p ${SLURM_LOG_DIR} "maxtext-${SLURM_LOG_TAG:+${SLURM_LOG_TAG}_}$timestamp""_XXXX")
@@ -43,7 +42,7 @@ partition=batch
 fi
 
 command="python /workdir/maxtext/MaxText/train.py /workdir/maxtext/MaxText/configs/base.yml \
-        run_name=runner_jaxpp_${timestamp} base_output_directory=$container_logs_dir        \
+        run_name=runner_jaxpp_${timestamp} base_output_directory=$log_dir                   \
         model_name=${MODEL} dtype=${DTYPE} steps=${STEPS}                                   \
         ici_tensor_parallelism=${TP} dcn_data_parallelism=${DP}                             \
         hardware=gpu dataset_type=synthetic enable_checkpointing=False                      \

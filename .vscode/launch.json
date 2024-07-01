@@ -82,7 +82,7 @@
     },
     {
       "name": "Debug MaxText Decode",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
       "console": "integratedTerminal",
       "justMyCode": false,
@@ -100,7 +100,7 @@
     },
     {
       "name": "Debug MaxText Train",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
       "console": "integratedTerminal",
       "justMyCode": false,
@@ -127,7 +127,7 @@
         "MaxText/configs/base.yml",
         "run_name=runner_jaxpp_$(date +%Y-%m-%d-%H-%M)",
         "base_output_directory=/tmp/log",
-        "steps=10",
+        "steps=20",
         "dtype=bfloat16",
         "hardware=gpu",
         "dataset_type=synthetic",
@@ -160,7 +160,7 @@
         "dataset_type=synthetic",
         //
         "model_name=gpt3-52k",
-        "steps=10",
+        "steps=20",
         "dtype=bfloat16",
         // "quantization=fp8",
         "max_target_length=1024",
