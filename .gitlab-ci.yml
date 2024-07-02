@@ -57,6 +57,8 @@ tag_latest:
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEV_BRANCH'
 
+# ================== LLAMA2 MODEL ================== #
+
 llama2-jax:
   stage: test
   script:
@@ -78,6 +80,8 @@ llama2-jaxpp:
   after_script:
     - docker rmi $TEST_IMAGE
 
+# ================== MIXTRAL MODEL ================== #
+
 mixtral-jax:
   stage: test
   script:
@@ -95,6 +99,29 @@ mixtral-jaxpp:
     - docker run --gpus=all --shm-size=10.24gb --ulimit memlock=-1 --ulimit stack=67108864
       -e RAY_ADDRESS=local --rm --workdir /workdir/maxtext ${TEST_IMAGE}
       "nvidia-smi && bash /workdir/maxtext/scripts/multigpu_jaxpp.sh --dp=1 --pp=1 --mp=1 --batch_size_per_device=1 --max_target_length=8 --num_microbatches=1 --model=mixtral-8x0_1b"
+
+  after_script:
+    - docker rmi $TEST_IMAGE
+
+# ================== MISTRAL MODEL ================== #
+
+mistral-jax:
+  stage: test
+  script:
+    - docker run --gpus=all --shm-size=10.24gb --ulimit memlock=-1 --ulimit stack=67108864
+      -e RAY_ADDRESS=local --rm --workdir /workdir/maxtext ${TEST_IMAGE}
+      "nvidia-smi && bash /workdir/maxtext/scripts/1gpu_jax.sh --max_target_length=8 --model=mistral-0_25b"
+
+  after_script:
+    - docker rmi $TEST_IMAGE
+
+
+mistral-jaxpp:
+  stage: test
+  script:
+    - docker run --gpus=all --shm-size=10.24gb --ulimit memlock=-1 --ulimit stack=67108864
+      -e RAY_ADDRESS=local --rm --workdir /workdir/maxtext ${TEST_IMAGE}
+      "nvidia-smi && bash /workdir/maxtext/scripts/multigpu_jaxpp.sh --dp=1 --pp=1 --mp=1 --batch_size_per_device=1 --max_target_length=8 --num_microbatches=1 --model=mistral-0_25b"
 
   after_script:
     - docker rmi $TEST_IMAGE
