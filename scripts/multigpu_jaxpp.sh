@@ -13,7 +13,7 @@ OUTPUT_PATH="/dev/shm/${RANDOM}"
 RUN_NAME="llama2-$(date +%Y-%m-%d-%H-%M)"
 
 # MaxText Runtime
-MAXTEXT_MODEL="llama2-0_5b"
+MAXTEXT_MODEL=""
 
 # Runtime Parameters
 DATA_PARALLELISM=2
@@ -64,6 +64,11 @@ do
         ;;
     esac
 done
+
+if [[ -z ${MAXTEXT_MODEL} ]]; then
+    echo "ERROR: \`--model=<model_name>\` has not been provided."
+    exit 1
+fi
 
 # ------------- DEBUG FLAGS -------------
 # ulimit -c unlimited
