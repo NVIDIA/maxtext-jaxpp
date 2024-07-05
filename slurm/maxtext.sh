@@ -24,7 +24,7 @@ SLURM_ACCOUNT=${SLURM_ACCOUNT:-coreai_dlalgo_llm}
 SLURM_JOB=${SLURM_JOB:-${SLURM_ACCOUNT}-jaxpp:${USER}-train-maxtext}
 SLURM_TIME=${SLURM_TIME:-"01:00:00"}
 SLURM_LOG_DIR=${SLURM_LOG_DIR:-"."}
-CONTAINER_IMAGE=${CONTAINER_IMAGE:-"gitlab-master.nvidia.com/cml/jaxpp_dev/maxtext:7b7eecce"}
+CONTAINER_IMAGE=${CONTAINER_IMAGE:-"gitlab-master.nvidia.com/cml/jaxpp_dev/maxtext:latest"}
 
 # Non-overwritable vars
 timestamp=$(date +%Y%m%d-%H%M%S)

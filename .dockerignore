@@ -1,0 +1,20 @@
+hlo/
+
+# vim temp files
+*.swp
+
+# temp folder for benchmarks
+scratch
+*.trace.json.gz
+*.xplane.pb
+*.hlo_proto.pb
+*.SSTABLE
+
+# Test/Lint Directories
+.pytest_cache/
+.ruff_cache/
+.vscode/
+.devcontainer/
+
+# GIT History
+.git/

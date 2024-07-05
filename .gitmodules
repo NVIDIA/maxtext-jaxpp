@@ -1,3 +1,4 @@
 [submodule "third_party/jaxpp"]
 	path = third_party/jaxpp
 	url = ssh://git@gitlab-master.nvidia.com:12051/CML/jaxpp_dev/jaxpp.git
+	branch = main

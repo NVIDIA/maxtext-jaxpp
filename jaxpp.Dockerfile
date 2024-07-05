@@ -6,4 +6,5 @@ RUN pip install -U pip && pip install --no-cache-dir -U -r /tmp/requirements.txt
 
 COPY --chown=$USER_UID:$USER_GID . maxtext
 
-RUN pip install --no-cache-dir -e '/workdir/maxtext/third_party/jaxpp[dev]'
+RUN pip install --no-cache-dir -e '/workdir/maxtext/third_party/jaxpp[dev]' && \
+    rm -rf /workdir/jaxpp

@@ -31,7 +31,7 @@ variables:
   TEST_IMAGE: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
   LATEST_IMAGE: "$CI_REGISTRY_IMAGE:latest"
   DOCKERFILE: "jaxpp.Dockerfile"
-  BASE_IMAGE: "gitlab-master.nvidia.com:5005/cml/jaxpp_dev/jaxpp:0231a2d4-base"
+  BASE_IMAGE: "gitlab-master.nvidia.com:5005/cml/jaxpp_dev/jaxpp:main-base"
 
 build_image:
   stage: build
