@@ -91,7 +91,7 @@ logits_dot_in_fp32: True  # whether to use fp32 in logits_dense or shared_embedd
 # These options offer a trade-off between speed (fastest to slowest) and HBM usage (highest to lowest)
 remat_policy: 'full'
 scan_layers: False
-param_scan_axis: 1
+param_scan_axis: 0  # In JaxPP we set to 0 instead of 1 to avoid flax transposes
 attention: 'autoselected' # Supported attention: autoselected, dot_product, flash, cudnn_flash_te
 
 # Combine matmuls for QKV and MLP
