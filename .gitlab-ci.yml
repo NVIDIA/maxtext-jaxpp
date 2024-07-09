@@ -25,6 +25,7 @@ stages:
 
 variables:
   GIT_SUBMODULE_STRATEGY: recursive
+  GIT_SUBMODULE_UPDATE_FLAGS: --remote
   GIT_SUBMODULE_FORCE_HTTPS: "true"
   JAX_VERSION: "0.4.29"
   CI_DEV_BRANCH: "jaxpp_main"
