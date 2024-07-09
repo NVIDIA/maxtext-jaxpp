@@ -75,7 +75,6 @@ def validate_keys(keys):
 
   if keys["use_jaxpp"]:
     assert (keys["gradient_clipping_threshold"] <= 0), "JAXPP does not allow global operations currently"
-    assert not keys["scan_layers"], "JAXPP does not support `scan_layers=True`"
 
 
 def validate_data_input(keys):

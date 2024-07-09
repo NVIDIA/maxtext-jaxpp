@@ -280,34 +280,48 @@ class Decoder(nn.Module):
       initializing = self.is_mutable_collection("params")
       params_spec = cfg.param_scan_axis if initializing else ScanIn(cfg.param_scan_axis)
       cache_spec = 0
-      y, _ = nn.scan(
-          BlockLayer,
-          variable_axes={
-              "params": params_spec,
-              "cache": cache_spec,
-              "intermediates": 0,
-              "aqt": 0,
-              "_overwrite_with_gradient": 0,
-          },
-          split_rngs={
-              "params": True,
-              "dropout": cfg.enable_dropout,
-          },
-          in_axes=(
-              nn.broadcast,
-              nn.broadcast,
-              nn.broadcast,
-              nn.broadcast,
-          ),
-          length=cfg.num_decoder_layers,
-          metadata_params={nn.PARTITION_NAME: "layers"},
-      )(config=cfg, mesh=mesh, name="layers", quant=self.quant)(
-          y,
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          model_mode,
-      )
+
+      num_stages = 1
+      layers_per_stage, rem = cfg.num_decoder_layers, 0
+      if cfg.use_jaxpp:
+        num_stages = cfg.num_stages
+        layers_per_stage, rem = divmod(cfg.num_decoder_layers, cfg.num_stages)
+
+      for stage in range(num_stages):
+        # NOTE: for uneven splits of layers by number of stages, spread remaining
+        #  layers on first few stages.
+        length = layers_per_stage + (1 if stage < rem else 0)
+        y, _ = nn.scan(
+            OriginalBlockLayer if cfg.use_jaxpp and stage == cfg.num_stages - 1 else BlockLayer,
+            variable_axes={
+                "params": params_spec,
+                "cache": cache_spec,
+                "intermediates": 0,
+                "aqt": 0,
+                "_overwrite_with_gradient": 0,
+            },
+            split_rngs={
+                "params": True,
+                "dropout": cfg.enable_dropout,
+            },
+            in_axes=(
+                nn.broadcast,
+                nn.broadcast,
+                nn.broadcast,
+                nn.broadcast,
+            ),
+            length=length,
+            metadata_params={nn.PARTITION_NAME: "layers"},
+        )(config=cfg, mesh=mesh, name=f"layers_{stage}", quant=self.quant)(
+            y,
+            decoder_segment_ids,
+            decoder_positions,
+            deterministic,
+            model_mode,
+        )
+        if cfg.use_jaxpp and stage != num_stages - 1:
+          y = jaxpp.pipeline_enter_stage(y, f"stage_{stage}", stage + 1)
+
     else:
       if cfg.use_jaxpp:
         layers_per_stage = cfg.num_decoder_layers // cfg.num_stages
