@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 if [ -z ${MODEL} ]; then
-  echo "Expect a model name: gpt3-175b or llama2-70b"
+  echo "Expect a model name: gpt3-175b, llama2-70b, or grok-314b"
   exit 1
 fi
 
@@ -13,7 +13,6 @@ PP=${PP:-8}
 DP=${DP:-1}
 TP=${TP:-8}
 VP=${VP:-3}
-SEQ_LEN=${SEQ_LEN:-2048}
 DTYPE=${DTYPE:-"bfloat16"}
 STEPS=${STEPS:-20}
 MBS=${MBS:-2}
@@ -39,6 +38,14 @@ partition=polar
 gpus_per_node=8
 elif [[ "${hostname}" == login-eos* ]]; then
 partition=batch
+fi
+
+if [[ "${MODEL}" == gpt3-* ]]; then
+  SEQ_LEN=${SEQ_LEN:-2048}
+elif [[ "${MODEL}" == llama2-* ]]; then
+  SEQ_LEN=${SEQ_LEN:-2048}
+elif [[ "${MODEL}" == grok-* ]]; then
+  SEQ_LEN=${SEQ_LEN:-8192}
 fi
 
 command="python /workdir/maxtext/MaxText/train.py /workdir/maxtext/MaxText/configs/base.yml \
