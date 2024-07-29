@@ -175,11 +175,15 @@ class Decoder(nn.Module):
       from layers import gpt3
 
       return gpt3.Gpt3DecoderLayer
+    elif self.config.decoder_block == "grok":
+      from layers import grok
+
+      return grok.GrokDecoderLayer
     else:
       raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block=}")
 
   def get_norm_layer(self):
-    if self.config.decoder_block in ("default", "llama2", "mistral", "gemma"):
+    if self.config.decoder_block in ("default", "llama2", "mistral", "gemma", "grok"):
       return RMSNorm
     elif self.config.decoder_block == "gpt3":
       from layers import gpt3

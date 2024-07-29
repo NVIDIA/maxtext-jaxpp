@@ -1,0 +1,18 @@
+# model config for grok
+
+base_emb_dim: 6144
+base_num_query_heads: 48
+base_num_kv_heads: 8
+base_mlp_dim: 14336
+base_num_decoder_layers: 64
+head_dim: 128
+mlp_activations: ["gelu"]
+vocab_size: 131072
+enable_dropout: False
+logits_via_embedding: False
+normalization_layer_epsilon: 1.0e-5
+num_experts: 8
+num_experts_per_tok: 2
+decoder_block: "grok"
+attention: "jaxpp_te"
+remat_policy: "minimal"
