@@ -271,6 +271,9 @@ num_stages: -1
 num_microbatches: 1
 schedule: "eager_1f1b"
 use_pgle: True
+moe_gating_func: "top2"
+moe_groups: 1
+moe_capacity_factor: 2.0
 ## END: JaxPP related parameters
 
 # Goodput parameters

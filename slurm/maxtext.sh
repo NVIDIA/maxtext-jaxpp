@@ -27,7 +27,8 @@ CONTAINER_IMAGE=${CONTAINER_IMAGE:-"gitlab-master.nvidia.com/cml/jaxpp_dev/maxte
 
 # Non-overwritable vars
 timestamp=$(date +%Y%m%d-%H%M%S)
-jaxpp_dir="./third_party/jaxpp"
+maxtext_dir="$(realpath $(dirname $0)/../)"
+jaxpp_dir="${maxtext_dir}/third_party/jaxpp"
 log_dir=/tmp/logs
 # NOTE: output_dir should not contain `:` or `,` since that breaks
 #   pyxis' `--container-mounts`
@@ -53,7 +54,7 @@ command="python /workdir/maxtext/MaxText/train.py /workdir/maxtext/MaxText/confi
         model_name=${MODEL} dtype=${DTYPE} steps=${STEPS}                                   \
         ici_tensor_parallelism=${TP} dcn_data_parallelism=${DP}                             \
         hardware=gpu dataset_type=synthetic enable_checkpointing=False                      \
-        per_device_batch_size=$(( ($MBS * $GA) / ($PP * $TP) ))                             \
+        per_device_batch_size=$(( ($MBS * $GA) / ($PP * $TP * $DP) ))                       \
         num_microbatches=${GA} max_target_length=${SEQ_LEN}                                 \
         num_workers=${PP} num_stages=$((${VP} * ${PP}))                                     \
         use_jaxpp=True schedule=${SCHEDULE}                                                 \
@@ -64,6 +65,6 @@ sbatch_flags="--chdir=${output_dir}                                             
         -N ${NUM_NODES} ${gpus_per_node:+--gpus-per-node=${gpus_per_node}}                  \
         --time=${SLURM_TIME} -o slurm_out.log -e slurm_err.log"
 
-common_srun_flags="--label --container-image=${CONTAINER_IMAGE} --container-mounts=$(realpath $output_dir):${log_dir},$(realpath .):/workdir/maxtext"
+common_srun_flags="--label --container-image=${CONTAINER_IMAGE} --container-mounts=$(realpath $output_dir):${log_dir},${maxtext_dir}:/workdir/maxtext"
 
 sbatch ${sbatch_flags} "${jaxpp_dir}/script/slurm/ray-on-slurm.sh" "${command}" "${common_srun_flags}"

@@ -5,6 +5,7 @@ base_num_query_heads: 48
 base_num_kv_heads: 8
 base_mlp_dim: 14336
 base_num_decoder_layers: 64
+moe_groups: 64
 head_dim: 128
 mlp_activations: ["gelu"]
 vocab_size: 131072
