@@ -199,7 +199,7 @@ class AttentionOp(nn.Module):
       raise ValueError(f"Unexpected attention kernel {self.attention_kernel=}.")
 
   def te_flash_attention(self, query: Array, key: Array, value: Array, decoder_segment_ids: Array | None, model_mode: str, deterministic: bool) -> Array:
-    from transformer_engine.jax.fused_attn import fused_attn, AttnBiasType, AttnMaskType
+    from transformer_engine.jax.attention import fused_attn, AttnBiasType, AttnMaskType, QKVLayout
 
     mask = self.generate_attention_mask(query, key, decoder_segment_ids, model_mode)
 
@@ -211,15 +211,14 @@ class AttentionOp(nn.Module):
 
     def self_attention_call(q, k, v, mask):
       return fused_attn(
-              q=q,
-              k=k,
-              v=v,
+              qkv=(q, k, v),
               bias=None,
               mask=mask,
               seed=te_seed,
               attn_bias_type=AttnBiasType.NO_BIAS,
               attn_mask_type=AttnMaskType.CAUSAL_MASK, # TODO: maybe handle padding
               scaling_factor=1 / math.sqrt(q.shape[-1]),
+              qkv_layout=QKVLayout.BSHD_BSHD_BSHD,
               dropout_probability=self.dropout_rate,
               is_training=(common_types.MODEL_MODE_TRAIN == model_mode) and not deterministic
             )
