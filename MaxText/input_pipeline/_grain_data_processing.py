@@ -16,9 +16,7 @@ limitations under the License.
 
 """Input pipeline using Grain."""
 
-import os
-import re
-from typing import Optional
+import glob
 
 import ml_collections
 import jax
@@ -30,130 +28,54 @@ from input_pipeline import _grain_tokenizer
 import multihost_dataloading
 
 
-def get_datasets(config: ml_collections.ConfigDict):
+def get_datasets(data_file_pattern):
   """Load dataset from array_record files for using with grain"""
-  data_dir = os.path.join(config.dataset_path, config.dataset_name)
-  train_files = [data_dir + "/" + f for f in os.listdir(data_dir) if re.match(r".*train.*", f)]
-  train_ds = grain.ArrayRecordDataSource(train_files)
-  if config.eval_dataset_name:
-    eval_files = [data_dir + "/" + f for f in os.listdir(data_dir) if re.match(rf".*{config.eval_split}.*", f)]
-    eval_ds = grain.ArrayRecordDataSource(eval_files)
-  else:
-    eval_ds = train_ds
-
-  return train_ds, eval_ds
-
-
-def preprocess_dataset(
-    config: ml_collections.ConfigDict,
-    dataloading_host_index,
-    dataloading_host_count,
-    global_mesh,
-    train_ds,
-    eval_ds,
-    vocab_path: Optional[str] = None,
-    data_shuffle_seed=0,
-    add_bos=True,
-    add_eos=True,
-):
-  """Use grain to pre-process the dataset and return iterators"""
-  # Set global batch size.
-  global_batch_size_to_load = config.global_batch_size_to_load
-
-  if config.eval_per_device_batch_size > 0:
-    eval_batch_size = config.eval_per_device_batch_size * global_mesh.size
-  else:
-    eval_batch_size = global_batch_size_to_load
-
-  train_iter = preprocessing_pipeline(
-      train_ds,
-      vocab_path,
-      add_bos,
-      add_eos,
-      config.grain_worker_count,
-      global_batch_size_to_load,
-      global_mesh,
-      dataloading_host_index,
-      dataloading_host_count,
-      shuffle=config.enable_data_shuffling,
-      num_epochs=1,
-      pack_examples=True,
-      max_length=config.max_target_length,
-      data_shuffle_seed=data_shuffle_seed,
-  )
-
-  eval_iter = preprocessing_pipeline(
-      eval_ds,
-      vocab_path,
-      add_bos,
-      add_eos,
-      config.grain_worker_count,
-      eval_batch_size,
-      global_mesh,
-      dataloading_host_index,
-      dataloading_host_count,
-      shuffle=config.enable_data_shuffling,
-      pack_examples=True,
-      max_length=config.max_target_length,
-      data_shuffle_seed=data_shuffle_seed,
-  )
-
-  predict_iter = preprocessing_pipeline(
-      eval_ds,
-      vocab_path,
-      add_bos,
-      add_eos,
-      config.grain_worker_count,
-      eval_batch_size,
-      global_mesh,
-      dataloading_host_index,
-      dataloading_host_count,
-      shuffle=config.enable_data_shuffling,
-      pack_examples=True,
-      max_length=config.max_target_length,
-      data_shuffle_seed=data_shuffle_seed,
-  )
-
-  return train_iter, eval_iter, predict_iter
+  data_files = glob.glob(data_file_pattern)
+  dataset = grain.ArrayRecordDataSource(data_files)
+  return dataset
 
 
 def preprocessing_pipeline(
     dataset,
-    vocab_path,
-    add_bos: bool,
-    add_eos: bool,
-    grain_worker_count: int,
-    batch_size: int,
+    tokenizer_path,
+    global_batch_size: int,
     global_mesh,
+    max_target_length: int,
+    grain_worker_count: int,
     dataloading_host_index,
     dataloading_host_count,
-    shuffle: bool,
-    num_epochs: Optional[int] = 1,
-    pack_examples: bool = True,
-    max_length: int = 512,
-    shift: bool = True,
-    drop_remainder: bool = True,
+    data_column,
+    shuffle: bool = False,
     data_shuffle_seed=0,
+    tokenize=True,
+    add_bos=True,
+    add_eos=True,
+    num_epochs=1,
+    packing=True,
+    shift=True,
+    drop_remainder=False,
 ):
-  """Apply grain operations to preprocess the given dataset."""
-  assert batch_size % global_mesh.size == 0, "Batch size should be divisible number of global devices."
+  """Use grain to pre-process the dataset and return iterators"""
+  assert global_batch_size % global_mesh.size == 0, "Batch size should be divisible number of global devices."
 
   operations = []
-  operations.append(_input_pipeline_utils.ParseFeatures())
-  operations.append(_input_pipeline_utils.NormalizeFeatures())
-  operations.append(_grain_tokenizer.TokenizeAndTrim(["inputs", "targets"], max_length, vocab_path, add_bos, add_eos))
+  operations.append(_input_pipeline_utils.ParseFeatures(data_column, tokenize))
+  operations.append(_input_pipeline_utils.NormalizeFeatures(data_column, tokenize))
+
+  if tokenize:
+    operations.append(_grain_tokenizer.TokenizeAndTrim(["inputs", "targets"], max_target_length, tokenizer_path, add_bos, add_eos))
 
   # Pack and Batch examples.
-  if pack_examples:
+  if packing:
     operations.append(
         grain.experimental.PackAndBatchOperation(
-            batch_size=batch_size // jax.process_count(), length_struct={"inputs": max_length, "targets": max_length}
+            batch_size=global_batch_size // jax.process_count(), length_struct={"inputs": max_target_length, "targets": max_target_length}
         )
     )
     operations.append(_input_pipeline_utils.ReformatPacking())
   else:
-    operations.append(_input_pipeline_utils.PadToMaxLength(max_length))
-    operations.append(grain.Batch(batch_size=batch_size // jax.process_count(), drop_remainder=drop_remainder))
+    operations.append(_input_pipeline_utils.PadToMaxLength(max_target_length))
+    operations.append(grain.Batch(batch_size=global_batch_size // jax.process_count(), drop_remainder=drop_remainder))
 
   # Shift inputs for teacher-forced training
   if shift:
@@ -163,7 +85,7 @@ def preprocessing_pipeline(
       num_records=len(dataset),
       num_epochs=num_epochs,
       shard_options=grain.ShardOptions(
-          shard_index=dataloading_host_index, shard_count=dataloading_host_count, drop_remainder=True
+          shard_index=dataloading_host_index, shard_count=dataloading_host_count, drop_remainder=drop_remainder
       ),
       shuffle=shuffle,
       seed=data_shuffle_seed,
@@ -180,3 +102,49 @@ def preprocessing_pipeline(
 
   # Return multi-host jax.Array prep iterator
   return multihost_gen
+
+def make_grain_iterator(
+    config: ml_collections.ConfigDict,
+    global_mesh,
+    process_indices,
+):
+  """Load, preprocess dataset and return iterators"""
+  train_ds = get_datasets(config.grain_train_files)
+  train_iter = preprocessing_pipeline(
+    dataset=train_ds,
+    tokenizer_path=config.tokenizer_path,
+    global_batch_size=config.global_batch_size_to_load,
+    global_mesh=global_mesh,
+    max_target_length=config.max_target_length,
+    grain_worker_count=config.grain_worker_count,
+    dataloading_host_index=process_indices.index(jax.process_index()),
+    dataloading_host_count=len(process_indices),
+    data_column=config.train_data_column,
+    shuffle=config.enable_data_shuffling,
+    data_shuffle_seed=config.data_shuffle_seed,
+    tokenize=config.tokenize_train_data,
+    add_bos=config.add_bos,
+    add_eos=config.add_eos,
+  )
+
+  if config.eval_interval > 0:
+    eval_ds = get_datasets(config.grain_eval_files)
+    eval_iter = preprocessing_pipeline(
+      dataset=eval_ds,
+      tokenizer_path=config.tokenizer_path,
+      global_batch_size=config.global_batch_size_to_load,
+      global_mesh=global_mesh,
+      max_target_length=config.max_target_length,
+      grain_worker_count=config.grain_worker_count,
+      dataloading_host_index=process_indices.index(jax.process_index()),
+      dataloading_host_count=len(process_indices),
+      data_column=config.eval_data_column,
+      shuffle=False,
+      data_shuffle_seed=config.data_shuffle_seed,
+      tokenize=config.tokenize_eval_data,
+      add_bos=config.add_bos,
+      add_eos=config.add_eos,
+    )
+  else:
+    eval_iter = None
+  return train_iter, eval_iter

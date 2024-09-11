@@ -28,10 +28,19 @@ from layers import normalizations
 from layers import quantizations
 import numpy as np
 from jax.ad_checkpoint import checkpoint_name
+from jax.experimental import shard_map
+import max_logging
+
+try:
+  from jax.experimental.pallas.ops.tpu import megablox as mblx
+except ImportError:
+  max_logging.log("JAX megablox is available for TPU only.")
+  pass
 
 Array = common_types.Array
 Config = common_types.Config
 DType = common_types.DType
+Mesh = common_types.Mesh
 NdInitializer = initializers.NdInitializer
 
 nd_dense_init = initializers.nd_dense_init
@@ -39,7 +48,6 @@ bias_init = initializers.default_bias_init
 
 RMSNorm = normalizations.RMSNorm
 Quant = quantizations.AqtQuantization
-
 
 def _convert_to_activation_function(fn_or_string: Union[str, Callable[..., Any]]) -> Callable[..., Any]:
   """Convert a string to an activation function."""
@@ -105,7 +113,7 @@ class DenseGeneral(nn.Module):
       """Computes a dot_general operation that may be quantized."""
       dot_general = lax.dot_general
       if self.quant:
-        dot_general_cls = self.quant.dot_general_cls()
+        dot_general_cls = self.quant.dot_general_cls(mesh_axes=self.kernel_axes)
         dot_general = dot_general_cls()
       return dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None)
 
@@ -263,29 +271,34 @@ class MoeBlock(nn.Module):
   Attributes:
     num_experts: Number of experts.
     num_experts_per_tok: Number of experts for each token.
+    mesh: Mesh, device mesh.
     kernel_init: Kernel function, passed to the dense layers.
     kernel_axes: Tuple with axes to apply kernel function.
     weight_dtype: Type for the weights.
     dtype: Type for the dense layer.
+    quant: Optional quantization config, no quantization if None.
   """
 
   config: Config
   num_experts: int
   num_experts_per_tok: int
+  mesh: Mesh
   kernel_init: NdInitializer
   kernel_axes: Tuple[str, ...]
   weight_dtype: DType = jnp.float32
   dtype: DType = jnp.float32
+  quant: Optional[Quant] = None
 
   def generate_kernels(self, num_experts, emb_dim, mlp_dim):
-    
+
     kernel_in_axis = np.arange(1)
     kernel_out_axis = np.arange(1, 2)
     kernel_init = nd_dense_init(1.0, 'fan_in', 'truncated_normal')
 
-    kernel_axes = ('exp', 'embed', 'mlp')
-    wo_kernel_axes = ('exp', 'mlp', 'embed')
-    
+    # The first axes is expert
+    kernel_axes = (None, 'embed', 'mlp')
+    wo_kernel_axes = (None, 'mlp', 'embed')
+
     w0_kernel = self.param(
         'wi_0',
         nn.with_logical_partitioning(kernel_init, kernel_axes),
@@ -315,17 +328,88 @@ class MoeBlock(nn.Module):
     wo_kernel = jnp.asarray(wo_kernel, self.dtype)
     return w0_kernel, w1_kernel, wo_kernel
 
-  @nn.compact
-  def __call__(self, inputs):
-    cfg = self.config
-    inputs = inputs.astype(cfg.dtype)
-    gate_logits = DenseGeneral(
-            self.num_experts,
-            dtype=self.dtype,
-            kernel_init=self.kernel_init,
-            kernel_axes=self.kernel_axes,
-            name="gate")(inputs)
-    
+  def permute(self, inputs, gate_logits):
+    """Permute tokens to group by expert to fit gmm call."""
+
+    # reshape inputs (batch, sequence, emb) to (batch * sequence, emb)
+    inputs_shape = inputs.shape
+    inputs_2d = jnp.reshape(inputs, (inputs_shape[0] * inputs_shape[1], inputs_shape[2]))
+    weights, selected_experts = jax.lax.top_k(gate_logits, self.num_experts_per_tok)
+    weights = jax.nn.softmax(weights.astype(self.weight_dtype), axis=-1).astype(self.dtype)
+    flatten_selected_experts = jnp.ravel(selected_experts)
+    sorted_selected_experts = jnp.argsort(flatten_selected_experts)
+    sorted_indices = sorted_selected_experts // self.num_experts_per_tok
+    # sort inputs for number of selected experts
+    sorted_inputs = jnp.take(inputs_2d, indices=sorted_indices, axis=0).astype(self.dtype)
+    group_size = jnp.bincount(flatten_selected_experts, length=self.num_experts)
+    return sorted_inputs, sorted_selected_experts, weights, group_size
+
+  def unpermute(self, intermediate, sorted_selected_experts, weights):
+    """Unpermute tokens to original order and combine weights."""
+
+    unsort_intermediate = jnp.take(intermediate, indices=jnp.argsort(sorted_selected_experts), axis=0)
+    reshaped_weights = jnp.reshape(weights, (-1, self.num_experts_per_tok))
+    tensor_parallelism = self.config.ici_tensor_parallelism * self.config.dcn_tensor_parallelism
+    reshaped_intermediate = jnp.reshape(unsort_intermediate, (-1, self.num_experts_per_tok, self.config.emb_dim // tensor_parallelism))
+    with jax.named_scope("weight_sum"):
+      output = jnp.einsum("BKE,BK -> BE", reshaped_intermediate, reshaped_weights)
+    return output.reshape(-1, self.config.max_target_length, self.config.emb_dim // tensor_parallelism).astype(self.dtype)
+
+  def megablox(self, inputs, gate_logits, w0_kernel, w1_kernel, wo_kernel):
+    tile_size = (512, 1024, 1024)
+    def gmm(inputs, kernel, group_sizes):
+      hs_shape = inputs.shape
+      # pad length is the 1st dimension of tiling size in gmm call
+      pad_length = 512
+      if hs_shape[0] % pad_length:
+        pad_length = pad_length - hs_shape[0] % pad_length
+        inputs = jax.lax.pad(inputs.astype(jnp.float32), 0.0, [(0, pad_length, 0), (0,0,0)])
+
+      inputs = inputs.astype(self.dtype)
+      kernel = kernel.astype(self.dtype)
+      output = mblx.gmm(lhs=inputs,
+                        rhs=kernel,
+                        group_sizes=group_sizes,
+                        preferred_element_type=jnp.bfloat16,
+                        tiling=tile_size)
+
+      if hs_shape[0] % pad_length:
+        output = output[:hs_shape[0]]
+      return output
+
+    # Currently, we only support data and tensor parallelism with Megablox.
+    # We all gather the input activations over tensor parallelism to follow strategy
+    # in https://parsa.epfl.ch/course-info/cs723/papers/Megatron.pdf.
+    @functools.partial(
+        shard_map.shard_map,
+        mesh=self.mesh,
+        in_specs=(
+              (nn.logical_to_mesh_axes(("activation_batch", None, None))),
+              (nn.logical_to_mesh_axes(("activation_batch", None, None))),
+              (nn.logical_to_mesh_axes((None, None, "mlp"))),
+              (nn.logical_to_mesh_axes((None, None, "mlp"))),
+              (nn.logical_to_mesh_axes((None, "mlp", None))),
+          ),
+        out_specs=(nn.logical_to_mesh_axes(("activation_batch", None, "activation_embed"))),
+        check_rep=False,
+    )
+    def wrapper(x, logits, w0, w1, wo):
+      x, sorted_selected_experts, weights, group_sizes = self.permute(x, logits)
+      layer_w0 = gmm(x, w0, group_sizes)
+      layer_w1 = gmm(x, w1, group_sizes)
+      layer_act = _convert_to_activation_function(self.config.mlp_activations[0])(layer_w0)
+      intermediate_layer = jnp.multiply(layer_act, layer_w1)
+      intermediate_output = gmm(intermediate_layer, wo, group_sizes)
+      tensor_parallelism = self.config.ici_tensor_parallelism * self.config.dcn_tensor_parallelism
+      if tensor_parallelism > 1:
+        intermediate_output = jax.lax.psum_scatter(intermediate_output, 'tensor', scatter_dimension=1, tiled=True)
+      output = self.unpermute(intermediate_output,
+                              sorted_selected_experts,
+                              weights)
+      return output
+    return wrapper(inputs, gate_logits, w0_kernel, w1_kernel, wo_kernel)
+
+  def dense_matmul(self, inputs, gate_logits, w0_kernel, w1_kernel, wo_kernel):
     top_k_weights, top_k_indices = jax.lax.top_k(gate_logits, self.num_experts_per_tok)
     flattened_top_k_weights = top_k_weights.reshape(-1, self.num_experts_per_tok)
 
@@ -336,19 +420,39 @@ class MoeBlock(nn.Module):
     index_update = (jnp.arange(gate_logits.shape[0])[:, None, None], jnp.arange(gate_logits.shape[1])[:, None], top_k_indices)
     weights = weights.at[index_update].set(softmax_probs)
 
-    w0_kernel, w1_kernel, wo_kernel = self.generate_kernels(cfg.num_experts,
-                                                            cfg.emb_dim,
-                                                            cfg.mlp_dim)
-    
+    inputs = nn.with_logical_constraint(inputs, ("activation_batch", "activation_length", "activation_embed"))
     with jax.named_scope("wi_0"):
       layer_w0 = jnp.einsum("BLE,NEH -> BLNH", inputs, w0_kernel)
     with jax.named_scope("wi_1"):
       layer_w1 = jnp.einsum("BLE,NEH -> BLNH", inputs, w1_kernel)
-    layer_w0_act = _convert_to_activation_function(cfg.mlp_activations[0])(layer_w0)
+    layer_w0_act = _convert_to_activation_function(self.config.mlp_activations[0])(layer_w0)
     layer_multiply = jnp.multiply(layer_w0_act, layer_w1)
     with jax.named_scope("wo"):
       intermediate_layer = jnp.einsum("BLNH,NHE -> BLNE", layer_multiply, wo_kernel)
     with jax.named_scope("w_sum"):
       output = jnp.einsum("BLNE,BLN -> BLE", intermediate_layer, weights)
-    
     return output
+
+  @nn.compact
+  def __call__(self, inputs):
+    cfg = self.config
+    inputs = inputs.astype(cfg.dtype)
+    gate_logits = DenseGeneral(
+            self.num_experts,
+            dtype=self.dtype,
+            weight_dtype=self.weight_dtype,
+            quant=self.quant,
+            kernel_init=self.kernel_init,
+            kernel_axes=self.kernel_axes,
+            name="gate")(inputs)
+
+    w0_kernel, w1_kernel, wo_kernel = self.generate_kernels(cfg.num_experts,
+                                                            cfg.emb_dim,
+                                                            cfg.mlp_dim)
+
+    if cfg.megablox:
+      max_logging.log("Running MoE megablox implementation.")
+      return self.megablox(inputs, gate_logits, w0_kernel, w1_kernel, wo_kernel)
+    else:
+      max_logging.log("Running MoE matmul implementation.")
+      return self.dense_matmul(inputs, gate_logits, w0_kernel, w1_kernel, wo_kernel)

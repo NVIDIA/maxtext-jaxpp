@@ -38,7 +38,7 @@ RAY_ADDRESS=local \
   base_output_directory=/tmp/log hardware=gpu dataset_type=synthetic \
   model_name=gpt3-52k steps=20 dtype=bfloat16 max_target_length=1024 per_device_batch_size=4 \
   dcn_data_parallelism=2 ici_tensor_parallelism=2 enable_checkpointing=false use_jaxpp=True \
-  distributed_initialization=True num_workers=2 num_microbatches=2 use_pgle=False
+  distributed_initialization=True ici_pipeline_parallelism=2 num_pipeline_microbatches=2 use_pgle=False
 ```
 
 To train on cs-oci-ord or eos, [`slurm/maxtext.sh](slurm/maxtext.sh) can be run on the login node.
