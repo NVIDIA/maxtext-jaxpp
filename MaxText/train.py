@@ -357,10 +357,28 @@ def train_step(model, config, state, data, dropout_rng, state_pspec=None):
     rng2: A new rng key that can be used in future calls.
 
   """
+  def masked_cast(path, val, dtype):
+    def get_stage_id(path):
+      if len(path) > 1:
+        if path[1].key.startswith("layers_"):
+          return int(path[1].key[len("layers_"):])
+        elif path[1].key.startswith("SequentialBlockDecoderLayers_"):
+          return int(path[1].key[len("SequentialBlockDecoderLayers_"):])
+      return None
+
+    if (stage_id := get_stage_id(path)) is not None:
+      worker = stage_id % config.ici_pipeline_parallelism
+      if config.jaxpp_cast_worker_idx is not None and worker >= config.jaxpp_cast_worker_idx:
+        return jnp.astype(val, dtype)
+    return val
+
+  casted_params = {**state.params, "params": jax.tree_util.tree_map_with_path(functools.partial(masked_cast, dtype=config.dtype), state.params['params'])}
   def compute_grads(data):
     train_loss_fn = functools.partial(loss_fn, model, config, data, dropout_rng, is_train=True)
     grad_fn = jax.value_and_grad(train_loss_fn, has_aux=True)
-    (loss, aux), raw_grads = grad_fn(state.params)
+    # (loss, aux), raw_grads = grad_fn(state.params)
+    (loss, aux), raw_grads = grad_fn(casted_params)
+    raw_grads['params'] = jax.tree_util.tree_map_with_path(functools.partial(masked_cast, dtype=jnp.float32), raw_grads['params'])
     return LoopOutput.create(((loss, aux), raw_grads))
 
   if not config.use_jaxpp:
