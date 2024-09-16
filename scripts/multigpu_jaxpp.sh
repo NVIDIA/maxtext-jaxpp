@@ -55,9 +55,9 @@ do
         BS_PER_DEVICE="${arg#*=}"
         shift # Remove --batch_size_per_device= from processing
         ;;
-        --num_microbatches=*)
+        --num_pipeline_microbatches=*)
         MICRO_BS="${arg#*=}"
-        shift # Remove --num_microbatches= from processing
+        shift # Remove --num_pipeline_microbatches= from processing
         ;;
         *)
         BYPASS_ARGUMENTS="${BYPASS_ARGUMENTS} ${arg}"
@@ -134,6 +134,8 @@ RAY_ADDRESS=local python ${BASE_DIR}/MaxText/train.py \
     base_output_directory=${OUTPUT_PATH} \
     dataset_type=synthetic \
     dcn_data_parallelism=${DATA_PARALLELISM} \
+    ici_pipeline_parallelism=${PIPELINE_PARALLELISM} \
+    num_pipeline_repeats=1 \
     ici_tensor_parallelism=${MODEL_PARALLELISM} \
     enable_checkpointing=false \
     hardware=gpu \
@@ -147,7 +149,6 @@ RAY_ADDRESS=local python ${BASE_DIR}/MaxText/train.py \
     `# ------------- JAXPP ------------- #` \
     use_jaxpp=true \
     distributed_initialization=true \
-    num_workers=${PIPELINE_PARALLELISM} \
-    num_microbatches=${MICRO_BS}\
+    num_pipeline_microbatches=${MICRO_BS}\
     use_pgle=False \
     ${BYPASS_ARGUMENTS}

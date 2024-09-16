@@ -19,95 +19,15 @@ import itertools as it
 
 import numpy as np
 import tensorflow as tf
-import tensorflow_datasets as tfds
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from input_pipeline import _tfds_data_processing
-from input_pipeline import _grain_data_processing
-from input_pipeline import _tfds_data_processing_c4_mlperf
-from input_pipeline import _hf_data_processing
-import tokenizer
+from input_pipeline._tfds_data_processing import make_tfds_iterator
+from input_pipeline._grain_data_processing import make_grain_iterator
+from input_pipeline._tfds_data_processing_c4_mlperf import make_c4_mlperf_train_iterator, make_c4_mlperf_eval_iterator
+from input_pipeline._hf_data_processing import make_hf_iterator
 import multihost_dataloading
-
-
-def get_tokenizer(tokenizer_path, add_bos=True, add_eos=True):
-  # Load tokenizer
-  sp_tokenizer = tokenizer.load_tokenizer(tokenizer_path=tokenizer_path, add_bos=add_bos, add_eos=add_eos)
-  return sp_tokenizer
-
-
-def make_c4_mlperf_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos, process_indices):
-  """Make train iterator and tokenizer for customized C4 dataset for mlperf gpt3 training."""
-  train_ds, eval_ds = _tfds_data_processing_c4_mlperf.get_datasets(
-      config=config,
-      dataloading_host_index=process_indices.index(jax.process_index()),
-      dataloading_host_count=len(process_indices),
-  )
-  sp_tokenizer = get_tokenizer(config.tokenizer_path, add_bos, add_eos)
-  train_iter, eval_iter = _tfds_data_processing_c4_mlperf.preprocess_dataset(
-      config, mesh, train_ds, eval_ds, sp_tokenizer, data_shuffle_seed=config.data_shuffle_seed
-  )
-  return train_iter, eval_iter, sp_tokenizer
-
-
-def make_c4_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos, process_indices):
-  """Make train iterator and tokenizer for C4 dataset"""
-  read_config = tfds.ReadConfig(
-      shuffle_seed=config.data_shuffle_seed,
-  )
-  train_ds, eval_ds = _tfds_data_processing.get_datasets(
-      config=config,
-      dataloading_host_index=process_indices.index(jax.process_index()),
-      dataloading_host_count=len(process_indices),
-      read_config=read_config,
-  )
-  sp_tokenizer = get_tokenizer(config.tokenizer_path, add_bos, add_eos)
-  train_iter, _, _ = _tfds_data_processing.preprocess_dataset(
-      config,
-      mesh,
-      train_ds,
-      eval_ds,
-      sp_tokenizer,
-      data_shuffle_seed=config.data_shuffle_seed,
-  )
-  return train_iter, None, sp_tokenizer
-
-
-def make_hf_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos, process_indices):
-  """Make train iterator using huggingface data pipeline"""
-  train_ds, _ = _hf_data_processing.get_datasets(config=config)
-
-  train_iter, _, _ = _hf_data_processing.preprocess_dataset(
-      config,
-      dataloading_host_index=process_indices.index(jax.process_index()),
-      dataloading_host_count=len(process_indices),
-      global_mesh=mesh,
-      dataset=train_ds,
-      add_bos=add_bos,
-      add_eos=add_eos,
-  )
-  return train_iter, None, None
-
-
-def make_grain_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos, process_indices):
-  """Make train iterator and tokenizer for C4 dataset"""
-  train_ds, eval_ds = _grain_data_processing.get_datasets(config=config)
-  sp_tokenizer = get_tokenizer(config.tokenizer_path, add_bos, add_eos)
-  train_iter, _, _ = _grain_data_processing.preprocess_dataset(
-      config,
-      dataloading_host_index=process_indices.index(jax.process_index()),
-      dataloading_host_count=len(process_indices),
-      global_mesh=mesh,
-      train_ds=train_ds,
-      eval_ds=eval_ds,
-      vocab_path=config.tokenizer_path,
-      data_shuffle_seed=config.data_shuffle_seed,
-      add_bos=add_bos,
-      add_eos=add_eos,
-  )
-  return train_iter, None, sp_tokenizer
 
 
 class SyntheticDataIterator:
@@ -200,47 +120,70 @@ def get_process_loading_real_data(config, mesh):
   return list(process_loading_real_data)
 
 
-def make_mixed_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos):
+def make_mixed_train_iterator(config, mesh):
+  """Return iterators according to dataset_type"""
   process_indices = get_process_loading_real_data(config, mesh)
   if config.expansion_factor_real_data != -1:  # assert number of hosts loading real data
     assert len(process_indices) == jax.process_count() // config.expansion_factor_real_data
   if jax.process_index() in process_indices:
-    if config.dataset_type == "c4":
-      return make_c4_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos, process_indices)
-    elif config.dataset_type == "c4-array_record":
-      return make_grain_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos, process_indices)
-    elif config.dataset_type == "c4_mlperf":
-      print("Overwrite both add_bos and add_eos to False")
-      return make_c4_mlperf_train_iterator_and_tokenizer(
-          config, mesh, add_bos=False, add_eos=False, process_indices=process_indices
-      )
+    if config.dataset_type == "tfds":
+      return make_tfds_iterator(config, mesh, process_indices)
+    elif config.dataset_type == "grain":
+      return make_grain_iterator(config, mesh, process_indices)
     elif config.dataset_type == "hf":
-      return make_hf_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos, process_indices)
+      return make_hf_iterator(config, mesh, process_indices)
   else:
-    return BadSyntheticDataIterator(config, mesh), None, get_tokenizer(config.tokenizer_path, add_bos, add_eos)
+    return BadSyntheticDataIterator(config, mesh), None
 
 
-def create_data_iterator_with_tokenizer(config, mesh, add_bos=True, add_eos=True):
+def make_c4_mlperf_iterator(config, mesh):
+  """Return iterators for c4_mlperf"""
+  # TODO: Merge this function into make_mixed_train_iterator after:
+  #   we independently split process_indices for training and evaluation iterators.
+  process_indices = get_process_loading_real_data(config, mesh)
+  if config.expansion_factor_real_data != -1:  # assert number of hosts loading real data
+    assert len(process_indices) == jax.process_count() // config.expansion_factor_real_data
+  print("Overwrite both add_bos and add_eos to False")
+  if jax.process_index() in process_indices:
+    train_iterator = make_c4_mlperf_train_iterator(config, mesh, add_bos=False, add_eos=False, process_indices=process_indices)
+  else:
+    train_iterator = BadSyntheticDataIterator(config, mesh)
+
+  if config.eval_per_device_batch_size >= 0:
+    effective_eval_per_device_batch_size = config.eval_per_device_batch_size
+  else:
+    effective_eval_per_device_batch_size = config.per_device_batch_size
+
+  assert effective_eval_per_device_batch_size >= 1.0, f"{effective_eval_per_device_batch_size=} is less than 1, which is not supported."
+  # Use all processes for evaluation until split is handled independently
+  eval_process_indices = list(range(jax.process_count()))
+  eval_iterator = make_c4_mlperf_eval_iterator(config, mesh, eval_process_indices)
+  return train_iterator, eval_iterator
+
+
+def create_data_iterator(config, mesh):
+  if config.use_jaxpp:
+    assert config.dataset_type == "synthetic", "JaxPP was tested only on synthetic dataset"
   if config.dataset_type == "synthetic":
     data_iter = None
     if config.use_jaxpp:
       def microbatched(a):
-        return a.reshape(config.dcn_data_parallelism, config.num_microbatches, -1, config.max_target_length)
+        return a.reshape(config.dcn_data_parallelism, config.num_pipeline_microbatches, -1, config.max_target_length)
       data_iter = it.repeat(jax.tree.map(microbatched, SyntheticDataIterator.raw_generate_synthetic_data(config)))
     else:
       data_iter = SyntheticDataIterator(config, mesh)
-    return data_iter, None, get_tokenizer(config.tokenizer_path, add_bos, add_eos)
-  elif config.dataset_type in ("c4", "c4-array_record", "c4_mlperf", "hf"):
-    return SyntheticDataIterator(config, mesh), None, get_tokenizer(config.tokenizer_path, add_bos, add_eos)
-  elif config.dataset_type in ("c4", "c4-array_record", "c4_mlperf", "hf"):
-    return make_mixed_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos)
+    return data_iter, None
+  elif config.dataset_type in ("tfds", "grain", "hf"):
+    return make_mixed_train_iterator(config, mesh)
+  elif config.dataset_type == "c4_mlperf":
+    return make_c4_mlperf_iterator(config, mesh)
   else:
-    assert False, "dataset type not implemented"
+    assert False, f"Unknown dataset_type {config.dataset_type}, dataset_type must be synthetic, tfds, grain, hf or c4_mlperf"
 
 
 def get_shaped_batch(config):
   """Return the shape of the batch - this is what eval_shape would return for the
-  output of create_data_iterator_with_tokenizer, but eval_shape doesn't work, see b/306901078."""
+  output of create_data_iterator, but eval_shape doesn't work, see b/306901078."""
   batch_shape = (config.global_batch_size_to_load, config.max_target_length)
   shaped_batch = {}
   shaped_batch["inputs"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
