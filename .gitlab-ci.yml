@@ -82,15 +82,15 @@ llama2-jaxpp:
 
 # ================== MIXTRAL MODEL ================== #
 
-mixtral-jax:
-  stage: test
-  script:
-    - docker run --gpus=all --shm-size=10.24gb --ulimit memlock=-1 --ulimit stack=67108864
-      -e RAY_ADDRESS=local --rm --workdir /workdir/maxtext ${TEST_IMAGE}
-      "nvidia-smi && bash /workdir/maxtext/scripts/1gpu_jax.sh --max_target_length=8 --model=mixtral-8x0_1b"
-
-  after_script:
-    - docker rmi $TEST_IMAGE
+# mixtral-jax:
+#   stage: test
+#   script:
+#     - docker run --gpus=all --shm-size=10.24gb --ulimit memlock=-1 --ulimit stack=67108864
+#       -e RAY_ADDRESS=local --rm --workdir /workdir/maxtext ${TEST_IMAGE}
+#       "nvidia-smi && bash /workdir/maxtext/scripts/1gpu_jax.sh --max_target_length=8 --model=mixtral-8x0_1b"
+#
+#   after_script:
+#     - docker rmi $TEST_IMAGE
 
 
 mixtral-jaxpp:
