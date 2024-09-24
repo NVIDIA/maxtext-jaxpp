@@ -147,8 +147,10 @@ class DecoderLayer(nn.Module):
 
     return layer_output, None if cfg.scan_layers else layer_output
 
+
 class SequentialBlockDecoderLayers(nn.Module):
   """Sequential unscanned series of decoder layers."""
+
   decoder_layer: Any
   num_decoder_layers: int
   config: Config
@@ -159,13 +161,14 @@ class SequentialBlockDecoderLayers(nn.Module):
   def __call__(self, inputs: jnp.ndarray, decoder_segment_ids, decoder_positions, deterministic, model_mode) -> jnp.ndarray:
     for lyr in range(self.num_decoder_layers):
       inputs = self.decoder_layer(config=self.config, mesh=self.mesh, name=f"layers_{lyr}", quant=self.quant)(
-        inputs,
-        decoder_segment_ids,
-        decoder_positions,
-        deterministic,
-        model_mode,
-        )
+          inputs,
+          decoder_segment_ids,
+          decoder_positions,
+          deterministic,
+          model_mode,
+      )
     return inputs
+
 
 class Decoder(nn.Module):
   """A stack of decoder layers as a part of an encoder-decoder architecture."""
@@ -207,11 +210,15 @@ class Decoder(nn.Module):
       from layers import simple_layer
 
       return simple_layer.SimpleDecoderLayer
+    elif self.config.decoder_block == "simple_mlp":
+      from layers import simple_layer
+
+      return simple_layer.SimpleMlpDecoderLayer
     else:
       raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block=}")
 
   def get_norm_layer(self):
-    if self.config.decoder_block in ("default", "llama2", "mistral", "gemma", "gemma2", "simple", "grok"):
+    if self.config.decoder_block in ("default", "llama2", "mistral", "gemma", "gemma2", "simple", "simple_mlp", "grok"):
       return RMSNorm
     elif self.config.decoder_block == "gpt3":
       from layers import gpt3
@@ -225,26 +232,26 @@ class Decoder(nn.Module):
     params_spec = cfg.param_scan_axis if initializing else ScanIn(cfg.param_scan_axis)
     cache_spec = 0
     scan_fn = nn.scan(
-      decoder_layer,
-      variable_axes={
-          "params": params_spec,
-          "cache": cache_spec,
-          "intermediates": 0,
-          "aqt": 0,
-          "_overwrite_with_gradient": 0,
-      },
-      split_rngs={
-          "params": True,
-          "dropout": cfg.enable_dropout,
-      },
-      in_axes=(
-          nn.broadcast,
-          nn.broadcast,
-          nn.broadcast,
-          nn.broadcast,
-      ),
-      length=length,
-      metadata_params={nn.PARTITION_NAME: metdata_axis_name},
+        decoder_layer,
+        variable_axes={
+            "params": params_spec,
+            "cache": cache_spec,
+            "intermediates": 0,
+            "aqt": 0,
+            "_overwrite_with_gradient": 0,
+        },
+        split_rngs={
+            "params": True,
+            "dropout": cfg.enable_dropout,
+        },
+        in_axes=(
+            nn.broadcast,
+            nn.broadcast,
+            nn.broadcast,
+            nn.broadcast,
+        ),
+        length=length,
+        metadata_params={nn.PARTITION_NAME: metdata_axis_name},
     )
     return scan_fn(config=cfg, mesh=mesh, name=name, quant=self.quant)
 
@@ -341,47 +348,55 @@ class Decoder(nn.Module):
         static_argnums=(-1, -2, -3, -4, -5),
     )
     if cfg.using_pipeline_parallelism:
-        if cfg.use_jaxpp:
-            num_logical_stages = cfg.ici_pipeline_parallelism * cfg.num_pipeline_repeats
-            layers_per_stage, rem = divmod(cfg.num_decoder_layers, num_logical_stages)
-            for stage in range(num_logical_stages):
-                # NOTE: for uneven splits of layers by number of stages, spread remaining
-                #  layers on first few stages.
-                num_layers_in_pipeline_stage = layers_per_stage + (1 if stage < rem else 0)
-                # NOTE: we avoid rematerialization for the last stage
-                is_last_stage = stage == num_logical_stages - 1
-                MaybeRemattedBlockLayer = BlockLayer if is_last_stage else RemattedBlockLayer
-                if num_layers_in_pipeline_stage == 1:
-                    stage_module = MaybeRemattedBlockLayer(config=cfg, mesh=mesh, quant=self.quant)
-                elif cfg.scan_layers:
-                    stage_module = self.scan_decoder_layers(cfg, MaybeRemattedBlockLayer, num_layers_in_pipeline_stage, "layers_per_stage", mesh, name=f"layers_{stage}")
-                elif not cfg.scan_layers:
-                    stage_module=SequentialBlockDecoderLayers(decoder_layer=MaybeRemattedBlockLayer, num_decoder_layers=num_layers_in_pipeline_stage, config=cfg, mesh=mesh,quant=self.quant)
-                y = stage_module(
-                    y,
-                    decoder_segment_ids,
-                    decoder_positions,
-                    deterministic,
-                    model_mode,
-                )
-                if cfg.scan_layers:
-                  y = y[0]
-                if not is_last_stage:
-                  y = jaxpp.pipeline_enter_stage(y, f"stage_{stage}", stage + 1)
-        else:
-            if cfg.num_layers_per_pipeline_stage == 1:
-              stage_module = BlockLayer(config=cfg, mesh=mesh, quant=self.quant)
-            elif cfg.scan_layers:
-              stage_module = self.scan_decoder_layers(cfg, RemattedBlockLayer, cfg.num_layers_per_pipeline_stage, "layers_per_stage", mesh)
-            elif not cfg.scan_layers:
-              stage_module=SequentialBlockDecoderLayers(decoder_layer=RemattedBlockLayer, num_decoder_layers=cfg.num_layers_per_pipeline_stage, config=cfg, mesh=mesh,quant=self.quant)
-            y = pipeline.Pipeline(config=cfg, mesh=mesh, layers=stage_module, remat_policy=policy)(
-                y,
-                decoder_segment_ids,
-                decoder_positions,
-                deterministic,
-                model_mode,
-            )
+      if cfg.use_jaxpp:
+        num_logical_stages = cfg.ici_pipeline_parallelism * cfg.num_pipeline_repeats
+        layers_per_stage, rem = divmod(cfg.num_decoder_layers, num_logical_stages)
+        for stage in range(num_logical_stages):
+          # NOTE: for uneven splits of layers by number of stages, spread remaining
+          #  layers on first few stages.
+          num_layers_in_pipeline_stage = layers_per_stage + (1 if stage < rem else 0)
+          # NOTE: we avoid rematerialization for the last stage
+          is_last_stage = stage == num_logical_stages - 1
+          MaybeRemattedBlockLayer = BlockLayer if is_last_stage else RemattedBlockLayer
+          if num_layers_in_pipeline_stage == 1:
+              stage_module = MaybeRemattedBlockLayer(config=cfg, mesh=mesh, quant=self.quant)
+          elif cfg.scan_layers:
+              stage_module = self.scan_decoder_layers(cfg, MaybeRemattedBlockLayer, num_layers_in_pipeline_stage, "layers_per_stage", mesh, name=f"layers_{stage}")
+          elif not cfg.scan_layers:
+              stage_module=SequentialBlockDecoderLayers(decoder_layer=MaybeRemattedBlockLayer, num_decoder_layers=num_layers_in_pipeline_stage, config=cfg, mesh=mesh,quant=self.quant)
+          y = stage_module(
+              y,
+              decoder_segment_ids,
+              decoder_positions,
+              deterministic,
+              model_mode,
+          )
+          if cfg.scan_layers:
+            y = y[0]
+          if not is_last_stage:
+            y = jaxpp.pipeline_enter_stage(y, f"stage_{stage}", stage + 1)
+      else:
+        if cfg.num_layers_per_pipeline_stage == 1:
+          stage_module = BlockLayer(config=cfg, mesh=mesh, quant=self.quant)
+        elif cfg.scan_layers:
+          stage_module = self.scan_decoder_layers(
+              cfg, RemattedBlockLayer, cfg.num_layers_per_pipeline_stage, "layers_per_stage", mesh
+          )
+        elif not cfg.scan_layers:
+          stage_module=SequentialBlockDecoderLayers(
+              decoder_layer=RemattedBlockLayer,
+              num_decoder_layers=cfg.num_layers_per_pipeline_stage,
+              config=cfg,
+              mesh=mesh,
+              quant=self.quant,
+          )
+        y = pipeline.Pipeline(config=cfg, mesh=mesh, layers=stage_module, remat_policy=policy)(
+            y,
+            decoder_segment_ids,
+            decoder_positions,
+            deterministic,
+            model_mode,
+          )
     else:
       if cfg.scan_layers:
         y, _ = self.scan_decoder_layers(cfg, RemattedBlockLayer, cfg.num_decoder_layers, "layers", mesh)(
@@ -427,10 +442,13 @@ class Decoder(nn.Module):
           dtype=jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype,  # for logit training stability
           kernel_axes=("embed", "vocab"),
           name="logits_dense",
+          matmul_precision=self.config.matmul_precision,
       )(
           y
       )  # We do not quantize the logits matmul.
-    logits = nn.with_logical_constraint(logits, ("activation_embed_and_logits_batch", "activation_length", "activation_vocab"))
+    logits = nn.with_logical_constraint(
+        logits, ("activation_embed_and_logits_batch", "activation_length", "activation_vocab")
+    )
     logits = logits.astype(jnp.float32)
     return logits
 
