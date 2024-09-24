@@ -829,6 +829,7 @@ def train_loop(config, state=None):
       state, metrics = p_train_step(state, example_batch, nextrng)
       if config.use_jaxpp:
         metrics['scalar']['learning/loss'] = np.array(metrics['scalar']['learning/loss']).sum()
+        metrics['scalar']['learning/moe_lb_loss'] = np.array(metrics['scalar']['learning/moe_lb_loss']).sum()
         metrics['scalar']['learning/total_weights'] = np.array(metrics['scalar']['learning/total_weights']).sum()
 
     new_time = datetime.datetime.now()
