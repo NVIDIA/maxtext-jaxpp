@@ -93,6 +93,26 @@ def load_compiled(config, partial_train, state):
   return p_train_step
 
 
+def calculate_decoder_block_grok_flops(config, log=True):
+  gate_flops = 2 * config.per_device_batch_size * config.max_target_length * config.emb_dim * config.num_experts
+  group_size = config.per_device_batch_size * config.max_target_length // config.moe_groups
+  capacity = int(config.capacity_factor * group_size / config.num_experts)
+  expert_capacity = ((capacity + 3) // 4) * 4
+  gate_top2_flops = (
+    (2 * config.moe_groups * group_size * config.num_experts) * 9
+    +
+    (2 * config.per_device_batch_size * config.max_target_length * config.num_experts * expert_capacity) * 4
+  )
+  dispatch_flops = 2 * config.per_device_batch_size * config.max_target_length * config.num_experts * expert_capacity * config.emb_dim
+  ffn_flops = (2 * config.num_experts * config.moe_groups * expert_capacity * config.emb_dim * config.ffn_size) * 3
+  combine_flops = 2 * config.num_experts * config.per_device_batch_size * config.max_target_length * expert_capacity * config.emb_dim
+
+  total_flops = gate_flops + gate_top2_flops + dispatch_flops + ffn_flops + combine_flops
+  if log:
+    print(f"{gate_flops=}, {gate_top2_flops=}, {dispatch_flops=}, {ffn_flops=}, {combine_flops=}")
+  return total_flops
+
+
 def calculate_tokens_training_per_device(config):
   """Calculate training Tokens per device"""
   return config.max_target_length * config.per_device_batch_size * config.gradient_accumulation_steps
@@ -139,9 +159,12 @@ def calculate_tflops_training_per_device(config, log=True):
   total_ffn_flops = ffn1_flops + ffn2_flops
 
   if config.num_experts > 1:
-    # MoE: brute force implementation
-    gate_flops = 2 * config.per_device_batch_size * config.max_target_length * config.emb_dim * config.num_experts
-    total_ffn_flops = gate_flops + config.num_experts_per_tok * total_ffn_flops
+    if config.decoder_block == "grok" and config.capacity_factor > 0:
+      total_ffn_flops = calculate_decoder_block_grok_flops(config, log)
+    else:
+      # MoE: brute force implementation
+      gate_flops = 2 * config.per_device_batch_size * config.max_target_length * config.emb_dim * config.num_experts
+      total_ffn_flops = gate_flops + config.num_experts_per_tok * total_ffn_flops
 
   qkv_flops = (
       2

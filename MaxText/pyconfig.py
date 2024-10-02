@@ -179,6 +179,7 @@ def validate_model_name(s: str) -> bool:
       "gpt3-6b",
       "gpt3-52k",
       "grok-314b",
+      "grok-80b",
   )
   if s not in valid_model_names:
     raise ValueError("Invalid model name was passed. Valid options ", valid_model_names)
@@ -405,6 +406,11 @@ class _HyperParameters:
     raw_keys["logical_axis_rules"] = _lists_to_tuples(raw_keys["logical_axis_rules"])
     raw_keys["data_sharding"] = _lists_to_tuples(raw_keys["data_sharding"])
 
+    if raw_keys["num_experts"] > 1:
+      raw_keys["ffn_size"] = max_utils.ffn_size(raw_keys["emb_dim"], raw_keys["widening_factor"])
+    else:
+      raw_keys["ffn_size"] = None
+
     validate_keys(raw_keys)
     validate_data_input(raw_keys)
 
@@ -480,10 +486,7 @@ def create_new_logical_axis_rules(old_logical_axis_rules, new_logical_axis_rules
 def update_model_keys(raw_keys, model_keys, key):
   """Update `key` value in `raw_keys` from the value in `model_keys`."""
   assert key in model_keys and key in raw_keys
-  if key == "logical_axis_rules":
-    raw_keys[key] = create_new_logical_axis_rules(
-        old_logical_axis_rules=raw_keys[key], new_logical_axis_rules=model_keys[key]
-    )
+  if key == 'logical_axis_rules' and not raw_keys["use_overridden_axis_rules"]:
     return
   raw_keys[key] = model_keys[key]
 

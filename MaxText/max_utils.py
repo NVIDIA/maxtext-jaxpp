@@ -854,7 +854,6 @@ def summarize_pytree_data(params, name="Params", raw=False):
     )
   return num_params, total_param_size, avg_param_size
 
-
 def save_quantized_checkpoint_if_configured(config, params):
   assert config.quantization, "quantization must be configured"
   if config.save_quantized_params_path:
@@ -881,3 +880,12 @@ def print_system_information():
   max_logging.log(f"System Information: Jax Version: {jax.__version__}")
   max_logging.log(f"System Information: Jaxlib Version: {jax.lib.__version__}")
   max_logging.log(f"System Information: Jax Backend: {jax.lib.xla_bridge.get_backend().platform_version}")
+
+
+def ffn_size(emb_size, widening_factor=8.0):
+  if widening_factor <= 0:
+      return None # disable
+  _ffn_size = int(widening_factor * emb_size) * 2 // 3
+  _ffn_size = _ffn_size + (8 - _ffn_size) % 8  # ensure it's a multiple of 8
+  max_logging.log(f"emd_size: {emb_size} adjusted ffn_size: {_ffn_size}")
+  return _ffn_size

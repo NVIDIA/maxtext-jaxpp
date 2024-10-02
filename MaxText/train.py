@@ -641,7 +641,7 @@ def setup_train_loop(config):
   )
 
   def make_line(keypath, abs_value):
-    return (f"{jax.tree_util.keystr(keypath):<100}, {str(abs_value.dtype):<10}, "
+    return (f"{jax.tree_util.keystr(keypath):<120}, {str(abs_value.dtype):<10}, "
             f"{str(abs_value.shape):<26}, {abs_value.sharding._to_xla_hlo_sharding(abs_value.ndim)}")
 
   max_logging.log("shardings/weights")
@@ -808,6 +808,7 @@ def train_loop(config, state=None):
 
   example_batch = None
   step_time = []
+  step_tflops = []
   last_step_completion = datetime.datetime.now()
   prof = profiler.Profiler(config)
   for step in np.arange(start_step, config.steps):
@@ -849,6 +850,7 @@ def train_loop(config, state=None):
 
     write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, step, config)
     step_time.append(metrics['scalar']['perf/step_time_seconds'])
+    step_tflops.append(metrics['scalar']['perf/per_device_tflops_per_sec'])
 
     if config.eval_interval > 0 and step > start_step and (step + 1) % config.eval_interval == 0:
       assert eval_data_iterator
@@ -906,7 +908,9 @@ def train_loop(config, state=None):
   # last_profiling_step + 2 as (1) we count steps from 0, and (2) the execution time for merge_multihost_xplanes is
   # counted toward the execution time for the step right after the last profiling step.
   num_warmup_steps = (last_profiling_step + 2) if config.profiler != "" else 6
-  max_logging.log(f"excluding the first {num_warmup_steps} steps: avg time per step {mean(step_time[num_warmup_steps:])}")
+  max_logging.log(
+      f"excluding the first {num_warmup_steps} steps: avg time per step {mean(step_time[num_warmup_steps:])}, avg tflops per step {mean(step_tflops[num_warmup_steps:])}"
+  )
   return state
 
 
