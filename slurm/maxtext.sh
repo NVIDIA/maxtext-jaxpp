@@ -13,6 +13,7 @@ PP=${PP:-8}
 DP=${DP:-1}
 TP=${TP:-8}
 VP=${VP:-3}
+EP=${EP:-1}
 DTYPE=${DTYPE:-"bfloat16"}
 STEPS=${STEPS:-20}
 MBS=${MBS:-2}
@@ -56,15 +57,16 @@ elif [[ "${MODEL}" == grok-* ]]; then
   SEQ_LEN=${SEQ_LEN:-8192}
 fi
 
-command="python /workdir/maxtext/MaxText/train.py /workdir/maxtext/MaxText/configs/base.yml     \
-        run_name=runner_jaxpp_${timestamp} base_output_directory=$log_dir                       \
-        model_name=${MODEL} dtype=${DTYPE} steps=${STEPS}                                       \
-        dcn_data_parallelism=${DP} ici_pipeline_parallelism=${PP} ici_tensor_parallelism=${TP}  \
-        hardware=gpu dataset_type=synthetic enable_checkpointing=False                          \
-        per_device_batch_size=$(( ($MBS * $GA) / ($PP * $TP * $DP) ))                           \
-        num_pipeline_microbatches=${GA} max_target_length=${SEQ_LEN}                            \
-        num_pipeline_repeats=${VP}                                                              \
-        use_jaxpp=True schedule=${SCHEDULE} profiler=${PROFILER}                                \
+command="python /workdir/maxtext/MaxText/train.py /workdir/maxtext/MaxText/configs/base.yml  \
+        run_name=runner_jaxpp_${timestamp} base_output_directory=$log_dir                    \
+        model_name=${MODEL} dtype=${DTYPE} steps=${STEPS}                                    \
+        dcn_data_parallelism=${DP} ici_pipeline_parallelism=${PP}                            \
+        ici_expert_parallelism=${EP} ici_tensor_parallelism=${TP}                            \
+        hardware=gpu dataset_type=synthetic enable_checkpointing=False                       \
+        per_device_batch_size=$(( ($MBS * $GA) / ($PP * $TP * $DP * $EP) ))                  \
+        num_pipeline_microbatches=${GA} max_target_length=${SEQ_LEN}                         \
+        num_pipeline_repeats=${VP}                                                           \
+        use_jaxpp=True schedule=${SCHEDULE} profiler=${PROFILER}                             \
         use_pgle=${USE_PGLE} distributed_initialization=True ${EXTRA_SCRIPT_FLAGS}"
 
 sbatch_flags="--chdir=${output_dir}                                                         \

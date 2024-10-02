@@ -337,6 +337,8 @@ class Decoder(nn.Module):
         )
       elif cfg.remat_policy == 'dots_saveable':
         policy = jax.checkpoint_policies.dots_saveable
+      elif cfg.remat_policy == 'save_dot_only':
+        policy = jax.checkpoint_policies.checkpoint_dots
       else:
         assert cfg.remat_policy == "full", "Remat policy needs to be on list of remat policies"
         policy = None

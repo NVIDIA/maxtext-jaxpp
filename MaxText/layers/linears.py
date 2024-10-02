@@ -23,6 +23,7 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 import common_types
+import max_logging
 from layers import initializers
 from layers import normalizations
 from layers import quantizations
@@ -579,26 +580,143 @@ class MoeBlock(nn.Module):
         ).astype(self.dtype)
       return output, None
 
-  @nn.compact
-  def __call__(self, inputs):
+  def gating_top2(self, logits):
+    """
+    Abbreviations:
+      B: batch size
+      L: sequence length
+      M: input dimension
+      G: number of groups
+      S: group size
+      E: number of experts
+    """
     cfg = self.config
-    inputs = inputs.astype(cfg.dtype)
+    num_groups, group_size, experts_dim = logits.shape
+    assert cfg.capacity_factor > 0, "Token dropping is required in paxml_top2, but {cfg.capacity_factor=} found"
+    capacity = int(cfg.capacity_factor * group_size / experts_dim)
+    expert_capacity_dim = ((capacity + 3) // 4) * 4 # Round up to a multiple of 4
+    fprop_dtype = mask_dtype = self.dtype
+    raw_gates = jax.nn.softmax(logits, axis=-1)
+
+    # top-1
+    index_1 = jnp.argmax(raw_gates, axis=-1)
+    mask_1 = jax.nn.one_hot(index_1, experts_dim, dtype=mask_dtype)
+    gate_1 = jnp.einsum('GSE,GSE->GS', raw_gates, mask_1.astype(raw_gates.dtype))
+    gates_without_top_1 = raw_gates * (1.0 - mask_1.astype(raw_gates.dtype))
+
+    # top-2
+    index_2 = jnp.argmax(gates_without_top_1, axis=-1)
+    mask_2 = jax.nn.one_hot(index_2, experts_dim, dtype=mask_dtype)
+    gate_2 = jnp.einsum('GSE,GSE->GS', gates_without_top_1, mask_2.astype(gates_without_top_1.dtype))
+
+    if cfg.legacy_mtf_behavior:
+      denom = gate_1 + gate_2 + 1e-9
+      gate_1 /= denom
+      gate_2 /= denom
+
+    # top-1 position
+    position_in_expert_1 = jnp.cumsum(mask_1, axis=-2) - mask_1
+    mask_1 *= jnp.less(position_in_expert_1, expert_capacity_dim).astype(mask_1.dtype)
+    position_in_expert_1 = jnp.einsum('GSE,GSE->GS', position_in_expert_1, mask_1)
+    mask_1_flat = jnp.sum(mask_1, axis=-1, dtype=mask_dtype)
+    mask_1_count = jnp.einsum('GSE->GE', mask_1)
+
+    # top-2 position
+    position_in_expert_2 = jnp.cumsum(mask_2, axis=-2) - mask_2 + jnp.expand_dims(mask_1_count, -2)
+    mask_2 *= jnp.less(position_in_expert_2, expert_capacity_dim).astype(mask_2.dtype)
+    position_in_expert_2 = jnp.einsum('GSE,GSE->GS', position_in_expert_2, mask_2)
+    mask_2_flat = jnp.sum(mask_2, axis=-1, dtype=mask_dtype)
+
+    gate_1 *= mask_1_flat.astype(gate_1.dtype)
+    gate_2 *= mask_2_flat.astype(gate_2.dtype)
+
+    if not cfg.legacy_mtf_behavior:
+      denom = gate_1 + gate_2
+      denom = jnp.where(denom > 0, denom, jnp.ones_like(denom))
+      gate_1 /= denom
+      gate_2 /= denom
+
+    # GSEC tensor: 1st part
+    b = jax.nn.one_hot(position_in_expert_1.astype(jnp.int32), expert_capacity_dim, dtype=jnp.float32)
+    a = jnp.expand_dims(gate_1, axis=-1) * jax.nn.one_hot(index_1, experts_dim, dtype=jnp.float32)
+    first_part_of_combine_tensor = jnp.einsum('GSE,GSC->GSEC', a, b)
+
+    # GSC tensor: 2nd part
+    b = jax.nn.one_hot(position_in_expert_2.astype(jnp.int32), expert_capacity_dim, dtype=jnp.float32)
+    a = jnp.expand_dims(gate_2, axis=-1) * jax.nn.one_hot(index_2, experts_dim, dtype=jnp.float32)
+    second_part_of_combine_tensor = jnp.einsum('GSE,GSC->GSEC', a, b)
+
+    # output tensors: GSEC
+    combine_tensor = first_part_of_combine_tensor + second_part_of_combine_tensor
+    dispatch_tensor = combine_tensor.astype(bool).astype(fprop_dtype)
+    combine_tensor = combine_tensor.astype(fprop_dtype)
+
+    return dispatch_tensor, combine_tensor
+
+  def paxml_top2(self, inputs, gate_logits, original_shape, w0_kernel, w1_kernel, wo_kernel):
+    cfg = self.config
+    assert cfg.num_experts_per_tok == 2
+    assert (inputs.shape[0] * inputs.shape[1]) % cfg.moe_groups == 0
+    dispatch, combine = self.gating_top2(gate_logits)
+    dispatch = nn.with_logical_constraint(dispatch, ("activation_group", "activation_length", None, None))
+    combine = nn.with_logical_constraint(combine, ("activation_group", "activation_length", None, None))
+    expert_inputs = jnp.einsum("GSEC,GSM -> EGCM", dispatch, inputs)
+    expert_inputs = nn.with_logical_constraint(expert_inputs, ("activation_exp", "activation_group", "activation_length", "activation_embed"))
+
+    with jax.named_scope("wi_0"):
+      hidden_w0 = jnp.einsum("EGCM,EMH -> EGCH", expert_inputs, w0_kernel)
+
+    with jax.named_scope("wi_1"):
+      hidden_w1 = jnp.einsum("EGCM,EMH -> EGCH", expert_inputs, w1_kernel)
+
+    hidden_w1_act = _convert_to_activation_function(cfg.mlp_activations[0])(hidden_w1)
+    hidden_multiply = jnp.multiply(hidden_w1_act, hidden_w0)
+
+    with jax.named_scope("wo"):
+      expert_outputs = jnp.einsum("EGCH,EHM -> EGCM", hidden_multiply, wo_kernel)
+      expert_outputs = nn.with_logical_constraint(expert_outputs, ("activation_exp", "activation_group", "activation_length", "activation_embed"))
+
+    outputs = jnp.einsum("EGCM,GSEC -> GSM", expert_outputs, combine)
+    outputs = nn.with_logical_constraint(outputs, ("activation_group", "activation_length", "activation_embed"))
+    outputs = outputs.reshape(original_shape)
+    return outputs, None
+
+  @nn.compact
+  def __call__(self, inputs, ffn_size=None):
+    cfg = self.config
+    if cfg.moe_gating_func == "paxml_top2":
+      # reshape inputs
+      B, L, M = original_shape = inputs.shape
+      assert (B * L) % cfg.moe_groups == 0
+      G, S  = cfg.moe_groups,  (B * L) // cfg.moe_groups
+      inputs = inputs.reshape(G, S, M).astype(cfg.dtype)
+      inputs = nn.with_logical_constraint(inputs, ("activation_group", "activation_length", "activation_embed"))
+    else:
+      inputs = inputs.astype(cfg.dtype)
+
     gate_logits = DenseGeneral(
         self.num_experts,
         dtype=self.dtype,
         weight_dtype=self.weight_dtype,
         quant=self.quant,
         kernel_init=self.kernel_init,
-        kernel_axes=self.kernel_axes,
+        kernel_axes=self.kernel_axes if cfg.moe_gating_func != "paxml_top2" else (None, None),
         name="gate",
         matmul_precision=self.config.matmul_precision,
     )(inputs)
 
-    w0_kernel, w1_kernel, wo_kernel = self.generate_kernels(cfg.num_experts, cfg.emb_dim, cfg.mlp_dim)
+    w0_kernel, w1_kernel, wo_kernel = self.generate_kernels(cfg.num_experts,
+                                                            cfg.emb_dim,
+                                                            cfg.mlp_dim if ffn_size is None else ffn_size)
 
     if cfg.megablox:
       max_logging.log("Running MoE megablox implementation.")
       return self.megablox(inputs, gate_logits, w0_kernel, w1_kernel, wo_kernel)
     else:
-      max_logging.log("Running MoE matmul implementation.")
-      return self.dense_matmul(inputs, gate_logits, w0_kernel, w1_kernel, wo_kernel)
+      max_logging.log(f"Running MoE implementation: {cfg.moe_gating_func}")
+      if cfg.moe_gating_func == "dense_matmul":
+        return self.dense_matmul(inputs, gate_logits, w0_kernel, w1_kernel, wo_kernel)
+      elif cfg.moe_gating_func == "paxml_top2":
+        return self.paxml_top2(inputs, gate_logits, original_shape, w0_kernel, w1_kernel, wo_kernel)
+      else:
+        raise NotImplementedError(f"Unsupported MoE implementation {cfg.moe_gating_func}")
