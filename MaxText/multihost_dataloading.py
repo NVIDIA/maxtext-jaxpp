@@ -117,3 +117,36 @@ class MultiHostDataLoadIterator:
 
   def __next__(self):
     return get_next_batch_sharded(self.local_iterator, self.global_mesh)
+
+
+class JaxPPDataLoadIterator:
+
+  def __init__(self, dataloader: Union[tf.data.Dataset, grain.DataLoader], config):
+    self.dataloader = dataloader
+    self.config = config
+    if isinstance(self.dataloader, tf.data.Dataset):
+      self.local_iterator = self.dataloader.as_numpy_iterator()
+    elif isinstance(self.dataloader, Iterable):
+      self.local_iterator = iter(self.dataloader)
+    else:
+      raise ValueError("Type error: dataloader should be either tf.data.Dataset or Iterable.")
+
+  def reset(self):
+    if isinstance(self.dataloader, tf.data.Dataset):
+      self.local_iterator = self.dataloader.as_numpy_iterator()
+    elif isinstance(self.dataloader, Iterable):
+      self.local_iterator = iter(self.dataloader)
+    else:
+      raise ValueError("Type error: dataloader should be either tf.data.Dataset or grain.DataLoader.")
+
+  def __iter__(self):
+    self.reset()
+    return self
+
+  def __next__(self):
+    config = self.config
+
+    def microbatched(a):
+      return a.reshape(config.dcn_data_parallelism, config.num_pipeline_microbatches, -1, config.max_target_length)
+
+    return jax.tree.map(microbatched, next(self.local_iterator))

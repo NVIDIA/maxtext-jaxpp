@@ -110,6 +110,9 @@ class BadSyntheticDataIterator:
 
 def get_process_loading_real_data(config, mesh):
   """Get list of processes loading data from GCS when expansion_factor_real_data != -1"""
+  if config.use_jaxpp:
+    return [0] # only the driver process
+
   sharding = jax.sharding.NamedSharding(mesh, P(*config.data_sharding))
   devices_indices_map = sharding.devices_indices_map((config.global_batch_size_to_load, config.max_target_length))
   batch_cutoff = config.global_batch_size_to_train_on
@@ -151,6 +154,9 @@ def make_c4_mlperf_iterator(config, mesh):
   else:
     train_iterator = BadSyntheticDataIterator(config, mesh)
 
+  if config.use_jaxpp:
+    return train_iterator, None
+
   if config.eval_per_device_batch_size >= 0:
     effective_eval_per_device_batch_size = config.eval_per_device_batch_size
   else:
@@ -167,7 +173,7 @@ def make_c4_mlperf_iterator(config, mesh):
 
 def create_data_iterator(config, mesh):
   if config.use_jaxpp:
-    assert config.dataset_type == "synthetic", "JaxPP was tested only on synthetic dataset"
+    assert config.dataset_type in ("synthetic", "c4_mlperf"), "JaxPP expects synthetic or c4_mlperf dataset, but {config.dataset_type} found"
   if config.dataset_type == "synthetic":
     data_iter = None
     if config.use_jaxpp:

@@ -310,7 +310,7 @@ def make_c4_mlperf_train_iterator(
   """Make train iterator of customized C4 dataset for mlperf gpt3 training."""
   train_ds = get_dataset(
       dataset_name=config.dataset_name,
-      split="train2",
+      split="train" if config.dataset_name == "c4/en:3.1.0" else "train2",
       dataloading_host_index=process_indices.index(jax.process_index()),
       dataloading_host_count=len(process_indices),
       enable_data_shuffling=config.enable_data_shuffling,
@@ -319,15 +319,22 @@ def make_c4_mlperf_train_iterator(
   train_ds = rekey(train_ds, {"inputs": None, "targets": "text"})
 
   sp_tokenizer = get_tokenizer(config.tokenizer_path, add_bos, add_eos)
+  # A hack that (global_batch_size_to_load * num_process) when using jaxpp
+  # because preprocess_train_dataset divides batch sizes with num_process
+  # natively, and jaxpp uses only one process
+  global_batch_size_to_load = config.global_batch_size_to_load if not config.use_jaxpp else config.global_batch_size_to_load * jax.process_count()
   train_ds = preprocess_train_dataset(
       train_ds,
       sp_tokenizer=sp_tokenizer,
-      train_global_batch_size_to_load=config.global_batch_size_to_load,
+      train_global_batch_size_to_load=global_batch_size_to_load,
       max_target_length=config.max_target_length,
       shuffle_buffer_size=128,
       data_shuffle_seed=config.data_shuffle_seed,
   )
-  train_multihost_gen = multihost_dataloading.MultiHostDataLoadIterator(train_ds, global_mesh)
+  if not config.use_jaxpp:
+    train_multihost_gen = multihost_dataloading.MultiHostDataLoadIterator(train_ds, global_mesh)
+  else:
+    train_multihost_gen = multihost_dataloading.JaxPPDataLoadIterator(train_ds, config)
   return train_multihost_gen
 
 

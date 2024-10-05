@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-if [ -z ${MODEL} ]; then
+if [ -z "${MODEL}" ]; then
   echo "Expect a model name: gpt3-175b, llama2-70b, or grok-314b"
   exit 1
 fi
@@ -18,6 +18,8 @@ DTYPE=${DTYPE:-"bfloat16"}
 STEPS=${STEPS:-20}
 MBS=${MBS:-2}
 GA=${GA:-64}
+USE_SYNTHETIC_DATA=${USE_SYNTHETIC_DATA:-"True"}
+DATA=${DATA:-$([ "${USE_SYNTHETIC_DATA}" == "True" ] && echo "dataset_type=synthetic" || echo "")}
 USE_PGLE=${USE_PGLE:-"False"}
 USE_PROFILER=${USE_PROFILER:-"True"}
 PROFILER=${PROFILER:-$([ "${USE_PROFILER}" == "True" ] && echo "xplane" || echo "")}
@@ -31,6 +33,7 @@ SLURM_LOG_DIR=${SLURM_LOG_DIR:-"."}
 CONTAINER_IMAGE=${CONTAINER_IMAGE:-"gitlab-master.nvidia.com/cml/jaxpp_dev/maxtext:latest"}
 EXTRA_SCRIPT_FLAGS=${EXTRA_SCRIPT_FLAGS:-""}
 EXTRA_SLURM_FLAGS=${EXTRA_SLURM_FLAGS:-""}
+EXTRA_MOUNTS=${EXTRA_MOUNTS:-""}
 
 # Non-overwritable vars
 timestamp=$(date +%Y%m%d-%H%M%S)
@@ -62,7 +65,7 @@ command="python /workdir/maxtext/MaxText/train.py /workdir/maxtext/MaxText/confi
         model_name=${MODEL} dtype=${DTYPE} steps=${STEPS}                                    \
         dcn_data_parallelism=${DP} ici_pipeline_parallelism=${PP}                            \
         ici_expert_parallelism=${EP} ici_tensor_parallelism=${TP}                            \
-        hardware=gpu dataset_type=synthetic enable_checkpointing=False                       \
+        hardware=gpu enable_checkpointing=False ${DATA}                                      \
         per_device_batch_size=$(( ($MBS * $GA) / ($PP * $TP * $DP * $EP) ))                  \
         num_pipeline_microbatches=${GA} max_target_length=${SEQ_LEN}                         \
         num_pipeline_repeats=${VP}                                                           \
@@ -74,6 +77,11 @@ sbatch_flags="--chdir=${output_dir}                                             
         -N ${NUM_NODES} ${gpus_per_node:+--gpus-per-node=${gpus_per_node}}                  \
         --time=${SLURM_TIME} ${MAIL} ${EXTRA_SLURM_FLAGS} -o slurm_out.log -e slurm_err.log"
 
-common_srun_flags="--container-image=${CONTAINER_IMAGE} --container-mounts=$(realpath $output_dir):${log_dir},${maxtext_dir}:/workdir/maxtext"
+MOUNTS="$(realpath $output_dir):${log_dir},${maxtext_dir}:/workdir/maxtext"
+if [ -n "${EXTRA_MOUNTS}" ]; then
+  MOUNTS=${MOUNTS},${EXTRA_MOUNTS}
+fi
+
+common_srun_flags="--container-image=${CONTAINER_IMAGE} --container-mounts=${MOUNTS}"
 
 sbatch ${sbatch_flags} "${jaxpp_dir}/script/slurm/ray-on-slurm.sh" "${command}" "${common_srun_flags}"
