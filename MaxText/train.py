@@ -464,7 +464,7 @@ def train_step(model, config, state, data, dropout_rng, state_pspec=None):
     def compute_grads(data):
       grad_func = jax.value_and_grad(loss_fn, argnums=4, has_aux=True)
       (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, casted_params, is_train=True)
-      raw_grads['params'] = jax.tree_util.tree_map_with_path(functools.partial(masked_cast, dtype=jnp.float32), raw_grads['params'])
+      raw_grads['params'] = jax.tree_util.tree_map_with_path(functools.partial(masked_cast, dtype=jnp.dtype(config.grad_dtype)), raw_grads['params'])
       return LoopOutput.create(((loss, aux), raw_grads))
 
     if not config.use_jaxpp:

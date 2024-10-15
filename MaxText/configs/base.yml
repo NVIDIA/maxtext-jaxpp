@@ -385,6 +385,7 @@ moe_groups: 1
 widening_factor: 0.0 # 0.0 means disabled
 legacy_mtf_behavior: True
 use_overridden_axis_rules: True
+grad_dtype: "bfloat16"
 # NOTE(jaxpp): end parameters
 
 # Goodput parameters
