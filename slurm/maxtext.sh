@@ -36,6 +36,7 @@ EXTRA_SLURM_FLAGS=${EXTRA_SLURM_FLAGS:-""}
 EXTRA_MOUNTS=${EXTRA_MOUNTS:-""}
 
 # Non-overwritable vars
+per_device_batch_size=$(python3 -c "print((${MBS} * ${GA}) / (${PP} * ${TP} * ${DP}))")
 timestamp=$(date +%Y%m%d-%H%M%S)
 maxtext_dir="$(realpath $(dirname $0)/../)"
 jaxpp_dir="${maxtext_dir}/third_party/jaxpp"
@@ -66,7 +67,7 @@ command="python /workdir/maxtext/MaxText/train.py /workdir/maxtext/MaxText/confi
         dcn_data_parallelism=${DP} ici_pipeline_parallelism=${PP}                            \
         ici_expert_parallelism=${EP} ici_tensor_parallelism=${TP}                            \
         hardware=gpu enable_checkpointing=False ${DATA}                                      \
-        per_device_batch_size=$(( ($MBS * $GA) / ($PP * $TP * $DP * $EP) ))                  \
+        per_device_batch_size=${per_device_batch_size}                                       \
         num_pipeline_microbatches=${GA} max_target_length=${SEQ_LEN}                         \
         num_pipeline_repeats=${VP}                                                           \
         use_jaxpp=True schedule=${SCHEDULE} profiler=${PROFILER}                             \
