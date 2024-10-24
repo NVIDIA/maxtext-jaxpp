@@ -147,6 +147,11 @@ class JaxPPDataLoadIterator:
     config = self.config
 
     def microbatched(a):
-      return a.reshape(config.dcn_data_parallelism, config.num_pipeline_microbatches, -1, config.max_target_length)
+      return a[: config.micro_batch_size_to_train_on, :].reshape(
+        config.dcn_data_parallelism,
+        config.num_pipeline_microbatches,
+        -1,
+        config.max_target_length,
+      )
 
     return jax.tree.map(microbatched, next(self.local_iterator))
