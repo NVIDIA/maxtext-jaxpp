@@ -178,7 +178,12 @@ def create_data_iterator(config, mesh):
     data_iter = None
     if config.use_jaxpp:
       def microbatched(a):
-        return a.reshape(config.dcn_data_parallelism, config.num_pipeline_microbatches, -1, config.max_target_length)
+        return a[:config.micro_batch_size_to_train_on, :].reshape(
+          config.dcn_data_parallelism,
+          config.num_pipeline_microbatches,
+          -1,
+          config.max_target_length,
+        )
       data_iter = it.repeat(jax.tree.map(microbatched, SyntheticDataIterator.raw_generate_synthetic_data(config)))
     else:
       data_iter = SyntheticDataIterator(config, mesh)
