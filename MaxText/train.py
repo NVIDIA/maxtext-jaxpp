@@ -1,5 +1,6 @@
 """
 Copyright 2023 Google LLC
+Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,6 +21,7 @@ limitations under the License.
 # Calling jax.device_count here prevents a "TPU platform already registered" error.
 # See github.com/google/maxtext/issues/20 for more
 
+from dataclasses import dataclass
 import datetime
 import os
 import sys
@@ -31,8 +33,10 @@ from typing import Sequence, Optional
 from absl import app
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
+import flax.struct
 import grain.python as grain
 import jax
+import jax.experimental
 import numpy as np
 import orbax.checkpoint
 import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_checkpoint_manager
@@ -70,11 +74,26 @@ from layers import quantizations
 from ml_goodput_measurement import goodput
 from ml_goodput_measurement import monitoring
 
+import flax
+import chex
 # pylint: disable=too-many-positional-arguments
 
 Transformer = models.Transformer
 EPS = 1e-8
 _DEFAULT_OCDBT_TARGET_DATA_FILE_SIZE = 2 * 1024**3
+
+"""
+JaxPP related imports
+"""
+# system
+import subprocess
+from statistics import mean
+
+# jaxpp
+import jaxpp.api as jaxpp
+from jaxpp.mesh import RemoteMpmdMesh, MpmdMesh
+from jaxpp.core import DistributedSharding
+from jaxpp.arrayref import ArrayRef
 
 
 def validate_train_config(config):
@@ -96,7 +115,7 @@ def validate_train_config(config):
 
 def get_first_step(state):
   with jax.spmd_mode("allow_all"):
-    return int(state.step)
+    return int(state.step._value if isinstance(state.step, ArrayRef) else state.step)
 
 
 def load_next_batch(train_iter, example_batch, config):
@@ -415,7 +434,7 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   rng1, aqt_rng = jax.random.split(dropout_rng)
 
   # decimate proportion of data when per_device_batch_size<1
-  if is_train:
+  if is_train and not config.use_jaxpp:
     for k, v in data.items():
       data[k] = v[: config.micro_batch_size_to_train_on, :]
   else:
@@ -455,7 +474,87 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   return loss, aux
 
 
-def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
+def load_schedule(config):
+  pipeline_parallel_dim = config.dcn_pipeline_parallelism * config.ici_pipeline_parallelism
+  num_logical_stages = config.num_pipeline_repeats * pipeline_parallel_dim
+  schedule = None
+  if config.schedule == "1f1b":
+      assert num_logical_stages <= pipeline_parallel_dim
+      schedule = jaxpp.Std1F1B(num_logical_stages)
+  elif config.schedule == "eager_1f1b":
+      assert num_logical_stages <= pipeline_parallel_dim
+      schedule = jaxpp.Eager1F1B(num_logical_stages)
+  elif config.schedule == "interleaved_1f1b":
+      schedule = jaxpp.Interleaved1F1B(num_logical_stages, pipeline_parallel_dim)
+  elif config.schedule == "zbh1":
+      schedule = jaxpp.ZeroBubble(num_logical_stages)
+  elif config.schedule == "interleaved_zbh1":
+      schedule = jaxpp.InterleavedZeroBubble(num_logical_stages, pipeline_parallel_dim)
+  else:
+      raise NotImplementedError(f"Unknown schedule {config.schedule}")
+  return schedule
+
+# `jaxpp.LoopOutput` specifies which of the loop outputs are "sum"med, con"cat"enated, "max"ed etc.
+# This inherited version is for updating fp8 quantization statistics
+# Will change in future versions of JaxPP
+class LoopOutput(jaxpp.LoopOutput, flax.struct.PyTreeNode):
+  @dataclass
+  class Aux:
+    is_max: list[bool]
+    tree: chex.PyTreeDef
+
+  aux: Aux | None = flax.struct.field(pytree_node=False, default=None)
+
+  @classmethod
+  def create(cls, value_and_grad_output):
+    fwd_out, raw_grads = value_and_grad_output
+    if (owg := raw_grads.pop(nn.fp8_ops.OVERWRITE_WITH_GRADIENT, None)) is not None:
+      (overwritten, maxed) = ([], [])
+      leaves, tree = jax.tree_util.tree_flatten_with_path(owg)
+      is_max = []
+      for path, leaf in leaves:
+        if path[-1].key.endswith('amax_history'):
+          is_max.append(True)
+          maxed.append(leaf)
+        elif path[-1].key.endswith('scale'):
+          is_max.append(False)
+          overwritten.append(leaf)
+        else:
+          keystr = jax.tree_util.keystr(path)
+          raise ValueError(f"Unexpected overwrite_with_gradient path {keystr}")
+      return cls(sum=raw_grads, cat=fwd_out, max=maxed, last=overwritten, aux=LoopOutput.Aux(is_max, tree))
+    return cls(sum=raw_grads, cat=fwd_out)
+
+  def rebuild(self):
+    if self.aux is not None:
+      m = 0
+      o = 0
+      leaves = []
+      for b in self.aux.is_max:
+        if b:
+          leaves.append(self.max[m])
+          m += 1
+        else:
+          leaves.append(self.last[o])
+          o += 1
+      self.sum[nn.fp8_ops.OVERWRITE_WITH_GRADIENT] = jax.tree.unflatten(self.aux.tree, leaves)
+    return (self.sum, self.cat)
+
+def masked_cast(config, path, val, dtype):
+  def get_stage_id(path):
+    if len(path) > 1:
+      if path[1].key.startswith("layers_"):
+        return int(path[1].key[len("layers_"):])
+      elif path[1].key.startswith("SequentialBlockDecoderLayers_"):
+        return int(path[1].key[len("SequentialBlockDecoderLayers_"):])
+    return None
+  if (stage_id := get_stage_id(path)) is not None:
+    worker = stage_id % (config.dcn_pipeline_parallelism * config.ici_pipeline_parallelism)
+    if config.jaxpp_cast_worker_idx is not None and worker >= config.jaxpp_cast_worker_idx:
+      return jnp.astype(val, dtype)
+  return val
+
+def train_step(model, config, state_mesh_shardings, state, data, dropout_rng, params_shardings=None):
   """
 
   Args:
@@ -520,12 +619,44 @@ def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
         reference_params = jax.device_put(reference_params, max_utils.with_memory_kind(reference_params_sharding, "device"))
         reference_params = max_utils.cast_to_bf16(reference_params)
         extra_dpo_args = [reference_params]
-    grad_func = jax.value_and_grad(_loss_fn, argnums=4, has_aux=True)
-    (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, state.params, *extra_dpo_args, is_train=True)
+
+    casted_params = {**state.params, "params": jax.tree_util.tree_map_with_path(functools.partial(masked_cast, config, dtype=config.dtype), state.params['params'])}
+    if config.shard_optimizer_over_data:
+      casted_params = jax.tree.map(jax.lax.with_sharding_constraint, casted_params, params_shardings)
+    def compute_grads(data):
+      grad_func = jax.value_and_grad(loss_fn, argnums=4, has_aux=True)
+      (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, casted_params, *extra_dpo_args, is_train=True)
+      raw_grads['params'] = jax.tree_util.tree_map_with_path(functools.partial(masked_cast, config, dtype=jnp.dtype(config.grad_dtype)), raw_grads['params'])
+      return LoopOutput.create(((loss, aux), raw_grads))
+
+    if not config.use_jaxpp:
+      loop_state = compute_grads(data)
+    else:
+      def microbatched(a):
+        return a[:config.micro_batch_size_to_train_on, :].reshape(
+          # `accumulate_grads` `vmap`s the body to avoid DP all-reduces at each
+          # iteration, hence the leading dimension.
+          state_mesh_shardings.step.mesh.shape['data'],
+          config.num_pipeline_microbatches,
+          -1,
+          config.max_target_length,
+        )
+      data = jax.tree.map(microbatched, data)
+      loss_aux_sharding = jax.sharding.NamedSharding(state_mesh_shardings.step.mesh, jax.sharding.PartitionSpec())
+      loop_state = jaxpp.accumulate_grads(
+          compute_grads,
+          batch=data,
+          out_shardings=LoopOutput.create((loss_aux_sharding, params_shardings)),
+          schedule=load_schedule(config),
+      )
+
+    raw_grads, (loss, aux) = loop_state.rebuild()
+
+  raw_grads = jax.lax.with_sharding_constraint(raw_grads, state_mesh_shardings.params)
+
   intermediate_outputs = aux["intermediate_outputs"]
   total_weights = aux["total_weights"]
   moe_lb_loss = aux["moe_lb_loss"]
-
   if config.gradient_clipping_threshold > 0:
     grads = maxtext_utils.apply_gradient_clipping(raw_grads, state, config.gradient_clipping_threshold)
   else:
@@ -539,12 +670,22 @@ def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
     )
   new_state = state.apply_gradients(grads=grads)
 
-  scalar_metrics = {
-      "learning/loss": loss,
-      "learning/moe_lb_loss": moe_lb_loss,
-      "learning/total_weights": total_weights,
-  }
-  if not config.optimizer_memory_host_offload:
+  if config.use_jaxpp:
+    # TODO: refine logic to match the one in MaxText's gradient accumulation
+    #  or use that altogether (add support for scan instead of
+    #  accumulate_grads in JaxPP)
+    scalar_metrics = {
+        "learning/loss": loss.sum() / total_weights.sum(),
+        "learning/moe_lb_loss": moe_lb_loss.sum(),
+        "learning/total_weights": total_weights.sum(),
+    }
+  else:
+    scalar_metrics = {
+        "learning/loss": loss,
+        "learning/moe_lb_loss": moe_lb_loss,
+        "learning/total_weights": total_weights,
+    }
+  if not config.use_jaxpp and not config.optimizer_memory_host_offload:
     scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
     scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
     scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(new_state.params)
@@ -636,17 +777,23 @@ def setup_mesh_and_model(config):
     learning_rate_schedule:
     tx:
   """
-
   init_rng = random.PRNGKey(config.init_weights_seed)
   writer = max_utils.initialize_summary_writer(config)
 
   # Mesh definition
-  devices_array = max_utils.create_device_mesh(config)
-  mesh = Mesh(devices_array, config.mesh_axes)
+  if not config.use_jaxpp:
+    devices_array = max_utils.create_device_mesh(config)
+    mesh = Mesh(devices_array, config.mesh_axes)
+  else:
+    if config.jaxpp_remote:
+      mesh = RemoteMpmdMesh._pop_current_worker_mesh()
+    else:
+      devices_array = max_utils.create_device_mesh(config)
+      mesh = MpmdMesh(Mesh(devices_array, config.mesh_axes), 'stage')
 
   # Model and Optimizer definition
   quant = quantizations.configure_quantization(config)
-  model = Transformer(config, mesh, quant=quant)
+  model = Transformer(config, mesh.lowering_mesh() if config.use_jaxpp else mesh, quant=quant)
   learning_rate_schedule = max_utils.create_learning_rate_schedule(config)
   tx = optimizers.get_optimizer(config, learning_rate_schedule)
   logger = checkpointing.setup_checkpoint_logger(config)
@@ -709,14 +856,25 @@ def setup_train_loop(config):
   """
   recorder = create_goodput_recorder(config)
   record_goodput(recorder, config, recorder.record_tpu_init_start_time if recorder else None)
-  init_rng, writer, checkpoint_manager, mesh, model, learning_rate_schedule, tx = setup_mesh_and_model(config)
+  init_rng, writer, checkpoint_manager, mpmd_mesh, model, learning_rate_schedule, tx = setup_mesh_and_model(config)
   record_goodput(recorder, config, recorder.record_tpu_init_end_time if recorder else None)
   record_goodput(recorder, config, recorder.record_training_preparation_start_time if recorder else None)
+  mesh = mpmd_mesh
+  # FIXME:
+  if config.use_jaxpp:
+    mesh = mpmd_mesh.lowering_mesh()
   data_iterator, eval_data_iterator = create_data_iterator(config, mesh)
 
   state, _, state_mesh_shardings, data_iterator = max_utils.setup_training_state(
       model, data_iterator, tx, config, init_rng, mesh, checkpoint_manager
   )
+
+  def make_line(keypath, abs_value):
+    return (f"{jax.tree_util.keystr(keypath):<120}, {str(abs_value.dtype):<10}, "
+            f"{str(abs_value.shape):<26}, {abs_value.sharding._to_xla_hlo_sharding(abs_value.ndim)}")
+
+  max_logging.log("shardings/weights")
+  max_logging.log("\n".join(make_line(keypath, abs_value) for keypath, abs_value in jax.tree_util.tree_leaves_with_path(state)))
 
   if not config.using_pipeline_parallelism:
     # The vocab tensor(s) of shape [vocab, embed] (and transpose) are not sharded by stage
@@ -753,11 +911,12 @@ def setup_train_loop(config):
       checkpoint_manager,
       state_mesh_shardings,
       model,
-      mesh,
+      mpmd_mesh,
       learning_rate_schedule,
       data_iterator,
       eval_data_iterator,
       state,
+      tx
   )
 
 
@@ -779,11 +938,12 @@ def train_loop(config, state=None):
       checkpoint_manager,
       state_mesh_shardings,
       model,
-      mesh,
+      mpmd_mesh,
       learning_rate_schedule,
       data_iterator,
       eval_data_iterator,
       state,
+      tx
   ) = setup_train_loop(config)
 
   if config.use_dpo:
@@ -792,6 +952,9 @@ def train_loop(config, state=None):
       state = _merge_dpo_state(state, reference_params)
     state_mesh_shardings = _merge_dpo_state(state_mesh_shardings, state_mesh_shardings.params["params"])
 
+  mesh = mpmd_mesh.lowering_mesh() if config.use_jaxpp else mpmd_mesh
+  params_shardings, state_mesh_shardings = max_utils.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
+
   # pylint: disable=line-too-long
   (
       functional_train,
@@ -799,7 +962,7 @@ def train_loop(config, state=None):
       out_shard_train,
       static_argnums_train,
       donate_argnums_train,
-  ) = maxtext_utils.get_functional_train_with_signature(train_step, mesh, state_mesh_shardings, model, config)
+  ) = maxtext_utils.get_functional_train_with_signature(train_step, mesh, state_mesh_shardings, model, config, params_shardings=params_shardings)
 
   if eval_data_iterator:
     # pylint: disable=line-too-long
@@ -830,13 +993,51 @@ def train_loop(config, state=None):
     p_eval_step = None
     print("Loaded compiled function!", flush=True)
   else:
-    p_train_step = jax.jit(
+    if not config.use_jaxpp:
+      p_train_step = jax.jit(
         functional_train,
         in_shardings=in_shard_train,
         out_shardings=out_shard_train,
         static_argnums=static_argnums_train,
+        donate_argnums=donate_argnums_train)
+    else:
+      max_logging.log("Running with jaxpp")
+      p_train_step = jaxpp.pipelined(
+        functional_train,
+        mpmd_mesh=mpmd_mesh,
         donate_argnums=donate_argnums_train,
-    )
+        in_axis_resources=in_shard_train,
+        out_axis_resources=out_shard_train,
+        use_pgle=config.use_pgle
+      )
+      # FIXME: remove and
+      if config.distributed_initialization:
+        max_logging.log("Starting distributed initialization...")
+        assert isinstance(mpmd_mesh, (MpmdMesh, RemoteMpmdMesh))
+
+        def create_state(rng_key):
+          return max_utils.unbox_logicallypartioned(max_utils.init_initial_state(model, tx, config, True, rng_key))
+
+        with mesh, nn_partitioning.axis_rules(tuple(config.logical_axis_rules)):
+          p_train_step = p_train_step.compile(
+            state, next(data_iterator), init_rng
+          )
+
+          train_state_dist_sharding = p_train_step.in_shardings[0]
+
+          replicated_sharding = jax.sharding.NamedSharding(
+              mpmd_mesh.lowering_mesh(), jax.sharding.PartitionSpec()
+          )
+          state = jaxpp.run_replicated_dced(
+            create_state,
+            (
+               DistributedSharding(set(range(mpmd_mesh.mpmd_dim)), replicated_sharding),
+            ),
+            train_state_dist_sharding,
+            mpmd_mesh,
+            init_rng,
+          )
+        max_logging.log("Distributed initialization done.")
 
     if eval_data_iterator:
       p_eval_step = jax.jit(
@@ -852,7 +1053,7 @@ def train_loop(config, state=None):
   local_metrics_file = open(config.metrics_file, "a", encoding="utf8") if config.metrics_file else None
   running_gcs_metrics = [] if config.gcs_metrics else None
 
-  start_step = get_first_step(state)  # this is the start_step for training
+  start_step = 0 # FIXME get_first_step(state)  # this is the start_step for training
   prof = profiler.Profiler(config, offset_step=start_step)
   first_profiling_step = prof.start_initial_profile_step
   if config.profiler != "" and first_profiling_step >= config.steps:
@@ -860,6 +1061,8 @@ def train_loop(config, state=None):
   last_profiling_step = prof.finished_initial_profile_step
 
   example_batch = None
+  step_time = []
+  step_tflops = []
   last_step_completion = datetime.datetime.now()
 
   performance_metric_queue = None
@@ -872,20 +1075,24 @@ def train_loop(config, state=None):
       gcp_workload_monitor.start_performance_reporting_thread(performance_metric_queue)
 
   for step in np.arange(start_step, config.steps):
-    if step == first_profiling_step or prof.should_activate_periodic_profile(step):
+    if config.profiler != "" and config.jaxpp_remote and step == first_profiling_step:
+      assert config.profiler == "xplane"
+      mpmd_mesh.start_trace(config.tensorboard_dir.rstrip('/'))
+    elif config.profiler != "" and step == first_profiling_step or prof.should_activate_periodic_profile(step):
       optional_postfix = f"step_{step}" if config.profile_periodically_period > 0 else ""
+      optional_postfix = f"proc_{jax.process_index()}_{optional_postfix}"
       prof.activate(blocking_object=state, optional_postfix=optional_postfix)
 
-    with jax.profiler.StepTraceAnnotation("train", step_num=step):
-      record_goodput(recorder, config, recorder.record_data_loading_start_time if recorder else None)
-      example_batch = load_next_batch(data_iterator, example_batch, config)
-      record_goodput(recorder, config, recorder.record_data_loading_end_time if recorder else None)
-      check_example_batch(config, example_batch=example_batch)
-      # pylint: disable=not-callable
-      nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
-      record_goodput(recorder, config, recorder.record_step_start_time if recorder else None, step)
-      with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-        state, metrics = p_train_step(state, example_batch, nextrng)
+    # with jax.profiler.StepTraceAnnotation("train", step_num=step):
+    record_goodput(recorder, config, recorder.record_data_loading_start_time if recorder else None)
+    example_batch = load_next_batch(data_iterator, example_batch, config)
+    record_goodput(recorder, config, recorder.record_data_loading_end_time if recorder else None)
+    check_example_batch(config, example_batch=example_batch)
+    # pylint: disable=not-callable
+    nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
+    record_goodput(recorder, config, recorder.record_step_start_time if recorder else None, step)
+    with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+      state, metrics = p_train_step(state, example_batch, nextrng)
 
     step_time_delta = datetime.datetime.now() - last_step_completion
     last_step_completion = datetime.datetime.now()
@@ -904,6 +1111,8 @@ def train_loop(config, state=None):
         sys.exit()
 
     write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, step, config)
+    step_time.append(metrics['scalar']['perf/step_time_seconds'])
+    step_tflops.append(metrics['scalar']['perf/per_device_tflops_per_sec'])
 
     if config.dump_hlo and step == start_step:
       jax.block_until_ready(state)  # Ensure compilation has finished.
@@ -915,7 +1124,8 @@ def train_loop(config, state=None):
           all_host_upload=config.dump_hlo_upload_all,
       )
 
-    if config.eval_interval > 0 and step > start_step and (step + 1) % config.eval_interval == 0:
+    if (not config.use_jaxpp and # FIXME: implement
+        config.eval_interval > 0 and step > start_step and (step + 1) % config.eval_interval == 0):
       assert eval_data_iterator
       cumulative_eval_metrics = {
           "scalar": {
@@ -960,7 +1170,16 @@ def train_loop(config, state=None):
         prof.deactivate()
         break
 
-    if step == last_profiling_step or prof.should_deactivate_periodic_profile(step):
+    if config.profiler != "" and config.jaxpp_remote and step == last_profiling_step:
+      assert config.profiler == "xplane"
+      # FIXME: properly block on all `state`.
+      #   avoid `jax.block_until_ready(state)` since it would pull each array onto the
+      #   driver, being incredibly slow.
+      # Block on these two values
+      jax.tree.leaves(state)[0]._value
+      jax.tree.leaves(state)[-1]._value
+      mpmd_mesh.stop_trace(merge_multihost_xplanes=True)
+    elif config.profiler != "" and step == last_profiling_step or prof.should_deactivate_periodic_profile(step):
       prof.deactivate(blocking_object=state)
 
     if step == start_step:
@@ -968,10 +1187,21 @@ def train_loop(config, state=None):
 
   if checkpoint_manager is not None:
     checkpoint_manager.wait_until_finished()
-  write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, config.steps - 1, config)  # final step metrics
+  if not config.use_jaxpp:
+    write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, config.steps - 1, config) # final step metrics
   max_utils.close_summary_writer(writer)
   record_goodput(recorder, config, recorder.record_job_end_time if recorder else None)
   clear_buffered_metrics()
+
+  # last_profiling_step + 2 as (1) we count steps from 0, and (2) the execution time for merge_multihost_xplanes is
+  # counted toward the execution time for the step right after the last profiling step.
+  num_warmup_steps = (last_profiling_step + 2) if config.profiler != "" else 6
+  max_logging.log(
+      f"excluding the first {num_warmup_steps} steps: avg time per step {mean(step_time[num_warmup_steps:])}, avg tflops per step {mean(step_tflops[num_warmup_steps:])}"
+  )
+
+  if config.use_jaxpp:
+    return state
   with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
     # pytype: disable=attribute-error
     compiled = p_train_step.lower(state, example_batch, nextrng).compile()
@@ -983,6 +1213,7 @@ def train_loop(config, state=None):
           f"argument size: {compiled_stats.argument_size_in_bytes}, "
           f"host temp size: {compiled_stats.host_temp_size_in_bytes}, in bytes."
       )
+
   return state
 
 

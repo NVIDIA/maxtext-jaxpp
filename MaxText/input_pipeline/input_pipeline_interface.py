@@ -1,5 +1,6 @@
 """
 Copyright 2023 Google LLC
+Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,6 +17,7 @@ limitations under the License.
 
 """Input pipeline"""
 import functools
+import itertools as it
 import numpy as np
 import tensorflow as tf
 import jax
@@ -27,7 +29,7 @@ from input_pipeline._grain_data_processing import make_grain_train_iterator, mak
 from input_pipeline._tfds_data_processing_c4_mlperf import make_c4_mlperf_train_iterator, make_c4_mlperf_eval_iterator
 from input_pipeline._hf_data_processing import make_hf_train_iterator, make_hf_eval_iterator
 import multihost_dataloading
-
+import max_logging
 
 class SyntheticDataIterator:
   """Creates a synthetic data iterator for performance testing work"""
@@ -115,9 +117,12 @@ class BadSyntheticDataIterator:
 
 
 def get_process_loading_real_data(
-    data_sharding, global_batch_size_to_load, global_batch_size_to_train_on, max_target_length, mesh
+    data_sharding, global_batch_size_to_load, global_batch_size_to_train_on, max_target_length, mesh, jaxpp_remote=False,
 ):
   """Get list of processes loading data from GCS when expansion_factor_real_data != -1"""
+  if jaxpp_remote:
+    return [0] # only the driver process
+
   sharding = jax.sharding.NamedSharding(mesh, P(*data_sharding))
   devices_indices_map = sharding.devices_indices_map((global_batch_size_to_load, max_target_length))
   batch_cutoff = global_batch_size_to_train_on
@@ -136,6 +141,9 @@ def make_mixed_iterator(config, mesh, process_indices_train, process_indices_eva
   else:
     train_iterator = BadSyntheticDataIterator(config, mesh)
 
+  if config.use_jaxpp:
+    return train_iterator, None
+
   if config.eval_interval <= 0:
     eval_iterator = None
   else:
@@ -147,6 +155,9 @@ def make_mixed_iterator(config, mesh, process_indices_train, process_indices_eva
 
 
 def create_data_iterator(config, mesh):
+  if config.use_jaxpp and config.jaxpp_remote:
+    mesh = jax.sharding.Mesh(np.array(jax.devices('cpu')).reshape((1,) * mesh.devices.ndim), mesh.axis_names)
+
   if config.dataset_type == "synthetic":
     return SyntheticDataIterator(config, mesh), None
 
@@ -156,6 +167,7 @@ def create_data_iterator(config, mesh):
       config.global_batch_size_to_train_on,
       config.max_target_length,
       mesh,
+      jaxpp_remote=config.jaxpp_remote,
   )
   if config.eval_interval > 0:
     process_indices_eval = get_process_loading_real_data(
@@ -164,6 +176,7 @@ def create_data_iterator(config, mesh):
         config.global_batch_size_to_eval_on,
         config.max_target_length,
         mesh,
+        jaxpp_remote=config.jaxpp_remote,
     )
   else:
     process_indices_eval = []

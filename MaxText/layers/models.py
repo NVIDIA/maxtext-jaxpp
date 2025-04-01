@@ -1,4 +1,5 @@
 #  Copyright 2023 Google LLC
+#  Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -30,6 +31,7 @@ from layers import embeddings
 from layers import linears
 from layers import normalizations, quantizations
 from layers import pipeline
+import jaxpp.api as jaxpp
 
 Array = common_types.Array
 Config = common_types.Config
@@ -223,7 +225,7 @@ class Decoder(nn.Module):
     else:
       raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block=}")
 
-  def scan_decoder_layers(self, cfg, decoder_layer, length, metdata_axis_name, mesh):
+  def scan_decoder_layers(self, cfg, decoder_layer, length, metdata_axis_name, mesh, name="layers"):
     initializing = self.is_mutable_collection("params")
     params_spec = cfg.param_scan_axis if initializing else ScanIn(cfg.param_scan_axis)
     cache_spec = 0
@@ -249,17 +251,18 @@ class Decoder(nn.Module):
         length=length,
         metadata_params={nn.PARTITION_NAME: metdata_axis_name},
     )
-    return scan_fn(config=cfg, mesh=mesh, name="layers", quant=self.quant)
+    return scan_fn(config=cfg, mesh=mesh, name=name, quant=self.quant)
 
-  def get_pipeline_stage_module(self, base_stage, cfg, mesh):
-    if cfg.num_layers_per_pipeline_stage == 1:
+  def get_pipeline_stage_module(self, base_stage, cfg, mesh, num_layers_per_pipeline_stage, name=None):
+    if num_layers_per_pipeline_stage == 1:
       stage_module = base_stage(config=cfg, mesh=mesh, quant=self.quant)
     elif cfg.scan_layers:
-      stage_module = self.scan_decoder_layers(cfg, base_stage, cfg.num_layers_per_pipeline_stage, "layers_per_stage", mesh)
+      kwargs = {"name": name} if name is not None else {}
+      stage_module = self.scan_decoder_layers(cfg, base_stage, num_layers_per_pipeline_stage, "layers_per_stage", mesh, **kwargs)
     else:
       stage_module = SequentialBlockDecoderLayers(
           decoder_layer=base_stage,
-          num_decoder_layers=cfg.num_layers_per_pipeline_stage,
+          num_decoder_layers=num_layers_per_pipeline_stage,
           config=cfg,
           mesh=mesh,
           quant=self.quant,
@@ -362,6 +365,8 @@ class Decoder(nn.Module):
         policy = jax.checkpoint_policies.save_only_these_names(
             "out_proj",
         )
+      elif cfg.remat_policy == "save_dot_only":
+        policy = jax.checkpoint_policies.checkpoint_dots
       else:
         assert cfg.remat_policy == "full", "Remat policy needs to be on list of remat policies"
         policy = None
@@ -373,15 +378,39 @@ class Decoder(nn.Module):
         static_argnums=(4, 5),  # Deterministic and model mode are static arguments.
     )
     if cfg.using_pipeline_parallelism:
-      base_stage = RemattedBlockLayer if cfg.set_remat_policy_on_layers_per_stage else BlockLayer
-      stage_module = self.get_pipeline_stage_module(base_stage, cfg, mesh)
-      y = pipeline.Pipeline(config=cfg, mesh=mesh, layers=stage_module, remat_policy=policy)(
-          y,
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          model_mode,
-      )
+      if cfg.use_jaxpp:
+        num_logical_stages = cfg.dcn_pipeline_parallelism * cfg.ici_pipeline_parallelism * cfg.num_pipeline_repeats
+        layers_per_stage, rem = divmod(cfg.num_decoder_layers, num_logical_stages)
+        assert layers_per_stage > 0
+        for stage in range(num_logical_stages):
+          # NOTE: for uneven splits of layers by number of stages, spread remaining
+          #  layers on first few stages.
+          num_layers_in_pipeline_stage = layers_per_stage + (1 if stage < rem else 0)
+          # NOTE: we avoid rematerialization for the last stage
+          is_last_stage = stage == num_logical_stages - 1
+          base_stage = BlockLayer if is_last_stage else RemattedBlockLayer
+          stage_module = self.get_pipeline_stage_module(base_stage, cfg, mesh, num_layers_in_pipeline_stage, name=f"layers_{stage}")
+          y = stage_module(
+              y,
+              decoder_segment_ids,
+              decoder_positions,
+              deterministic,
+              model_mode,
+          )
+          if cfg.scan_layers:
+            y = y[0]
+          if not is_last_stage:
+            y = jaxpp.pipeline_enter_stage(y, f"stage_{stage}", stage + 1)
+      else:
+        base_stage = RemattedBlockLayer if cfg.set_remat_policy_on_layers_per_stage else BlockLayer
+        stage_module = self.get_pipeline_stage_module(base_stage, cfg, mesh, cfg.num_layers_per_pipeline_stage)
+        y = pipeline.Pipeline(config=cfg, mesh=mesh, layers=stage_module, remat_policy=policy)(
+            y,
+            decoder_segment_ids,
+            decoder_positions,
+            deterministic,
+            model_mode,
+        )
     else:
       if cfg.scan_layers:
         y, _ = self.scan_decoder_layers(cfg, RemattedBlockLayer, cfg.num_decoder_layers, "layers", mesh)(

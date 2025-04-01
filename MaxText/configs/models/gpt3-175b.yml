@@ -1,4 +1,5 @@
 # Copyright 2023 Google LLC
+# Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,14 +29,14 @@ logits_via_embedding: True
 normalize_embedding_logits: False
 logits_dot_in_fp32: False
 normalization_layer_epsilon: 1.e-05
-use_iota_embed: True
+use_iota_embed: False
 fused_qkv: True
 opt_type: "adam_pax"
 decoder_block: "gpt3"
-dataset_path: "gs://mlperf-llm-public2"
-dataset_name: "c4/en:3.0.4"
-eval_dataset_name: "c4/en:3.0.5"
-gradient_clipping_threshold: 1.
+#dataset_path: "gs://mlperf-llm-public2"
+#dataset_name: "c4/en:3.0.4"
+#eval_dataset_name: "c4/en:3.0.5"
+gradient_clipping_threshold: 0.
 adam_b1: 0.9
 adam_b2: 0.95
 adam_eps: 1.e-8

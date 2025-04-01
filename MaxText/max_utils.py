@@ -1,5 +1,6 @@
 """
 Copyright 2023 Google LLC
+Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -38,6 +39,7 @@ import max_logging
 
 import orbax.checkpoint as ocp
 import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_checkpoint_manager
+from jaxpp.mesh import RemoteMpmdMesh
 
 
 import json
@@ -49,6 +51,7 @@ from flax.linen import partitioning as nn_partitioning
 
 from tensorboardX import writer
 from google.cloud import storage
+import tensorflow as tf
 
 HYBRID_RING_64X4 = "hybrid_ring_64x4"
 HYBRID_RING_32X8 = "hybrid_ring_32x8"
@@ -264,9 +267,38 @@ def maybe_initialize_jax_distributed_system(raw_keys):
     # Don't initialize jax distributed with AOT compilation
     return
   if is_gpu_backend(raw_keys):
-    max_logging.log("Attempting to initialize the jax distributed system for GPU backend...")
-    initialize_jax_for_gpu(raw_keys)
-    max_logging.log("Jax distributed system initialized on GPU!")
+    if raw_keys["jaxpp_remote"] and raw_keys["use_jaxpp"]:
+      def get_mesh_shape_by_names(axis_names):
+        mesh_axes_map = {
+          "data": "ici_data_parallelism",
+          "stage": None,
+          "fsdp": "ici_fsdp_parallelism",
+          "fsdp_transpose": "ici_fsdp_transpose_parallelism",
+          "sequence": "ici_sequence_parallelism",
+          "tensor": "ici_tensor_parallelism",
+          "expert": "ici_expert_parallelism",
+          "autoregressive": "ici_autoregressive_parallelism",
+        }
+        return tuple(raw_keys[mesh_axes_map.get(name)] if mesh_axes_map.get(name) is not None else 1 for name in axis_names)
+      if raw_keys["ici_pipeline_parallelism"] > 0 and raw_keys["jaxpp_remote"]:
+        max_logging.log(
+          "WARNING: JaxPP with remote execution does not ensure proper pipeline rank"
+          "colocation yet"
+        )
+      # Need to clear all backends as pyconfig has initialized once
+      RemoteMpmdMesh._push_current_worker_mesh(RemoteMpmdMesh(
+        raw_keys["dcn_pipeline_parallelism"] * raw_keys["ici_pipeline_parallelism"],
+        get_mesh_shape_by_names(raw_keys["mesh_axes"]),
+        raw_keys["mesh_axes"],
+        import_modules=["transformer_engine.jax.cpp_extensions"],
+      ))
+      tf.config.set_visible_devices([], "GPU")
+      jax.config.update("jax_default_prng_impl", "unsafe_rbg")
+      jax.config.update("jax_default_device", jax.local_devices(backend="cpu")[0])
+    else:
+      max_logging.log("Attempting to initialize the jax distributed system for GPU backend...")
+      initialize_jax_for_gpu(raw_keys)
+      max_logging.log("Jax distributed system initialized on GPU!")
   elif is_cpu_backend(raw_keys):
     max_logging.log("Attempting to initialize the jax distributed system for CPU backend...")
     initialize_jax_for_cpu(raw_keys)
@@ -399,6 +431,8 @@ def _retrieve_jax_init_info(raw_keys):
 
 def get_num_slices(raw_keys):
   """Calculate num_slices based on number of devices."""
+  if raw_keys["jaxpp_remote"]:
+      return 1
   if raw_keys["hardware"] == "cpu":
     max_logging.log(" Setting num_slices=1 for CPU hardware type")
     return 1
@@ -658,7 +692,12 @@ def init_initial_state(model, tx, config, is_training, key):
 
   Args: model, tx, config, is_training, key
   """
-  input_shape = (config.micro_batch_size_to_train_on, config.max_target_length)
+  microbatch_size, rem = divmod(config.micro_batch_size_to_train_on, config.num_pipeline_microbatches)
+  assert rem == 0, f"Global batch size {config.global_batch_size_to_load=} should be divisible by {config.num_pipeline_microbatches=}"
+  input_shape = (
+      config.micro_batch_size_to_train_on if not config.use_jaxpp else microbatch_size,
+      config.max_target_length
+  )
   model_vars = model.init(
       {"params": key, "dropout": key, "aqt": key},
       np.ones(input_shape, dtype=jnp.int32),
@@ -744,6 +783,10 @@ def setup_initial_state(
   unboxed_abstract_state, state_mesh_annotations, state_mesh_shardings = get_abstract_state(
       model, tx, config, rng, mesh, is_training
   )
+
+  # TODO: remove this and add `jaxpp.mpmd` to init_state_partial below
+  if config.use_jaxpp:
+      return unboxed_abstract_state, state_mesh_annotations, state_mesh_shardings, data_iterator
 
   # Initialization
   with nn_partitioning.axis_rules(config.logical_axis_rules):
@@ -923,6 +966,46 @@ def _cross_entropy_with_logits_bwd(
 cross_entropy_with_logits.defvjp(_cross_entropy_with_logits_fwd, _cross_entropy_with_logits_bwd)
 
 
+def add_data_to_sharding(mesh, path, aval, sharding):
+  if not isinstance(sharding, jax.sharding.NamedSharding):
+    raise AssertionError(f"Expected NamedSharding, found {sharding} of {type(sharding)=} at {jax.tree_util.keystr(path)}")
+  try:
+    sharded_shape = sharding.shard_shape(aval.shape)
+  except Exception as e:
+    raise AssertionError(f"Could not shard value {jax.tree_util.keystr(path)} of shape={aval.shape} with {sharding=}") from e
+  pspec = sharding._parsed_pspec
+
+  if 'data' in jax.tree.leaves(pspec):
+    return sharding
+
+  for idx, (size, partition) in enumerate(zip(sharded_shape, pspec)):
+    if partition is None:
+      partition = ()
+
+    if size % mesh.shape['data'] == 0 and (partition is None or 'tensor' not in partition):
+      added_component = ('data',) + partition
+      new_pspec = jax.sharding.PartitionSpec(*(pspec[:idx] + (added_component,) + pspec[idx+1:]))
+      return sharding.with_spec(new_pspec)
+  return sharding
+
+
+def maybe_update_params_sharding_with_opt(config, state_mesh_shardings):
+  prev_params_shardings = state_mesh_shardings.params
+  if config.shard_optimizer_over_data:
+    if isinstance(state_mesh_shardings.opt_state, optax.ScaleByAdamState):
+      sharded_fp32_params = state_mesh_shardings.opt_state.mu
+    elif isinstance(state_mesh_shardings.opt_state, tuple) and isinstance(state_mesh_shardings.opt_state[0], optax.ScaleByAdamState):
+      sharded_fp32_params = state_mesh_shardings.opt_state[0].mu
+    else:
+      raise NotImplementedError(f"Could not find optimizer state shardings from optimizer of type {type(state_mesh_shardings.opt_state)}")
+    if "params" not in sharded_fp32_params.keys():
+      # When quantization=fp8 is enabled the sharded_fp32_params
+      # are not wrapped in `params`. Here we wrap them back.
+      sharded_fp32_params = {"params": sharded_fp32_params}
+    state_mesh_shardings = state_mesh_shardings.replace(params=dict(prev_params_shardings, **sharded_fp32_params))
+  return prev_params_shardings, state_mesh_shardings
+
+
 def get_abstract_state(model, tx, config, rng, mesh, is_training=True):
   """Get a shaped abstraction of the state (including optimizer)"""
   init_state_partial = functools.partial(init_initial_state, model, tx, config, is_training, rng)
@@ -933,6 +1016,11 @@ def get_abstract_state(model, tx, config, rng, mesh, is_training=True):
   state_logical_annotations = nn.get_partition_spec(abstract_state)
 
   state_mesh_shardings = nn.logical_to_mesh_sharding(state_logical_annotations, mesh, config.logical_axis_rules)
+  if is_training and config.shard_optimizer_over_data:
+    state_mesh_shardings = state_mesh_shardings.replace(
+      opt_state=jax.tree.map_with_path(functools.partial(add_data_to_sharding, mesh), unbox_logicallypartioned(abstract_state).opt_state, state_mesh_shardings.opt_state)
+    )
+
   if is_training and config.optimizer_memory_host_offload:
     opt_state = jax.tree_util.tree_map(lambda x: x.with_memory_kind(kind="pinned_host"), state_mesh_shardings.opt_state)
     params = jax.tree_util.tree_map(lambda x: x.with_memory_kind(kind="pinned_host"), state_mesh_shardings.params)
@@ -1071,7 +1159,8 @@ def print_mem_stats(label: str):
       stats = d.memory_stats()
       used = round(stats["bytes_in_use"] / 2**30, 2)
       limit = round(stats["bytes_limit"] / 2**30, 2)
-      max_logging.log(f"\tUsing (GB) {used} / {limit} ({used/limit:%}) on {d}")
+      peak_size = round(stats["peak_bytes_in_use"] / 2**30, 2)
+      max_logging.log(f"\tUsing (GB) {used} / {limit} ({used/limit:%}) ({peak_size=} GiB) on {d}")
   except (RuntimeError, KeyError, TypeError) as ex:
     max_logging.log(f"\tMemstats unavailable, error: {ex}")
 

@@ -1,5 +1,6 @@
 """
 Copyright 2023 Google LLC
+Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -41,6 +42,8 @@ import pickle
 import accelerator_to_spec_map
 import train
 from input_pipeline import input_pipeline_interface
+import jaxpp.api as jaxpp
+from jaxpp.mesh import MpmdMesh
 
 # pylint: disable=too-many-positional-arguments
 
@@ -112,18 +115,32 @@ def jit_and_compile(
     static_argnums,
     donate_argnums,
     logical_axis_rules,
+    mpmd_mesh=None,
 ):
   """Jit, lower, and compile func."""
   with mesh, logical_axis_rules:
-    jitted = jax.jit(
+    if mpmd_mesh is not None:
+      p_train_step = jaxpp.pipelined(
         func,
-        in_shardings=in_shardings,
-        out_shardings=out_shardings,
-        static_argnums=static_argnums,
+        mpmd_mesh=mpmd_mesh,
         donate_argnums=donate_argnums,
-    )
-    lowered = jitted.lower(*func_input_args, **func_input_kwargs)
-  compiled = lowered.compile()
+        in_axis_resources=in_shardings,
+        out_axis_resources=out_shardings,
+      )
+      assert len(func_input_kwargs) == 0
+      compiled = p_train_step.compile(*func_input_args)
+    else:
+      jitted = jax.jit(
+          func,
+          in_shardings=in_shardings,
+          out_shardings=out_shardings,
+          static_argnums=static_argnums,
+          donate_argnums=donate_argnums,
+      )
+      lowered = jitted.lower(*func_input_args, **func_input_kwargs)
+
+  if mpmd_mesh is None:
+    compiled = lowered.compile()
   return compiled
 
 
@@ -146,17 +163,24 @@ def main(argv: Sequence[str]) -> None:
 
   # Create target mesh
   topology_mesh = get_topology_mesh(config)
+  if config.use_jaxpp:
+    mpmd_mesh = MpmdMesh(topology_mesh, 'stage')
+    mesh = mpmd_mesh.lowering_mesh()
+  else:
+    mpmd_mesh = None
+    mesh = topology_mesh
 
   # Print system information after building the compile topology to avoid
   # prematurely initializing the backend.
   max_utils.print_system_information()
 
   # Get shaped inputs
-  shaped_train_args, shaped_train_kwargs, state_mesh_shardings, model = get_shaped_inputs(topology_mesh, config)
+  shaped_train_args, shaped_train_kwargs, state_mesh_shardings, model = get_shaped_inputs(mesh, config)
+  params_shardings, state_mesh_shardings = max_utils.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
   # Get function to compile and shardings
   func_to_compile, in_shard, out_shard, static_argnums, donate_argnums = maxtext_utils.get_functional_train_with_signature(
-      train.train_step, topology_mesh, state_mesh_shardings, model, config
+      train.train_step, mesh, state_mesh_shardings, model, config, params_shardings=params_shardings
   )
 
   # Compile
@@ -165,12 +189,13 @@ def main(argv: Sequence[str]) -> None:
       func_to_compile,
       shaped_train_args,
       shaped_train_kwargs,
-      topology_mesh,
+      mesh,
       in_shard,
       out_shard,
       static_argnums,
       donate_argnums,
       nn_partitioning.axis_rules(config.logical_axis_rules),
+      mpmd_mesh=mpmd_mesh
   )
   print("Jitting and compilation complete!", flush=True)
 
@@ -179,9 +204,11 @@ def main(argv: Sequence[str]) -> None:
     print("Saving compiled object...")
     save_compiled(compiled, config.compiled_trainstep_file)
     print(f"Successfully saved compiled object as {config.compiled_trainstep_file}")
-  print("Finished train_compile.py successfully!", flush=True)
-  print(f"Cost analysis: {compiled.cost_analysis()}")
-  print(f"Memory analysis: {compiled.memory_analysis()}")
+
+  if not config.use_jaxpp:
+    print("Finished train_compile.py successfully!", flush=True)
+    print(f"Cost analysis: {compiled.cost_analysis()}")
+    print(f"Memory analysis: {compiled.memory_analysis()}")
 
   # Dump HLO if requested
   if config.dump_hlo:

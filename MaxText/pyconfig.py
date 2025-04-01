@@ -1,5 +1,6 @@
 """
 Copyright 2023 Google LLC
+Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -149,6 +150,9 @@ def validate_keys(keys):
   validate_multiple_slices(keys)
   if keys["num_experts"] > 1:
     validate_megablox_parallelism(keys)
+
+  if keys["use_jaxpp"]:
+    assert (keys["gradient_clipping_threshold"] <= 0), "JAXPP does not allow global operations currently"
 
 
 def validate_data_input(keys):
@@ -585,7 +589,8 @@ def set_and_validate_pipeline_config(raw_keys):
           # The "stage" needs to be listed first since the microbatch dimension is first before the reshape.
           logical_axis_rules[idx] = [
               "activation_embed_and_logits_batch",
-              ["stage", "data", "fsdp", "fsdp_transpose", "expert"],
+              ["stage", "data", "fsdp", "fsdp_transpose", "expert"] if not raw_keys["use_jaxpp"] else
+              ["stage", "fsdp", "fsdp_transpose", "expert"],
           ]
           break  # Exit the loop after modifying the list
       return logical_axis_rules
@@ -639,25 +644,30 @@ def set_and_validate_pipeline_config(raw_keys):
     raw_keys["logical_axis_rules"] = modify_activation_embed_and_logits_batch(raw_keys["logical_axis_rules"])
     raw_keys = pipeline_first_axis(raw_keys)
     num_stages = int(raw_keys["ici_pipeline_parallelism"] * raw_keys["dcn_pipeline_parallelism"])
-    if raw_keys["num_pipeline_repeats"] == -1:
-      num_pipeline_repeats, remainder = divmod(
-          raw_keys["num_decoder_layers"], num_stages * raw_keys["num_layers_per_pipeline_stage"]
-      )
+    if not raw_keys["use_jaxpp"]:
+      if raw_keys["num_pipeline_repeats"] == -1:
+        num_pipeline_repeats, remainder = divmod(
+            raw_keys["num_decoder_layers"], num_stages * raw_keys["num_layers_per_pipeline_stage"]
+        )
+        assert (
+            not remainder
+        ), f"The number of layers per stage ({raw_keys['num_layers_per_pipeline_stage']}) times the number of stages ({num_stages}) must divide the number of decoder layers ({raw_keys['num_decoder_layers']}) "
+        raw_keys["num_pipeline_repeats"] = num_pipeline_repeats
       assert (
-          not remainder
-      ), f"The number of layers per stage ({raw_keys['num_layers_per_pipeline_stage']}) times the number of stages ({num_stages}) must divide the number of decoder layers ({raw_keys['num_decoder_layers']}) "
-      raw_keys["num_pipeline_repeats"] = num_pipeline_repeats
-    assert (
-        num_stages * raw_keys["num_pipeline_repeats"] * raw_keys["num_layers_per_pipeline_stage"]
-        == raw_keys["num_decoder_layers"]
-    ), f"The product of pipeline stages ({num_stages}), repeats ({raw_keys['num_pipeline_repeats']}), and layers per stage ({raw_keys['num_layers_per_pipeline_stage']}) must be equal to the number of layers ({raw_keys['num_decoder_layers']})"
+          num_stages * raw_keys["num_pipeline_repeats"] * raw_keys["num_layers_per_pipeline_stage"]
+          == raw_keys["num_decoder_layers"]
+      ), f"The product of pipeline stages ({num_stages}), repeats ({raw_keys['num_pipeline_repeats']}), and layers per stage ({raw_keys['num_layers_per_pipeline_stage']}) must be equal to the number of layers ({raw_keys['num_decoder_layers']})"
+    else:
+      assert raw_keys["pipeline_delay_activation_forwarding"] is False
+      assert raw_keys["num_pipeline_repeats"] >= 1
+      assert raw_keys["num_pipeline_microbatches"] >= 1
     if raw_keys["num_pipeline_microbatches"] == -1:
       if raw_keys["pipeline_delay_activation_forwarding"]:
         raw_keys["num_pipeline_microbatches"] = 2 * num_stages
       else:
         raw_keys["num_pipeline_microbatches"] = num_stages
     assert (
-        raw_keys["num_pipeline_microbatches"] % num_stages == 0
+        raw_keys["num_pipeline_microbatches"] % num_stages == 0 or raw_keys["use_jaxpp"]
     ), f"The number of microbatches ({raw_keys['num_pipeline_microbatches']}) must be divisible by the number of stages ({num_stages})"
     assert (
         raw_keys["micro_batch_size_to_train_on"] % raw_keys["num_pipeline_microbatches"] == 0
@@ -781,6 +791,9 @@ def calculate_global_batch_sizes(
 
 
 def get_num_target_devices(raw_keys):
+  if raw_keys["jaxpp_remote"] and raw_keys["use_jaxpp"]:
+    from jaxpp.mesh import RemoteMpmdMesh
+    return RemoteMpmdMesh.current_worker_mesh().remote_mesh.size
   # In AOT case compile_topology is set (e.g. is not the empty string), and we determine the
   # number of devices from the compile_topology. In non-AOT settings we simply can use jax.devices().
   if raw_keys.get("compile_topology"):
@@ -799,8 +812,7 @@ def get_quantization_local_shard_count(raw_keys):
 
 
 def using_pipeline_parallelism(raw_keys) -> bool:
-  return int(raw_keys["ici_pipeline_parallelism"]) > 1 or int(raw_keys["dcn_pipeline_parallelism"]) > 1
-
+  return raw_keys["use_jaxpp"] or int(raw_keys["ici_pipeline_parallelism"]) > 1 or int(raw_keys["dcn_pipeline_parallelism"]) > 1
 
 def using_tensor_parallelism(raw_keys) -> bool:
   return (
