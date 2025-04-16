@@ -411,7 +411,7 @@ data_shuffle_seed: 0
 init_weights_seed: 0
 
 # You may disable clipping by setting gradient_clipping_threshold to zero.
-gradient_clipping_threshold: 0. # NOTE(jaxpp): jaxpp does not support clipping
+gradient_clipping_threshold: 1.
 
 # Instead of updating the weights every step, you may effectively use a larger
 # batch by accumulating the gradient over a set of steps.

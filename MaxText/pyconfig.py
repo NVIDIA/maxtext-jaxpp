@@ -151,9 +151,6 @@ def validate_keys(keys):
   if keys["num_experts"] > 1:
     validate_megablox_parallelism(keys)
 
-  if keys["use_jaxpp"]:
-    assert (keys["gradient_clipping_threshold"] <= 0), "JAXPP does not allow global operations currently"
-
 
 def validate_data_input(keys):
   """validate provided parameters for data input"""

@@ -12,28 +12,73 @@ Some of the notable changes are listed below.
 * The `maybe_initialize_jax_distributed_system` function in [MaxText/max_utils.py](MaxText/max_utils.py)
   creates `RemoteMpmdMesh` to be used by JaxPP.
 * [MaxText/train.py](MaxText/train.py) contains changes to
-** Enable pipeline parallelism for the train step, and
-** Mark the pipeline loop in the train step with `jaxpp.accumulate_grads`.
+ * Enable pipeline parallelism for the train step, and
+ * Mark the pipeline loop in the train step with `jaxpp.accumulate_grads`.
 
-# Benchmarks
+# Docker image
 
-## GPT3
-MaxText GPT3 has been tested with JaxPP.
+For ease of use, we provide a docker image with this fork under `/workdir/maxtext`.
+The docker image has all the dependencies that are needed to use MaxText with JaxPP installed.
 
-[`MaxText/train.py`](MaxText/train.py) is used to run the benchmark.
-The following example command line runs the script on a single node with 2 DP (data parallelism) groups.
-In this example, each DP group runs the computation, using 2-way pipeline parallelism and 2-way tensor parallelism.
+## Building and Testing Docker Container
+
+The build process uses the JaxPP base image as a starting point. Follow the instructions at [JaxPP's Building the Base Image](https://github.com/NVIDIA/jaxpp#building-the-base-image) to build the `jaxpp-base` image first.
+
+### Prerequisites
+- Docker installed and configured
+- NVIDIA Container Toolkit installed
+- JaxPP base image built and available locally
+
+### Building the Main Image
+
+After building the base image, you can build the main image:
 
 ```bash
-RAY_ADDRESS=local \
-  python /workspaces/maxtext/MaxText/train.py \
-  MaxText/configs/base.yml \
-  run_name=gpt3-52k \
-  base_output_directory=/tmp/log hardware=gpu dataset_type=synthetic \
-  model_name=gpt3-52k steps=20 dtype=bfloat16 max_target_length=1024 per_device_batch_size=4 \
-  dcn_data_parallelism=2 ici_tensor_parallelism=2 enable_checkpointing=false use_jaxpp=True \
-  distributed_initialization=True ici_pipeline_parallelism=2 num_pipeline_microbatches=2 use_pgle=False
+docker build --force-rm=true \
+  -f jaxpp.Dockerfile \
+  --build-arg BASE_IMAGE=jaxpp-base \
+  -t maxtext-jaxpp .
 ```
+
+### Running Tests
+
+The container includes several test suites for different models:
+
+1. **Tiny Llama2 Model Tests**:
+```bash
+docker run --gpus=all --shm-size=10.24gb --ulimit memlock=-1 --ulimit stack=67108864 \
+  -e CUDA_VISIBLE_DEVICES=0 --rm --workdir /workdir/maxtext maxtext-jaxpp \
+  "nvidia-smi && bash /workdir/maxtext/scripts/multigpu_jaxpp.sh --max_target_length=64 --model=default \
+   --dp=1 --pp=1 --mp=1 --batch_size_per_device=1 --num_pipeline_microbatches=1 \
+   jaxpp_remote=false base_emb_dim=1024 base_num_query_heads=8 base_num_kv_heads=8 base_mlp_dim=11008 \
+   base_num_decoder_layers=1 head_dim=128 vocab_size=32000 enable_dropout=false \
+   logits_via_embedding=false normalization_layer_epsilon=1.0e-5 decoder_block=llama2"
+```
+
+2. **Tiny Mixtral Model Tests**:
+```bash
+docker run --gpus=all --shm-size=10.24gb --ulimit memlock=-1 --ulimit stack=67108864 \
+  -e CUDA_VISIBLE_DEVICES=0 --rm --workdir /workdir/maxtext maxtext-jaxpp \
+  "nvidia-smi && bash /workdir/maxtext/scripts/multigpu_jaxpp.sh --max_target_length=64 --model=default \
+   --dp=1 --pp=1 --mp=1 --batch_size_per_device=1 --num_pipeline_microbatches=1 \
+   jaxpp_remote=false base_emb_dim=1024 base_num_query_heads=2 base_num_kv_heads=2 base_mlp_dim=896 \
+   base_num_decoder_layers=2 head_dim=16 vocab_size=32000 enable_dropout=false \
+   logits_via_embedding=false normalization_layer_epsilon=1.0e-5 num_experts=8 \
+   num_experts_per_tok=2 decoder_block=mistral"
+```
+
+3. **Tiny Mistral Model Tests**:
+```bash
+docker run --gpus=all --shm-size=10.24gb --ulimit memlock=-1 --ulimit stack=67108864 \
+  -e CUDA_VISIBLE_DEVICES=0 --rm --workdir /workdir/maxtext maxtext-jaxpp \
+  "nvidia-smi && bash /workdir/maxtext/scripts/multigpu_jaxpp.sh --max_target_length=64 --model=default \
+   --dp=1 --pp=1 --mp=1 --batch_size_per_device=1 --num_pipeline_microbatches=1 \
+   jaxpp_remote=false base_emb_dim=2048 base_num_query_heads=1 base_num_kv_heads=1 base_mlp_dim=896 \
+   base_num_decoder_layers=1 head_dim=8 vocab_size=32000 enable_dropout=false \
+   logits_via_embedding=false normalization_layer_epsilon=1.0e-5 decoder_block=mistral"
+```
+
+Note: The tests require GPU access and sufficient GPU memory.
 
 # Profiling
 

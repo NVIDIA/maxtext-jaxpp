@@ -753,3 +753,4 @@ class MoeBlock(nn.Module):
     else:
       max_logging.log("Running MoE dense matmul implementation.")
       return self.dense_matmul(inputs, gate_logits, w0_kernel, w1_kernel, wo_kernel)
+

@@ -486,10 +486,6 @@ def load_schedule(config):
       schedule = jaxpp.Eager1F1B(num_logical_stages)
   elif config.schedule == "interleaved_1f1b":
       schedule = jaxpp.Interleaved1F1B(num_logical_stages, pipeline_parallel_dim)
-  elif config.schedule == "zbh1":
-      schedule = jaxpp.ZeroBubble(num_logical_stages)
-  elif config.schedule == "interleaved_zbh1":
-      schedule = jaxpp.InterleavedZeroBubble(num_logical_stages, pipeline_parallel_dim)
   else:
       raise NotImplementedError(f"Unknown schedule {config.schedule}")
   return schedule
