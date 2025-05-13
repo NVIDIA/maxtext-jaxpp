@@ -120,12 +120,12 @@ def jit_and_compile(
   """Jit, lower, and compile func."""
   with mesh, logical_axis_rules:
     if mpmd_mesh is not None:
-      p_train_step = jaxpp.pipelined(
+      p_train_step = jaxpp.mpmd_jit_with_loop(
         func,
         mpmd_mesh=mpmd_mesh,
         donate_argnums=donate_argnums,
-        in_axis_resources=in_shardings,
-        out_axis_resources=out_shardings,
+        in_shardings=in_shardings,
+        out_shardings=out_shardings,
       )
       assert len(func_input_kwargs) == 0
       compiled = p_train_step.compile(*func_input_args)

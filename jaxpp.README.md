@@ -13,7 +13,7 @@ Some of the notable changes are listed below.
   creates `RemoteMpmdMesh` to be used by JaxPP.
 * [MaxText/train.py](MaxText/train.py) contains changes to
  * Enable pipeline parallelism for the train step, and
- * Mark the pipeline loop in the train step with `jaxpp.accumulate_grads`.
+ * Mark the pipeline loop in the train step with `jaxpp.treduce`.
 
 # Docker image
 
@@ -34,10 +34,15 @@ The build process uses the JaxPP base image as a starting point. Follow the inst
 After building the base image, you can build the main image:
 
 ```bash
-docker build --force-rm=true \
-  -f jaxpp.Dockerfile \
-  --build-arg BASE_IMAGE=jaxpp-base \
-  -t maxtext-jaxpp .
+# Check if jaxpp-base image exists
+if [ -z "$(docker images -q jaxpp-base)" ]; then
+  echo "Error: jaxpp-base image not found. Please build it first using the instructions at https://github.com/NVIDIA/jaxpp#building-the-base-image."
+else
+  docker build --force-rm=true \
+    -f jaxpp.Dockerfile \
+    --build-arg BASE_IMAGE=jaxpp-base \
+    -t maxtext-jaxpp .
+fi
 ```
 
 ### Running Tests

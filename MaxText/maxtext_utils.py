@@ -260,19 +260,11 @@ def assert_params_sufficiently_sharded(params, mesh, tolerance):
       f"of total parameters with a value of {unsharded_param_perc}%."
   )
 
-def global_norm(updates) -> jax.Array:
-  """Compute the global norm across a nested structure of tensors."""
-  per_param_sum = [jnp.sum(numerics.abs_sq(x)) for x in jax.tree.leaves(updates)]
-  return jnp.sqrt(
-    cross_mpmd_all_reduce(*(e.astype(jnp.float32) for e in per_param_sum))
-  )
-
-def clip_by_global_norm(max_norm: float) -> optax.GradientTransformation:
+def clip_by_global_norm(g_norm: jax.Array, max_norm: float) -> optax.GradientTransformation:
   # Adaptation of `optax.transforms._clipping.clip_by_global_norm`
-  # that uses a cross_mpmd_all_reduce to compute `global_norm`.
+  # that takes `g_norm` as argument
   def update_fn(updates, state, params=None):
     del params
-    g_norm = global_norm(updates)
     trigger = jnp.squeeze(g_norm < max_norm)
     chex.assert_shape(trigger, ())  # A scalar.
 
@@ -284,7 +276,7 @@ def clip_by_global_norm(max_norm: float) -> optax.GradientTransformation:
 
   return optax.GradientTransformation(base.init_empty_state, update_fn)
 
-def apply_gradient_clipping(raw_grads, state, clipping_threshold):
+def apply_gradient_clipping(raw_grads, state, g_norm, clipping_threshold):
   """Applies gradient clipping to raw gradients, with special handing for FLAX fp8 stats.
 
   Args:
@@ -295,7 +287,7 @@ def apply_gradient_clipping(raw_grads, state, clipping_threshold):
   Returns:
     A pytree of clipped gradients.
   """
-  gradient_clip_transformation = clip_by_global_norm(clipping_threshold)
+  gradient_clip_transformation = clip_by_global_norm(g_norm, clipping_threshold)
   if OVERWRITE_WITH_GRADIENT in raw_grads:
     # Scales + Amax History for Delayed Tensor Scaling SHOULD NOT be clipped or affect clipping
     fp8_stats = raw_grads.pop(OVERWRITE_WITH_GRADIENT)

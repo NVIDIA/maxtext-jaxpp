@@ -458,9 +458,7 @@ target_eval_loss: 0.  # early stop once reaching target eval_loss
 # NOTE(jaxpp): begin parameters
 jaxpp_remote: True
 shard_optimizer_over_data: True # Similar to upstream `pipeline_fsdp_ag_once`
-jaxpp_cast_worker_idx: 0
 use_jaxpp: False
-distributed_initialization: False
 schedule: "eager_1f1b"
 use_pgle: True
 grad_dtype: "bfloat16"

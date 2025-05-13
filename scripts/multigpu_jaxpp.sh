@@ -161,7 +161,6 @@ python ${BASE_DIR}/MaxText/train.py \
     dtype=float16 \
     `# ------------- JAXPP ------------- #` \
     use_jaxpp=true \
-    distributed_initialization=true \
     num_pipeline_microbatches=${MICRO_BS}\
     use_pgle=False \
     ${BYPASS_ARGUMENTS}

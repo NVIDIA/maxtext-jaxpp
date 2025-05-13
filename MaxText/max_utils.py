@@ -39,7 +39,6 @@ import max_logging
 
 import orbax.checkpoint as ocp
 import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_checkpoint_manager
-from jaxpp.mesh import RemoteMpmdMesh
 
 
 import json
@@ -52,6 +51,7 @@ from flax.linen import partitioning as nn_partitioning
 from tensorboardX import writer
 from google.cloud import storage
 import tensorflow as tf
+import jaxpp.api as jaxpp
 
 HYBRID_RING_64X4 = "hybrid_ring_64x4"
 HYBRID_RING_32X8 = "hybrid_ring_32x8"
@@ -82,7 +82,8 @@ def find_nans_and_infs(pytree):
 
 def l2norm_pytree(x):
   """L2 norm of a pytree of arrays."""
-  return jnp.sqrt(jax.tree_util.tree_reduce(lambda x, y: x + jnp.sum(jnp.square(y)), x, initializer=0.0))
+  per_param_sum = [jnp.sum(jnp.square(x)) for x in jax.tree.leaves(x)]
+  return jnp.sqrt(jaxpp.cross_mpmd_all_reduce(*(e.astype(jnp.float32) for e in per_param_sum)))
 
 
 def calculate_num_params_from_pytree(params):
@@ -286,7 +287,7 @@ def maybe_initialize_jax_distributed_system(raw_keys):
           "colocation yet"
         )
       # Need to clear all backends as pyconfig has initialized once
-      RemoteMpmdMesh._push_current_worker_mesh(RemoteMpmdMesh(
+      jaxpp.RemoteMpmdMesh._push_current_worker_mesh(jaxpp.RemoteMpmdMesh(
         raw_keys["dcn_pipeline_parallelism"] * raw_keys["ici_pipeline_parallelism"],
         get_mesh_shape_by_names(raw_keys["mesh_axes"]),
         raw_keys["mesh_axes"],
@@ -759,7 +760,7 @@ def setup_initial_state(
     tx,
     config,
     rng,
-    mesh,
+    maybe_mpmd_mesh,
     checkpoint_manager,
     is_training=True,
 ):
@@ -780,16 +781,19 @@ def setup_initial_state(
     state_mesh_annotations: the mesh annotations for the train state
   """
 
+  mesh = maybe_mpmd_mesh
+  if isinstance(maybe_mpmd_mesh, (jaxpp.RemoteMpmdMesh, jaxpp.MpmdMesh)):
+    mesh = maybe_mpmd_mesh.lowering_mesh()
+
   unboxed_abstract_state, state_mesh_annotations, state_mesh_shardings = get_abstract_state(
       model, tx, config, rng, mesh, is_training
   )
 
-  # TODO: remove this and add `jaxpp.mpmd` to init_state_partial below
-  if config.use_jaxpp:
-      return unboxed_abstract_state, state_mesh_annotations, state_mesh_shardings, data_iterator
-
   # Initialization
   with nn_partitioning.axis_rules(config.logical_axis_rules):
+    if checkpoint_manager is not None:
+      assert not config.use_jaxpp
+
     restored, raw_params = checkpointing.load_state_if_possible(
         checkpoint_manager,
         data_iterator,
@@ -810,16 +814,61 @@ def setup_initial_state(
     else:
       init_state_partial = functools.partial(init_initial_state, model, tx, config, is_training)
       init_state_partial.__name__ = "initialize_state"
-      # pylint: disable=not-callable
-      state = jax.jit(
-          init_state_partial,
-          in_shardings=None,
-          out_shardings=state_mesh_shardings,
-      )(rng)
-      if raw_params:  # If we loaded a partial state, we need to merge it.
-        state = state.replace(params=raw_params)
+      if config.use_jaxpp:
+        # First infer placement based on loop usage
+        # Imported here to avoid circular import errors
+        import maxtext_utils
+        from train import train_step
+        params_shardings, _state_mesh_shardings = maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
+        (
+            functional_train,
+            in_shard_train,
+            out_shard_train,
+            static_argnums_train,
+            donate_argnums_train,
+        ) = maxtext_utils.get_functional_train_with_signature(train_step, mesh, _state_mesh_shardings, model, config, params_shardings=params_shardings)
 
-  state = unbox_logicallypartioned(state)
+        p_train_step = jaxpp.mpmd_jit_with_loop(
+          functional_train,
+          mpmd_mesh=maybe_mpmd_mesh,
+          donate_argnums=donate_argnums_train,
+          in_shardings=in_shard_train,
+          out_shardings=out_shard_train,
+          use_pgle=config.use_pgle
+        )
+        with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+          global_mpmd_train_step = p_train_step.trace_and_place(
+            unboxed_abstract_state, next(data_iterator), rng
+          )
+        unboxed_abstract_state_placements = global_mpmd_train_step.in_shardings[0]
+        def attach_right_mesh(shaped: jax.ShapeDtypeStruct, dist_sharding):
+          sharding: jax.sharding.NamedSharding = shaped.sharding
+          jax_mesh = maybe_mpmd_mesh.as_mpmd_mesh.mpmd_submesh(sorted(dist_sharding.mesh_ids)).jax_mesh
+          mpmd_sharding = jax.sharding.NamedSharding(jax_mesh, sharding.spec)
+          return jax.ShapeDtypeStruct(shaped.shape, shaped.dtype, sharding=mpmd_sharding, weak_type=shaped.weak_type)
+
+        unboxed_mpmd_abstract_state = jax.tree.map(attach_right_mesh, unboxed_abstract_state, unboxed_abstract_state_placements)
+        replicated_sharding = jax.sharding.NamedSharding(
+            maybe_mpmd_mesh.lowering_mesh(), jax.sharding.PartitionSpec()
+        )
+        state = jaxpp.mpmd_jit_rev(
+            lambda rng: jax.tree.map(jax._src.numpy.lax_numpy._array_copy, unbox_logicallypartioned(init_state_partial(rng))),
+            out_refs=jax.tree.map(lambda s: s.mesh_ids, unboxed_abstract_state_placements),
+            mpmd_mesh=maybe_mpmd_mesh,
+            in_shardings=replicated_sharding,
+            out_shardings=in_shard_train[0],
+        )(rng)
+      else:
+        # pylint: disable=not-callable
+        state = jax.jit(
+            init_state_partial,
+            in_shardings=None,
+            out_shardings=state_mesh_shardings,
+        )(rng)
+        if raw_params:  # If we loaded a partial state, we need to merge it.
+          state = state.replace(params=raw_params)
+
+        state = unbox_logicallypartioned(state)
 
   return state, state_mesh_annotations, state_mesh_shardings, data_iterator
 
@@ -973,7 +1022,7 @@ def add_data_to_sharding(mesh, path, aval, sharding):
     sharded_shape = sharding.shard_shape(aval.shape)
   except Exception as e:
     raise AssertionError(f"Could not shard value {jax.tree_util.keystr(path)} of shape={aval.shape} with {sharding=}") from e
-  pspec = sharding._parsed_pspec
+  pspec = sharding.spec
 
   if 'data' in jax.tree.leaves(pspec):
     return sharding
@@ -981,6 +1030,9 @@ def add_data_to_sharding(mesh, path, aval, sharding):
   for idx, (size, partition) in enumerate(zip(sharded_shape, pspec)):
     if partition is None:
       partition = ()
+
+    if isinstance(partition, str):
+      partition = (partition,)
 
     if size % mesh.shape['data'] == 0 and (partition is None or 'tensor' not in partition):
       added_component = ('data',) + partition

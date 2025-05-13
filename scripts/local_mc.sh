@@ -21,7 +21,7 @@ command="python -u MaxText/train.py MaxText/configs/base.yml                    
         dcn_data_parallelism=1 ici_data_parallelism=2 ici_tensor_parallelism=2              \
         ici_pipeline_parallelism=2 num_pipeline_repeats=2 num_pipeline_microbatches=32       \
         enable_checkpointing=false use_jaxpp=True jaxpp_remote=False schedule=interleaved_1f1b    \
-        distributed_initialization=True use_pgle=False profiler=xplane"
+        use_pgle=False profiler=xplane"
 
 seq 0 $((n_procs - 1)) | xargs -P $n_procs -I {} bash -c ' \
 n_gpus=$2; \
