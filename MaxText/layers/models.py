@@ -400,7 +400,7 @@ class Decoder(nn.Module):
           if cfg.scan_layers:
             y = y[0]
           if not is_last_stage:
-            y = jaxpp.pipeline_enter_stage(y, f"stage_{stage}", stage + 1)
+            y = jaxpp.pipeline_enter_stage(y, f"stage_{stage}")
       else:
         base_stage = RemattedBlockLayer if cfg.set_remat_policy_on_layers_per_stage else BlockLayer
         stage_module = self.get_pipeline_stage_module(base_stage, cfg, mesh, cfg.num_layers_per_pipeline_stage)

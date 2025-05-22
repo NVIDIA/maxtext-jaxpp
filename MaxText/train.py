@@ -602,6 +602,7 @@ def train_step(model, config, state_mesh_shardings, state, data, dropout_rng, pa
       loop_result = jaxpp.treduce(
           vmapped_compute_grads,
           data,
+          axis=1,
           schedule=load_schedule(config),
           operation=(jaxpp.Concat(axis=1), param_operation)
       )
