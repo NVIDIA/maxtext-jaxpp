@@ -22,11 +22,11 @@ from typing import overload
 from flax import nnx
 import flax.linen as nn
 import jax
-from jax.sharding import Mesh
+from jax.sharding import Mesh, AxisType
 from MaxText import maxtext_utils
 from MaxText import pyconfig
 from MaxText.layers import quantizations
-from MaxText.common_types import MODEL_MODE_TRAIN
+from MaxText.common_types import MODEL_MODE_TRAIN, ShardMode
 from MaxText.layers import models
 from orbax import checkpoint as ocp
 from functools import partial
@@ -40,6 +40,7 @@ import jaxpp.api as jaxpp
 def from_config(
     config: pyconfig.HyperParameters,
     devices: Sequence[jax.Device] | None = None,
+    mesh: Mesh | None = None,
     *,
     model_mode: str = MODEL_MODE_TRAIN,
 ) -> nn.Module:
@@ -50,6 +51,7 @@ def from_config(
 def from_config(
     config: pyconfig.HyperParameters,
     devices: Sequence[jax.Device] | None = None,
+    mesh: Mesh | None = None,
     *,
     model_mode: str = MODEL_MODE_TRAIN,
     rngs: nnx.Rngs,
@@ -60,6 +62,7 @@ def from_config(
 def from_config(
     config: pyconfig.HyperParameters,
     devices: Sequence[jax.Device] | None = None,
+    mesh: Mesh | None = None,
     *,
     model_mode: str = MODEL_MODE_TRAIN,
     rngs: nnx.Rngs | None = None,
@@ -80,15 +83,25 @@ def from_config(
       model = from_config(config)
   """
   devices_array = maxtext_utils.create_device_mesh(config, devices)
-  if not config.use_jaxpp:
-    mesh = Mesh(devices_array, config.mesh_axes)
-  else:
-    mesh = jaxpp.MpmdMesh(Mesh(devices_array, config.mesh_axes), 'stage')
+
+  if mesh is None:
+    if config.shard_mode == ShardMode.EXPLICIT:
+      axis_types = tuple([AxisType.Explicit] * len(config.mesh_axes))
+    else:
+      axis_types = tuple([AxisType.Auto] * len(config.mesh_axes))
+
+    base_mesh = Mesh(devices_array, config.mesh_axes, axis_types=axis_types)
+
+    if config.use_jaxpp:
+      mesh = jaxpp.MpmdMesh(base_mesh, "stage")
+    else:
+      mesh = base_mesh
+
   model = create_model(config, mesh.lowering_mesh() if config.use_jaxpp else mesh, model_mode=model_mode, rngs=rngs)
 
   if config.use_jaxpp:
-    # At this point, model.mesh has mesh.lowering_mesh() as its value, but we need to set it to the original mesh
-    # so that the caller can have access to the original mesh.
+    # At this point, model.mesh has mesh.lowering_mesh() as its value, but we need to set it to the mpmd_mesh
+    # so that the caller can have access to the mpmd_mesh.
     model.mesh = mesh
   # Return only the model
   return model
@@ -117,17 +130,28 @@ def create_model(config, mesh, model_mode: str = MODEL_MODE_TRAIN, rngs: nnx.Rng
   return model
 
 
-def create_nnx_model(config, devices=None):
+def create_nnx_model(config, mesh=None, devices=None, model_mode=None, rng_key=None):
   """Creates a NNX model with sharded parameters, possibly loading from a checkpoint."""
 
-  def _create_model():
-    init_rng = jax.random.PRNGKey(config.init_weights_seed)
-    return from_config(config, devices, rngs=nnx.Rngs(params=init_rng, dropout=1))
+  def _create_model(mesh: Mesh | None = None, model_mode: str = MODEL_MODE_TRAIN, rng_key: jax.Array | None = None):
+    if rng_key is None:
+      rng_key = jax.random.PRNGKey(config.init_weights_seed)
 
-  abstract_model = nnx.eval_shape(_create_model)
+    if model_mode == MODEL_MODE_TRAIN:
+      rngs = nnx.Rngs(params=rng_key, dropout=1)
+    else:
+      rngs = nnx.Rngs(params=rng_key)  # disable dropout RNG for inference
+
+    return from_config(config, devices, mesh, rngs=rngs, model_mode=model_mode)
+
+  _create_model_partial = partial(_create_model, mesh=mesh, model_mode=model_mode, rng_key=rng_key)
+
+  abstract_model = nnx.eval_shape(_create_model_partial)
   graphdef, abstract_state = nnx.split(abstract_model)
   specs = nnx.get_partition_spec(abstract_state)
-  mesh = abstract_model.mesh
+
+  if mesh is None:
+    mesh = abstract_model.mesh
 
   # JIT a function that creates the model state with proper sharding from the start.
   # By providing out_shardings, we instruct JAX to produce sharded output directly,
@@ -139,7 +163,7 @@ def create_nnx_model(config, devices=None):
   def create_sharded_state():
     # This will be JIT-compiled. JAX knows the output sharding and can
     # initialize the parameters directly on the target devices in a sharded way.
-    model = _create_model()
+    model = _create_model_partial()
     return nnx.state(model)
 
   with mesh:
