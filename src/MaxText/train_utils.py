@@ -19,8 +19,8 @@ import os
 import jax
 from MaxText import checkpointing
 from MaxText import max_logging
-from MaxText import max_utils
 from MaxText import maxtext_utils
+from MaxText import sharding
 from MaxText import optimizers
 from MaxText.dpo_utils import _merge_dpo_state
 from MaxText.input_pipeline.input_pipeline_interface import create_data_iterator
@@ -91,10 +91,11 @@ def jit_train_step(config, model, state, state_mesh_shardings, data_sharding, tr
 
   # Define the compilation of functional_train, either by loading the compiled version or wrapping a new one in a jit
   if config.compiled_trainstep_file != "":
-    print("Loading the compiled function...", flush=True)
+    max_logging.log("Loading the compiled function...")
+    execution_devices = model.mesh.devices.flatten().tolist()
     # Need to pass train signature and state to determine i/o shapes of train_state for now.
-    p_train_step = maxtext_utils.load_compiled(config, functional_train, state)
-    print("Loaded compiled function!", flush=True)
+    p_train_step = maxtext_utils.load_compiled(config, functional_train, state, execution_devices)
+    max_logging.log("Loaded compiled function!")
   else:
     if not config.use_jaxpp:
       p_train_step = jax.jit(
@@ -162,7 +163,7 @@ def jit_train_and_eval_step(
 ):
   """Returns a JIT-compiled train and eval step function."""
   mesh = maybe_mpmd_mesh.lowering_mesh() if config.use_jaxpp else maybe_mpmd_mesh
-  data_sharding = maxtext_utils.get_input_data_sharding(config, mesh)
+  data_sharding = sharding.get_input_data_sharding(config, mesh)
   p_train_step = jit_train_step(config, model, state, state_mesh_shardings, data_sharding, train_step, maybe_mpmd_mesh, params_shardings)
   p_eval_step = None
   if eval_data_iterator:
@@ -207,20 +208,18 @@ def setup_train_loop(config, recorder, devices=None):
     # Check if context parallelism is being used with sequence packing
     if context_parallel_size > 1 and config.packing and config.dataset_type != "synthetic":
       raise ValueError(
-          "Context parallelism cannot be used with sequence packing except for"
-          " synthetic data where packing is not applied. Either disable"
-          " sequence packing (set packing=False) or disable context"
-          " parallelism. Context parallelism with packing support will be added"
-          " soon."
+          "Context parallelism cannot be used with sequence packing. "
+          "Disable sequence packing (set packing=False). "
+          "Context parallelism with packing support will be added soon."
       )
 
     # Apply reordering wrapper to data iterators if context parallelism is enabled
     with mesh:
       if context_parallel_size > 1 and config.context_parallel_load_balance:
-        data_iterator = map(max_utils.get_reorder_callable(context_parallel_size), data_iterator)
+        data_iterator = map(maxtext_utils.get_reorder_callable(context_parallel_size, config.shard_mode), data_iterator)
         if eval_data_iterator:
           eval_data_iterator = map(
-              max_utils.get_reorder_callable(context_parallel_size),
+              maxtext_utils.get_reorder_callable(context_parallel_size, config.shard_mode),
               eval_data_iterator,
           )
 
@@ -239,7 +238,7 @@ def setup_train_loop(config, recorder, devices=None):
     # TODO(aireenmei, hengtaoguo): support sharding in vit for multimodal
     if not config.using_pipeline_parallelism and not config.use_multimodal:
       # The vocab tensor(s) of shape [vocab, embed] (and transpose) are not sharded by stage
-      maxtext_utils.assert_params_sufficiently_sharded(state.params, mesh, config.sharding_tolerance)
+      sharding.assert_params_sufficiently_sharded(state.params, mesh, config.sharding_tolerance)
 
     if config.use_dpo:
       abstract_state, _, _ = maxtext_utils.get_abstract_state(model, tx, config, init_rng, mesh, is_training=True)
@@ -303,12 +302,8 @@ def validate_train_config(config):
         " use other quantization or set gradient_accumulation_steps to 1"
     )
 
-  # Check if GPU Flash Attention is being used with sequence packing
-  if config.attention == "cudnn_flash_te" and config.packing and config.dataset_type != "synthetic":
-    raise ValueError(
-        "cudnn_flash_te only supports BSHD format. The THD (seq packing)"
-        " support is going to be available in Transformer Engine 2.0 release."
-        " Please disable sequence packing (set packing=False) or use a"
-        " different attention mechanism. With synthetic data, the format is not"
-        " important as packing is not applied."
+  if config.packing and config.dataset_type == "synthetic":
+    max_logging.log(
+        "WARNING: Sequence packing is essentially ignored for synthetic data. "
+        "Please use a real dataset to use sequence packing."
     )

@@ -23,13 +23,13 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
 
 from flax import linen as nn
 from flax import nnx
 from flax.linen.partitioning import ScanIn
 
-from MaxText.common_types import DecoderBlockType, Config, EP_AS_CONTEXT
+from MaxText.common_types import DecoderBlockType, ShardMode, Config, EP_AS_CONTEXT
 from MaxText.common_types import MODEL_MODE_TRAIN, MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE
 from MaxText import max_logging
 from MaxText import max_utils
@@ -39,6 +39,7 @@ from MaxText.layers import quantizations
 from MaxText.layers import pipeline
 from MaxText import maxtext_utils
 from MaxText import multimodal_utils
+from MaxText import sharding
 from MaxText.layers.attentions import attention_as_linen
 from MaxText.layers.normalizations import rms_norm
 from MaxText.layers.embeddings import attend_on_embedding, embed_as_linen, positional_embedding_as_linen
@@ -90,17 +91,28 @@ class DecoderLayer(nn.Module):
       previous_chunk=None,
       slot: None | int = None,
       page_state: None | page_manager.PageState = None,
+      kv_cache: jax.Array | None = None,
+      attention_metadata: dict[str, Any] | None = None,
   ):
     cfg = self.config
     mesh = self.mesh
+    _maybe_shard_with_logical = functools.partial(
+        sharding.maybe_shard_with_logical,
+        mesh=mesh,
+        shard_mode=cfg.shard_mode,
+    )
 
     if self.model_mode == MODEL_MODE_PREFILL:
-      logical_axis_names = ("activation_batch", "prefill_activation_length", "activation_mlp")
-    elif cfg.expert_shard_attention_option == EP_AS_CONTEXT and self.model_mode == MODEL_MODE_TRAIN:
-      logical_axis_names = ("activation_batch_no_exp", "activation_length", "activation_mlp")
+      logical_axis_names = ("activation_batch", "prefill_activation_length", "activation_embed")
+    elif self.config.expert_shard_attention_option == EP_AS_CONTEXT and self.model_mode == MODEL_MODE_TRAIN:
+      logical_axis_names = ("activation_batch_no_exp", "activation_length", "activation_embed")
     else:
-      logical_axis_names = ("activation_batch", "activation_length_no_exp", "activation_mlp")
-    inputs = nn.with_logical_constraint(inputs, logical_axis_names)
+      logical_axis_names = ("activation_batch", "activation_length_no_exp", "activation_embed")
+
+    if model_mode == MODEL_MODE_PREFILL:
+      inputs = _maybe_shard_with_logical(inputs, logical_axis_names)
+    else:
+      inputs = _maybe_shard_with_logical(inputs, logical_axis_names)
 
     inputs = checkpoint_name(inputs, "decoder_layer_input")
     # inputs: embedded inputs to the decoder with shape [batch, length, emb_dim]
@@ -113,9 +125,9 @@ class DecoderLayer(nn.Module):
         kernel_axes=("norm",),
     )(inputs)
     if model_mode == MODEL_MODE_PREFILL:
-      lnx = nn.with_logical_constraint(lnx, logical_axis_names)
+      lnx = _maybe_shard_with_logical(lnx, logical_axis_names)
     else:
-      lnx = nn.with_logical_constraint(lnx, logical_axis_names)
+      lnx = _maybe_shard_with_logical(lnx, logical_axis_names)
 
     attention_layer = attention_as_linen(
         config=self.config,
@@ -143,19 +155,21 @@ class DecoderLayer(nn.Module):
         model_mode=model_mode,
     )
 
-    attention_lnx = attention_layer(
+    attention_lnx, kv_cache = attention_layer(
         lnx,
         lnx,
         decoder_positions,
         decoder_segment_ids=decoder_segment_ids,
         deterministic=deterministic,
         model_mode=model_mode,
+        kv_cache=kv_cache,
+        attention_metadata=attention_metadata,
     )
 
     if model_mode == MODEL_MODE_PREFILL:
-      attention_lnx = nn.with_logical_constraint(attention_lnx, logical_axis_names)
+      attention_lnx = _maybe_shard_with_logical(attention_lnx, logical_axis_names)
     else:
-      attention_lnx = nn.with_logical_constraint(attention_lnx, logical_axis_names)
+      attention_lnx = _maybe_shard_with_logical(attention_lnx, logical_axis_names)
 
     # MLP block.
     mlp_lnx = linears.mlp_block(
@@ -169,11 +183,12 @@ class DecoderLayer(nn.Module):
         model_mode=model_mode,
         config=cfg,
         quant=self.quant,
+        mesh=self.mesh,
     )(lnx, deterministic=deterministic)
     if model_mode == MODEL_MODE_PREFILL:
-      mlp_lnx = nn.with_logical_constraint(mlp_lnx, logical_axis_names)
+      mlp_lnx = _maybe_shard_with_logical(mlp_lnx, logical_axis_names)
     else:
-      mlp_lnx = nn.with_logical_constraint(mlp_lnx, logical_axis_names)
+      mlp_lnx = _maybe_shard_with_logical(mlp_lnx, logical_axis_names)
 
     next_layer_addition = mlp_lnx + attention_lnx
 
@@ -183,12 +198,12 @@ class DecoderLayer(nn.Module):
 
     layer_output = next_layer_addition_dropped_out + inputs
     if model_mode == MODEL_MODE_PREFILL:
-      layer_output = nn.with_logical_constraint(
+      layer_output = _maybe_shard_with_logical(
           layer_output,
           logical_axis_names,
       )
     else:
-      layer_output = nn.with_logical_constraint(
+      layer_output = _maybe_shard_with_logical(
           layer_output,
           logical_axis_names,
       )
@@ -202,7 +217,10 @@ class DecoderLayer(nn.Module):
           jnp.sum(layer_output == 0) / jnp.size(layer_output),
       )
 
-    return layer_output, None if cfg.scan_layers else layer_output
+    if cfg.scan_layers:
+      return layer_output, None
+    else:
+      return layer_output, kv_cache
 
 
 class SequentialBlockDecoderLayers(nn.Module):
@@ -402,7 +420,7 @@ class Decoder(nn.Module):
       case DecoderBlockType.GPT3:
         return [gpt3.Gpt3DecoderLayer]
       case DecoderBlockType.GPT_OSS:
-        return [gpt_oss.GptOssScannableBlock] if self.config.scan_layers else [gpt_oss.GptOssDecoderLayer]
+        return [gpt_oss.GptOssScannableBlockToLinen] if self.config.scan_layers else [gpt_oss.GptOssDecoderLayerToLinen]
       case DecoderBlockType.QWEN3:
         return [qwen3.Qwen3DecoderLayerToLinen]
       case DecoderBlockType.QWEN3_MOE:
@@ -466,7 +484,7 @@ class Decoder(nn.Module):
         DecoderBlockType.SIMPLE_MLP,
         DecoderBlockType.LLAMA4,
     ):
-      return functools.partial(rms_norm, num_features=num_features)
+      return functools.partial(rms_norm, num_features=num_features, shard_mode=self.config.shard_mode)
     elif self.config.decoder_block == DecoderBlockType.GPT3:
       return functools.partial(gpt3.gpt3_layer_norm, num_features=num_features, reductions_in_fp32=False, use_bias=True)
     else:
@@ -553,7 +571,14 @@ class Decoder(nn.Module):
 
     # Merge the image embeddings with the text embeddings for multimodal models
     if image_embeddings is not None and cfg.use_multimodal:
-      if cfg.model_name in ["gemma3-4b", "gemma3-12b", "gemma3-27b", "llama4-17b-16e", "llama4-17b-128e"]:
+      if cfg.model_name in [
+          "gemma3-4b",
+          "gemma3-12b",
+          "gemma3-27b",
+          "llama4-17b-16e",
+          "llama4-17b-128e",
+          "qwen3-omni-30b-a3b",
+      ]:
         y = multimodal_utils.merge_mm_embeddings(
             text_embeddings=y,
             vision_embeddings=image_embeddings,
@@ -578,14 +603,29 @@ class Decoder(nn.Module):
           embedding_init=nn.initializers.normal(stddev=1.0),
           name="position_embedder",
           config=cfg,
+          mesh=self.mesh,
       )(decoder_positions, model_mode=model_mode)
     return y
 
   @nn.compact
-  def _apply_output_head(self, shared_embedding: nn.Module | nnx.Module, y, deterministic, model_mode):
+  def apply_output_head(self, shared_embedding: nn.Module | nnx.Module, y, deterministic, model_mode):
     """Applies final normalization and projects hidden states to logits."""
 
     cfg = self.config
+    if cfg.shard_mode == ShardMode.EXPLICIT:
+      norm_out_sharding = NamedSharding(
+          self.mesh,
+          nn.logical_to_mesh_axes(
+              (
+                  "activation_batch",
+                  "activation_length_no_exp",
+                  "activation_embed",
+              )
+          ),
+      )
+    else:
+      norm_out_sharding = None
+
     y = self.get_norm_layer(num_features=y.shape[-1])(
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
@@ -593,8 +633,22 @@ class Decoder(nn.Module):
         epsilon=cfg.normalization_layer_epsilon,
         kernel_axes=("norm",),
         parameter_memory_host_offload=cfg.parameter_memory_host_offload,
-    )(y)
+    )(y, out_sharding=norm_out_sharding)
     y = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2,))(y, deterministic=deterministic)
+
+    if model_mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
+      out_sharding = NamedSharding(self.mesh, nn.logical_to_mesh_axes((None, None, "activation_vocab")))
+    else:
+      out_sharding = NamedSharding(
+          self.mesh,
+          nn.logical_to_mesh_axes(
+              (
+                  "activation_embed_and_logits_batch",
+                  "activation_length_no_exp",
+                  "activation_vocab",
+              )
+          ),
+      )
 
     # [batch, length, emb_dim] -> [batch, length, vocab_size]
     if cfg.logits_via_embedding:
@@ -606,7 +660,7 @@ class Decoder(nn.Module):
       if isinstance(embedding_table, nn.spmd.LogicallyPartitioned):
         embedding_table = embedding_table.unbox()
       attend_dtype = jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype
-      logits = attend_on_embedding(y, embedding_table, attend_dtype, self.config)
+      logits = attend_on_embedding(y, embedding_table, attend_dtype, self.config, out_sharding)
 
       if self.config.normalize_embedding_logits:
         # Correctly normalize pre-softmax logits for this shared case.
@@ -621,18 +675,14 @@ class Decoder(nn.Module):
           weight_dtype=cfg.weight_dtype,
           dtype=jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype,  # for logit training stability
           kernel_axes=("embed", "vocab"),
+          shard_mode=cfg.shard_mode,
           name="logits_dense",
           matmul_precision=self.config.matmul_precision,
           parameter_memory_host_offload=cfg.parameter_memory_host_offload,
       )(
-          y
+          y,
+          out_sharding=out_sharding,
       )  # We do not quantize the logits matmul.
-    if model_mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
-      logits = nn.with_logical_constraint(logits, (None, None, "activation_vocab"))
-    elif cfg.num_vocab_tiling == 1:
-      logits = nn.with_logical_constraint(
-          logits, ("activation_embed_and_logits_batch", "activation_length_no_exp", "activation_vocab")
-      )
 
     if self.config.cast_logits_to_fp32:
       logits = logits.astype(jnp.float32)
@@ -654,6 +704,8 @@ class Decoder(nn.Module):
       bidirectional_mask: None | Any = None,
       image_embeddings: None | jnp.ndarray = None,
       image_masks: None | jnp.ndarray = None,
+      kv_caches: list[jax.Array] | None = None,
+      attention_metadata=None,
   ):
     cfg = self.config
     mesh = self.mesh
@@ -693,7 +745,7 @@ class Decoder(nn.Module):
         moe_layer = RemattedBlockLayers[1]
         num_moe_layers = cfg.num_decoder_layers - cfg.first_num_dense_layers
         num_moe_layers_outside_pp = num_moe_layers - self.config.pipeline_parallel_layers
-        logical_axis_rules_pp_as_dp = maxtext_utils.logical_axis_rules_pp_act_as_dp(self.config.logical_axis_rules)
+        logical_axis_rules_pp_as_dp = sharding.logical_axis_rules_pp_act_as_dp(self.config.logical_axis_rules)
         # We chose not to pipeline the dense layers, only sparse for SPMD.
         with self.mesh, nn.partitioning.axis_rules(logical_axis_rules_pp_as_dp):
           y, _ = self.scan_decoder_layers(
@@ -720,7 +772,7 @@ class Decoder(nn.Module):
         y = self.pipeline_module(y, *broadcast_args, partition_spec=partition_spec)
         remaining_layers = self.config.num_decoder_layers - self.config.pipeline_parallel_layers
         if remaining_layers > 0:
-          logical_axis_rules_pp_as_dp = maxtext_utils.logical_axis_rules_pp_act_as_dp(self.config.logical_axis_rules)
+          logical_axis_rules_pp_as_dp = sharding.logical_axis_rules_pp_act_as_dp(self.config.logical_axis_rules)
           with self.mesh, nn.partitioning.axis_rules(logical_axis_rules_pp_as_dp):
             y, _ = self.scan_decoder_layers(
                 cfg,
@@ -815,37 +867,38 @@ class Decoder(nn.Module):
         if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
           assert len(RemattedBlockLayers) == 2, "Unscanned layers must have a length of 2 using deepseek."
 
-          for index in range(cfg.first_num_dense_layers):
-            dense_layer = self.decoder_layer[0] if stage_id != num_logical_stages - 1 else RemattedBlockLayers[0]
-            y = dense_layer(config=cfg, mesh=mesh, name=f"dense_layers_{index}", quant=self.quant, model_mode=model_mode)(
-                y,
-                decoder_segment_ids,
-                decoder_positions,
-                deterministic,
-                model_mode,
-                previous_chunk=previous_chunk,
-                page_state=page_state,
-                slot=slot,
-            )
-            if index != cfg.num_decoder_layers - 1 and cutoffs[stage_id] == index:
-              y = jaxpp.api.pipeline_enter_stage(y, f"stage_{stage_id}")
-              stage_id += 1
-
-          for index in range(cfg.first_num_dense_layers, cfg.num_decoder_layers):
-            moe_layer = RemattedBlockLayers[1] if stage_id != num_logical_stages - 1 else self.decoder_layer[1]
-            y = moe_layer(config=cfg, mesh=mesh, name=f"moe_layers_{index - cfg.first_num_dense_layers}", quant=self.quant, model_mode=model_mode)(
-                y,
-                decoder_segment_ids,
-                decoder_positions,
-                deterministic,
-                model_mode,
-                previous_chunk=previous_chunk,
-                page_state=page_state,
-                slot=slot,
-            )
-            if index != cfg.num_decoder_layers - 1 and cutoffs[stage_id] == index:
-              y = jaxpp.api.pipeline_enter_stage(y, f"stage_{stage_id}")
-              stage_id += 1
+          dense_layer = RemattedBlockLayers[0]
+          moe_layer = RemattedBlockLayers[1]
+          layers = [dense_layer, moe_layer]
+          layer_prefixes = ["dense_layers", "moe_layers"]
+          num_moe_layers = cfg.num_decoder_layers - cfg.first_num_dense_layers
+          num_layers_list = [cfg.first_num_dense_layers, num_moe_layers]
+          layer_offset = 0
+          # Iterate over the two layer groups (dense and MoE) and apply layer transformation
+          for layer, num_layers, layer_prefix in zip(layers, num_layers_list, layer_prefixes):
+            for index in range(num_layers):
+              actual_layer_idx = layer_offset + index
+              kv_cache = kv_caches[index] if kv_caches is not None else None
+              y, kv_cache = layer(
+                  config=cfg, mesh=mesh, name=f"{layer_prefix}_{index}", quant=self.quant, model_mode=self.model_mode
+              )(
+                  y,
+                  decoder_segment_ids,
+                  decoder_positions,
+                  deterministic,
+                  model_mode,
+                  previous_chunk=previous_chunk,
+                  page_state=page_state,
+                  slot=slot,
+                  kv_cache=kv_cache,
+                  attention_metadata=attention_metadata,
+              )
+              if kv_caches is not None and kv_cache is not None:
+                kv_caches[index] = kv_cache
+              if actual_layer_idx != cfg.num_decoder_layers - 1 and cutoffs[stage_id] == actual_layer_idx:
+                y = jaxpp.api.pipeline_enter_stage(y, f"stage_{stage_id}")
+                stage_id += 1
+            layer_offset += num_layers
 
         else:
           for lyr in range(cfg.num_decoder_layers):
@@ -869,7 +922,8 @@ class Decoder(nn.Module):
             layer = layer_ctor(
                 config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant, model_mode=self.model_mode, **layer_kwargs
             )
-            y = layer(
+            kv_cache = kv_caches[lyr] if kv_caches is not None else None
+            y, kv_cache = layer(
                 y,
                 decoder_segment_ids,
                 decoder_positions,
@@ -878,8 +932,13 @@ class Decoder(nn.Module):
                 previous_chunk=previous_chunk,
                 page_state=page_state,
                 slot=slot,
+                kv_cache=kv_cache,
+                attention_metadata=attention_metadata,
                 **layer_call_kwargs,
             )
+            if kv_caches is not None and kv_cache is not None:
+              kv_caches[lyr] = kv_cache
+
             if lyr != cfg.num_decoder_layers - 1 and cutoffs[stage_id] == lyr:
               y = jaxpp.api.pipeline_enter_stage(y, f"stage_{stage_id}")
               stage_id += 1
@@ -895,14 +954,14 @@ class Decoder(nn.Module):
       logits = None
       self.sow("intermediates", "hidden_states", hidden_state)
     else:
-      logits = self._apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
+      logits = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
 
     if add_last_enter_stage:
       logits = jaxpp.api.pipeline_enter_stage(logits, f"stage_{stage_id}")
 
     # The API of the Decoder is now a tuple, providing both the main output
     # and the raw hidden state needed for auxiliary tasks.
-    return logits, hidden_state
+    return logits, hidden_state, kv_caches
 
   def _apply_gemma3_scanned_blocks(
       self,
@@ -955,10 +1014,9 @@ class Decoder(nn.Module):
     if num_remaining_layers > 0:
       # We name the remainder block with a 'remainder' suffix to avoid parameter name collisions
       rem_layer_kwargs = {"num_of_layers": num_remaining_layers}
-      # pytype: disable=wrong-keyword-args
       layer = RemattedGemma3Block(
           config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode, name="layers_remainder", **rem_layer_kwargs
-      )
+      )  # pytype: disable=wrong-keyword-args
       y, _ = layer(
           y,
           decoder_segment_ids,
