@@ -458,7 +458,7 @@ def train_loop(config, recorder, state=None):
       checkpoint_manager,
       state_mesh_shardings,
       model,
-      maybe_mpmd_mesh,
+      mesh,
       learning_rate_schedule,
       data_iterator,
       eval_data_iterator,
@@ -471,21 +471,28 @@ def train_loop(config, recorder, state=None):
       state = _merge_dpo_state(state, reference_params)
     state_mesh_shardings = _merge_dpo_state(state_mesh_shardings, state_mesh_shardings.params["params"])
 
-  mesh = maybe_mpmd_mesh.lowering_mesh() if config.use_jaxpp else maybe_mpmd_mesh
   params_shardings, state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
+
+  mpmd_mesh = jaxpp.MpmdMesh(mesh, "stage") if config.use_jaxpp else None
 
   p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
       config,
       model,
-      maybe_mpmd_mesh,
+      mesh,
       state,
       state_mesh_shardings,
       train_step,
       eval_step,
       eval_data_iterator,
-      params_shardings,
+      jax.tree.map(lambda s: s.update(mesh=mpmd_mesh.lowering_mesh()), params_shardings) if config.use_jaxpp else params_shardings,
   )
-  if not config.use_jaxpp:
+
+  if config.use_jaxpp:
+    shaped_batch = maxtext_utils.get_shaped_batch(config)
+    p_train_step = p_train_step.compile(state, shaped_batch, init_rng)
+    args_mpmd_shardings, kwargs_mpmd_shardings = p_train_step.in_shardings
+    state = jaxpp.spmd_to_mpmd_reshard(mpmd_mesh, state, args_mpmd_shardings[0])
+  else:
     with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
       shaped_batch = maxtext_utils.get_shaped_batch(config)
       if config.shard_optimizer_over_data:
@@ -503,19 +510,20 @@ def train_loop(config, recorder, state=None):
   # Write train config params, num model params, and XLA flags to tensorboard
   metric_logger.write_setup_info_to_tensorboard(state.params)
 
+  task_times = None
   try:
     step_time = []
     step_tflops = []
     # NOTE: The dict values are unused when use_jaxpp is False.
     profiling_process_ids = {pid: "" for pid in jax.process_indices()}
     if config.use_jaxpp:
-      idx = tuple(slice(None) if i == maybe_mpmd_mesh.mpmd_axis else 0 for i in range(len(maybe_mpmd_mesh.jax_mesh.shape)))
-      first_device_per_mpmd_rank = maybe_mpmd_mesh.jax_mesh.devices[idx]
+      idx = tuple(slice(None) if i == mpmd_mesh.mpmd_axis else 0 for i in range(len(mpmd_mesh.jax_mesh.shape)))
+      first_device_per_mpmd_rank = mpmd_mesh.jax_mesh.devices[idx]
       profiling_process_ids = {d.process_index: d for d in first_device_per_mpmd_rank}
 
     last_step_completion = datetime.datetime.now()
     for step in np.arange(start_step, config.steps):
-      prof.maybe_activate_profiler(step, state, maybe_mpmd_mesh=maybe_mpmd_mesh, profiling_process_ids=profiling_process_ids)
+      prof.maybe_activate_profiler(step, state, maybe_mpmd_mesh=mpmd_mesh, profiling_process_ids=profiling_process_ids)
 
       with jax.profiler.StepTraceAnnotation("train", step_num=step):
         example_batch = data_loader.load_next_batch()
@@ -527,11 +535,20 @@ def train_loop(config, recorder, state=None):
         )
         # pylint: disable=not-callable
         nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
-        with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
+
+        if config.use_jaxpp:
+          example_batch, nextrng = jaxpp.spmd_to_mpmd_reshard(mpmd_mesh, (example_batch, nextrng), p_train_step.in_shardings[0][1:])
+
+        # We don't want to collect task times at the same time we're profiling
+        enable_task_times = config.use_jaxpp and step == start_step + config.skip_first_n_steps_for_profiler + 1
+        with maybe_record_goodput(recorder, GoodputEvent.STEP, step), jaxpp.collect_task_times_ms(enable_task_times) as step_task_times:
           with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
             if config.shard_optimizer_over_data and not config.use_jaxpp:
               state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
             state, metrics = p_train_step(state, example_batch, nextrng)
+
+          if step_task_times is not None:
+            task_times = step_task_times
 
       step_time_delta = datetime.datetime.now() - last_step_completion
       last_step_completion = datetime.datetime.now()
@@ -580,12 +597,16 @@ def train_loop(config, recorder, state=None):
       step_time.append(metrics['scalar']['perf/step_time_seconds'])
       step_tflops.append(metrics['scalar']['perf/per_device_tflops_per_sec'])
 
-    if config.use_jaxpp and prof.mode != "":
-      command = """find . -wholename '*proc_*_mpmd*/*.xplane.pb' | sort | awk '{line=$0; sub(/.*mpmd_/, "", line); sub(/_.*/, "", line); printf "%d:%s:0 ", line, $0}'"""
-      subprocess.run(
-        [f"merge_multihost_xplanes $({command})"],
-        shell=True, cwd=config.tensorboard_dir, check=True
-      )
+    if config.use_jaxpp:
+      assert mpmd_mesh is not None
+      state = jaxpp.mpmd_to_spmd_reshard(mpmd_mesh, state, state_mesh_shardings)
+
+      if prof.mode != "":
+        command = """find . -wholename '*proc_*_mpmd*/*.xplane.pb' | sort | awk '{line=$0; sub(/.*mpmd_/, "", line); sub(/_.*/, "", line); printf "%d:%s:0 ", line, $0}'"""
+        subprocess.run(
+          [f"merge_multihost_xplanes $({command})"],
+          shell=True, cwd=config.tensorboard_dir, check=True
+        )
 
     if config.save_checkpoint_on_completion:
       state_to_save = state if not config.use_dpo else _split_dpo_state(state)[0]
@@ -604,6 +625,10 @@ def train_loop(config, recorder, state=None):
   max_logging.log(
       f"excluding the first {num_warmup_steps} steps: avg time per step {mean(step_time[num_warmup_steps:])}, avg tflops per step {mean(step_tflops[num_warmup_steps:])}"
   )
+
+  if task_times is not None:
+    for task_name, times in task_times.items():
+      max_logging.log(f"task {task_name}: {mean(times)} ms")
 
   return state
 

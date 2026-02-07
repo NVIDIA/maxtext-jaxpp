@@ -381,7 +381,7 @@ shard_mode: "auto" # can be either auto or explicit
 mesh_axes: ['data', 'stage', 'fsdp', 'fsdp_transpose', 'sequence', 'context', 'context_autoregressive', 'tensor', 'tensor_transpose', 'tensor_sequence', 'expert', 'autoregressive']
 logical_axis_rules: [
                       ['activation_batch', ['fsdp', 'fsdp_transpose', 'expert']],
-                      ['activation_batch_no_exp', ['data', 'fsdp', 'fsdp_transpose']],
+                      ['activation_batch_no_exp', ['fsdp', 'fsdp_transpose']],
                       ['activation_embed_and_logits_batch', ['data', 'stage', 'fsdp', 'fsdp_transpose', 'expert']],
                       ['activation_embed_and_logits_batch_sequence', ['data', 'stage', 'fsdp', 'fsdp_transpose', 'sequence', 'context', 'expert']],
                       ['activation_heads', ['tensor', 'tensor_transpose', 'sequence','tensor_sequence','autoregressive']],
@@ -825,7 +825,7 @@ allow_split_physical_axes: False
 # Apply transformations to the mesh to optimize for TPU v6e
 optimize_mesh_for_tpu_v6e: False
 
-shardy: False # Whether to use shardy XLA backend (default in Jax starting 0.7.0), or GSPMD (to be fully deprecated ~2026)
+shardy: True # Whether to use shardy XLA backend (default in Jax starting 0.7.0), or GSPMD (to be fully deprecated ~2026)
 
 use_ragged_attention: False
 ragged_block_size: 256

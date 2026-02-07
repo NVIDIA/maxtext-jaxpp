@@ -1937,7 +1937,7 @@ class MaxTextConfig(
       if not self.num_slices > 1:
         raise ValueError("DCN parallelism requested but only one slice available.")
     if self.decoder_block == DecoderBlockType.LLAMA4:
-      if self.capacity_factor >= 0:
+      if self.capacity_factor >= 0 and not self.use_jaxpp:
         raise ValueError(
             "Llama4 decoder has not been tested with capacity_factor >= 0 -- please set that value to -1 for now!"
         )

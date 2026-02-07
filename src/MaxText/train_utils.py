@@ -77,8 +77,16 @@ def create_training_tools(config, model, mesh):
   return init_rng, checkpoint_manager, learning_rate_schedule, tx
 
 
-def jit_train_step(config, model, state, state_mesh_shardings, data_sharding, train_step, maybe_mpmd_mesh, params_shardings):
+def jit_train_step(config, model, state, state_mesh_shardings, data_sharding, train_step, params_shardings):
   """Returns a JIT-compiled train step function, which is loaded from a file if specified in the config."""
+
+  mpmd_mesh = None
+  if config.use_jaxpp:
+    mpmd_mesh = jaxpp.MpmdMesh(model.mesh, "stage")
+    model.mesh = mpmd_mesh.lowering_mesh()
+    state_mesh_shardings = jax.tree.map(lambda s: s.update(mesh=model.mesh), state_mesh_shardings)
+    params_shardings = jax.tree.map(lambda s: s.update(mesh=model.mesh), params_shardings)
+
   (
       functional_train,
       in_shardings,
@@ -106,12 +114,13 @@ def jit_train_step(config, model, state, state_mesh_shardings, data_sharding, tr
         donate_argnums=donate_argnums)
     else:
       max_logging.log("Running with jaxpp")
+      assert mpmd_mesh is not None
       p_train_step = jaxpp.mpmd_jit_with_loop(
         functional_train,
-        mpmd_mesh=maybe_mpmd_mesh,
+        mpmd_mesh=mpmd_mesh,
+        in_shardings=jax.tree.map(lambda x: x.spec, in_shardings),
+        out_shardings=jax.tree.map(lambda x: x.spec, out_shardings),
         donate_argnums=donate_argnums,
-        in_shardings=in_shardings,
-        out_shardings=out_shardings,
       )
 
   return p_train_step
@@ -153,7 +162,7 @@ def jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step,
 def jit_train_and_eval_step(
     config,
     model,
-    maybe_mpmd_mesh,
+    mesh,
     state,
     state_mesh_shardings,
     train_step,
@@ -162,12 +171,13 @@ def jit_train_and_eval_step(
     params_shardings=None,
 ):
   """Returns a JIT-compiled train and eval step function."""
-  mesh = maybe_mpmd_mesh.lowering_mesh() if config.use_jaxpp else maybe_mpmd_mesh
+  # NOTE(jaxpp): all shardings/model/mesh etc. are the full SPMD mesh here
+
   data_sharding = sharding.get_input_data_sharding(config, mesh)
-  p_train_step = jit_train_step(config, model, state, state_mesh_shardings, data_sharding, train_step, maybe_mpmd_mesh, params_shardings)
+  p_train_step = jit_train_step(config, model, state, state_mesh_shardings, data_sharding, train_step, params_shardings)
   p_eval_step = None
   if eval_data_iterator:
-    p_eval_step = jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step, maybe_mpmd_mesh)
+    p_eval_step = jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step, mesh)
 
   return p_train_step, p_eval_step
 
@@ -193,16 +203,12 @@ def setup_train_loop(config, recorder, devices=None):
 
   with maybe_record_goodput(recorder, GoodputEvent.TPU_INIT):
     model = model_creation_utils.from_config(config, devices)
-    maybe_mpmd_mesh = model.mesh
-    if config.use_jaxpp:
-      assert isinstance(maybe_mpmd_mesh, jaxpp.MpmdMesh)
-      model.mesh = mesh = maybe_mpmd_mesh.lowering_mesh()
-    else:
-      assert isinstance(maybe_mpmd_mesh, jax.sharding.Mesh)
-      mesh = maybe_mpmd_mesh
+    mesh = model.mesh
+
     init_rng, checkpoint_manager, learning_rate_schedule, tx = create_training_tools(config, model, mesh)
 
   with maybe_record_goodput(recorder, GoodputEvent.TRAINING_PREPARATION):
+    # TODO: currently data iterator is sharded on the full spmd_mesh
     data_iterator, eval_data_iterator = create_data_iterator(config, mesh)
     context_parallel_size = mesh.shape["context"]
     # Check if context parallelism is being used with sequence packing
@@ -224,7 +230,7 @@ def setup_train_loop(config, recorder, devices=None):
           )
 
     state, _, state_mesh_shardings, data_iterator = maxtext_utils.setup_training_state(
-        model, data_iterator, tx, config, init_rng, maybe_mpmd_mesh, checkpoint_manager
+        model, data_iterator, tx, config, init_rng, mesh, checkpoint_manager
     )
 
     def make_line(keypath, array_or_array_ref):
@@ -277,7 +283,7 @@ def setup_train_loop(config, recorder, devices=None):
       checkpoint_manager,
       state_mesh_shardings,
       model,
-      maybe_mpmd_mesh,
+      mesh,
       learning_rate_schedule,
       data_iterator,
       eval_data_iterator,

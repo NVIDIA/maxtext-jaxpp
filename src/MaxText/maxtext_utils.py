@@ -912,61 +912,17 @@ def setup_initial_state(
     else:
       init_state_partial = functools.partial(init_initial_state, model, tx, config, is_training)
       init_state_partial.__name__ = "initialize_state"
-      if config.use_jaxpp:
-        # First infer placement based on loop usage
-        # Imported here to avoid circular import errors
-        from MaxText import maxtext_utils
-        from MaxText.train import train_step
-        params_shardings, _state_mesh_shardings = max_utils.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
-        data_sharding = maxtext_utils.get_input_data_sharding(config, mesh)
-        (
-            functional_train,
-            in_shard_train,
-            out_shard_train,
-            static_argnums_train,
-            donate_argnums_train,
-        ) = maxtext_utils.get_functional_train_with_signature(train_step, data_sharding, _state_mesh_shardings, model, config, params_shardings=params_shardings)
 
-        p_train_step = jaxpp.mpmd_jit_with_loop(
-          functional_train,
-          mpmd_mesh=maybe_mpmd_mesh,
-          donate_argnums=donate_argnums_train,
-          in_shardings=in_shard_train,
-          out_shardings=out_shard_train,
-        )
-        with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-          global_mpmd_train_step = p_train_step.trace_and_place(
-            unboxed_abstract_state, next(data_iterator), rng
-          )
-        unboxed_abstract_state_placements = global_mpmd_train_step.in_shardings[0][0]
-        def attach_right_mesh(shaped: jax.ShapeDtypeStruct, dist_sharding):
-          sharding: jax.sharding.NamedSharding = shaped.sharding
-          jax_mesh = maybe_mpmd_mesh.mpmd_submesh(sorted(dist_sharding.mesh_ids)).jax_mesh
-          mpmd_sharding = jax.sharding.NamedSharding(jax_mesh, sharding.spec)
-          return jax.ShapeDtypeStruct(shaped.shape, shaped.dtype, sharding=mpmd_sharding, weak_type=shaped.weak_type)
+      # pylint: disable=not-callable
+      state = jax.jit(
+          init_state_partial,
+          in_shardings=None,
+          out_shardings=state_mesh_shardings,
+      )(rng)
+      if raw_params:  # If we loaded a partial state, we need to merge it.
+        state = state.replace(params=raw_params)
 
-        unboxed_mpmd_abstract_state = jax.tree.map(attach_right_mesh, unboxed_abstract_state, unboxed_abstract_state_placements)
-        replicated_sharding = jax.sharding.NamedSharding(
-            maybe_mpmd_mesh.lowering_mesh(), jax.sharding.PartitionSpec()
-        )
-        state = jaxpp.mpmd_jit_rev(
-            lambda rng: jax.tree.map(jax._src.lax.lax._array_copy, max_utils.unbox_logicallypartioned(init_state_partial(rng))),
-            out_refs=jax.tree.map(lambda s: s.mesh_ids, unboxed_abstract_state_placements),
-            mpmd_mesh=maybe_mpmd_mesh,
-            in_shardings=replicated_sharding,
-            out_shardings=in_shard_train[0],
-        )(rng)
-      else:
-        # pylint: disable=not-callable
-        state = jax.jit(
-            init_state_partial,
-            in_shardings=None,
-            out_shardings=state_mesh_shardings,
-        )(rng)
-        if raw_params:  # If we loaded a partial state, we need to merge it.
-          state = state.replace(params=raw_params)
-
-        state = max_utils.unbox_logicallypartioned(state)
+      state = max_utils.unbox_logicallypartioned(state)
 
   return state, state_mesh_annotations, state_mesh_shardings, data_iterator
 

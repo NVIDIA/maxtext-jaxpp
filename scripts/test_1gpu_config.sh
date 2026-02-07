@@ -1,3 +1,5 @@
+set -e
+
 if [ -n "$MODEL_CONFIG" ] && [ -n "$CONFIG_FILE" ]; then
     echo "Error: both MODEL_CONFIG and CONFIG_FILE are set"
     exit 1
@@ -11,6 +13,9 @@ export N_PROCS=1
 export N_GPUS=1
 
 # Run plain JAX config
+export JAXPP_CONFIG="
+    max_target_length=64
+"
 bash ./scripts/run_local_mc.sh
 
 # Run JaxPP config

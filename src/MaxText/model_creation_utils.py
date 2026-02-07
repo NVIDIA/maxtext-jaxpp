@@ -32,9 +32,6 @@ from orbax import checkpoint as ocp
 from functools import partial
 from etils import epath
 
-# jaxpp
-import jaxpp.api as jaxpp
-
 
 @overload
 def from_config(
@@ -90,19 +87,10 @@ def from_config(
     else:
       axis_types = tuple([AxisType.Auto] * len(config.mesh_axes))
 
-    base_mesh = Mesh(devices_array, config.mesh_axes, axis_types=axis_types)
+    mesh = Mesh(devices_array, config.mesh_axes, axis_types=axis_types)
 
-    if config.use_jaxpp:
-      mesh = jaxpp.MpmdMesh(base_mesh, "stage")
-    else:
-      mesh = base_mesh
+  model = create_model(config, mesh, model_mode=model_mode, rngs=rngs)
 
-  model = create_model(config, mesh.lowering_mesh() if config.use_jaxpp else mesh, model_mode=model_mode, rngs=rngs)
-
-  if config.use_jaxpp:
-    # At this point, model.mesh has mesh.lowering_mesh() as its value, but we need to set it to the mpmd_mesh
-    # so that the caller can have access to the mpmd_mesh.
-    model.mesh = mesh
   # Return only the model
   return model
 

@@ -22,4 +22,6 @@ n_gpus=$2; \
 start=$(({} * n_gpus)); \
 end=$((start + n_gpus - 1)); \
 JAX_COORDINATOR_IP="localhost" JAX_COORDINATOR_PORT=1234 NNODES=$1 NODE_RANK={} \
+JAXPP_ENABLE_LICM=1 \
+NVTE_FUSED_ATTN=1 \
 CUDA_VISIBLE_DEVICES=$(seq -s, $start $end) $3' _ $N_PROCS $N_GPUS "$COMMAND"

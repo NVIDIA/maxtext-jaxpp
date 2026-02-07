@@ -1487,8 +1487,7 @@ class RoutedMoE(nnx.Module):
     if is_llama4_decoder_layer:
       router_scores = jax.nn.sigmoid(top_k_weights.astype(jnp.float32)).astype(self.dtype)
       inputs = inputs * router_scores
-    else:
-      weights = self.reshape_and_update_weights(top_k_weights, top_k_indices)
+    weights = self.reshape_and_update_weights(top_k_weights, top_k_indices)
     matmul_precision = jax.lax.Precision(self.config.matmul_precision)
 
     if self.config.model_call_mode != "inference":

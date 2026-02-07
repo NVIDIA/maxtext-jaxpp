@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding
 
-from MaxText.common_types import ShardMode
+from MaxText.common_types import DecoderBlockType, ShardMode
 from MaxText.sharding import maybe_shard_with_name
 
 import jaxpp.api as jaxpp
@@ -207,6 +207,12 @@ def gradient_accumulation_loss_and_grad(
       return a.reshape(*shape)
 
     data = jax.tree.map(microbatched, data)
+    if mesh.shape["data"] > 1 and config.decoder_block == DecoderBlockType.LLAMA4:
+      # This is needed to work around the constraint that GA % EP == 0 for Llama4.
+      data = jax.lax.with_sharding_constraint(
+        data,
+        jax.sharding.PartitionSpec("data", tuple(_ for _ in config.data_sharding[0] if _ != "data"), None)
+      )
 
     # Perform data parallelism manually through vmap
     vmapped_compute_grads = compute_grads
