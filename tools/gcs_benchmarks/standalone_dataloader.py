@@ -27,18 +27,18 @@ import numpy as np
 
 import jax
 
-from MaxText import max_logging
 from MaxText import pyconfig
-from MaxText.data_loader import DataLoader
 from MaxText.train import get_first_step
-from MaxText.train_utils import validate_train_config, setup_train_loop
+from maxtext.common.data_loader import DataLoader
+from maxtext.utils import max_logging
+from maxtext.utils.train_utils import validate_train_config, setup_train_loop
 
 
 def data_load_loop(config, state=None):
   """Main data loader loop.
   Loads batches of data for each training step.
   """
-  _, _, _, _, mesh, _, data_iterator, _, state = setup_train_loop(config, recorder=None)
+  _, _, _, _, mesh, _, data_iterator, _, _, _, state = setup_train_loop(config, recorder=None)
   data_loader = DataLoader(config, mesh, data_iterator, None)
 
   example_batch = None

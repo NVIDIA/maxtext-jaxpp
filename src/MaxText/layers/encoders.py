@@ -15,55 +15,131 @@
 """"Module for encoder layers."""
 
 import jax
-from flax import linen as nn
+from flax import nnx
 from jax.sharding import Mesh
 
 from MaxText.common_types import Config
-from MaxText.layers import quantizations
-
-# Type alias for cleaner type hints
-Quant = quantizations.AqtQuantization
+from MaxText.layers import nnx_wrappers
+from MaxText.layers import initializers
 
 
-class VisionEncoder(nn.Module):
+class VisionEncoder(nnx.Module):
   """Vision encoder to encode images into soft tokens."""
 
-  config: Config
-  mesh: Mesh
+  def __init__(self, config: Config, mesh: Mesh, *, rngs: nnx.Rngs):
+    self.config = config
+    self.mesh = mesh
+    self.rngs = rngs
+    self.encoder_name, self.projector_name = self._setup_vision_encoder_layers()
 
-  def setup(self):
-    self.vision_encoder_layer = self.get_vision_encoder_layers()
-
-  def get_vision_encoder_layers(self):
-    """Get vision encoder layers specific to the model, classes of nn.Module type."""
+  def _setup_vision_encoder_layers(self):
+    """Setup vision encoder layers specific to the model, instantiate NNX modules."""
     if self.config.model_name in ["gemma3-4b", "gemma3-12b", "gemma3-27b"]:
       from MaxText.layers import gemma3  # pylint: disable=import-outside-toplevel
 
-      return [gemma3.gemma3visionencoder_as_linen, gemma3.visionembedder_as_linen]
+      encoder_name = "Gemma3VisionEncoderLayer_0"
+      projector_name = "VisionEmbedder_0"
+      setattr(self, encoder_name, gemma3.Gemma3VisionEncoderLayer(config=self.config, mesh=self.mesh, rngs=self.rngs))
+      setattr(self, projector_name, gemma3.VisionEmbedder(config=self.config, mesh=self.mesh, rngs=self.rngs))
+      return encoder_name, projector_name
     elif self.config.model_name in ["llama4-17b-16e", "llama4-17b-128e"]:
       from MaxText.layers import llama4  # pylint: disable=import-outside-toplevel
 
-      return [llama4.llama4visionmodel_as_linen, llama4.llama4multimodalprojector_as_linen]
+      encoder_name = "Llama4VisionModel_0"
+      projector_name = "Llama4MultiModalProjector_0"
+      setattr(self, encoder_name, llama4.Llama4VisionModel(config=self.config, mesh=self.mesh, rngs=self.rngs))
+      setattr(self, projector_name, llama4.Llama4MultiModalProjector(config=self.config, mesh=self.mesh, rngs=self.rngs))
+      return encoder_name, projector_name
     elif self.config.model_name in ["qwen3-omni-30b-a3b"]:
       from MaxText.layers import qwen3  # pylint: disable=import-outside-toplevel
 
-      return [qwen3.qwen3omni_visionencoder_as_linen, qwen3.qwen3omni_visionprojector_as_linen]
+      encoder_name = "Qwen3OmniMoeVisionEncoder_0"
+      projector_name = "Qwen3OmniMoeVisionProjector_0"
+      setattr(self, encoder_name, qwen3.Qwen3OmniMoeVisionEncoder(config=self.config, mesh=self.mesh, rngs=self.rngs))
+      setattr(self, projector_name, qwen3.Qwen3OmniMoeVisionProjector(config=self.config, rngs=self.rngs))
+      return encoder_name, projector_name
     else:
       raise ValueError(f"No VisionEncoder implemented for {self.config.model_name} yet")
 
-  @nn.compact
   def __call__(self, input_images, deterministic=False):
-    cfg = self.config
-    mesh = self.mesh
     # vision encoder output, frozen params in many cases
-    embeddings = self.vision_encoder_layer[0](config=cfg, mesh=mesh)(input_images, deterministic=deterministic)
-    if cfg.model_name in ["qwen3-omni-30b-a3b"]:
-      embeddings = embeddings[0]  # todo(eitanporat) add deepstack support
+    encoder = getattr(self, self.encoder_name)
+    embeddings = encoder(input_images, deterministic=deterministic)
 
-    if cfg.freeze_vision_encoder_params:
+    if self.config.freeze_vision_encoder_params:
       embeddings = jax.lax.stop_gradient(embeddings)
 
-    if len(self.vision_encoder_layer) > 1:
-      # vision embedder / projection layer, not frozen in most cases, trained / finetuned together with main model
-      embeddings = self.vision_encoder_layer[1](config=cfg, mesh=mesh)(embeddings)
+    # vision embedder / projection layer, not frozen in most cases, trained / finetuned together with main model
+    projector = getattr(self, self.projector_name)
+    embeddings = projector(embeddings)
+
     return embeddings
+
+
+class AudioEncoder(nnx.Module):
+  """Audio encoder to encode audio features into soft tokens."""
+
+  def __init__(self, config: Config, mesh: Mesh, *, rngs: nnx.Rngs):
+    self.config = config
+    self.mesh = mesh
+    self.rngs = rngs
+    self.encoder_name, self.projector_name = self._setup_audio_encoder_layers()
+
+  def _setup_audio_encoder_layers(self):
+    """Setup audio encoder layers specific to the model, instantiate NNX modules."""
+    if self.config.model_name in ["qwen3-omni-30b-a3b"]:
+      from MaxText.layers import qwen3  # pylint: disable=import-outside-toplevel
+
+      encoder_name = "Qwen3OmniAudioEncoder_0"
+      projector_name = "Qwen3OmniAudioProjector_0"
+      setattr(self, encoder_name, qwen3.Qwen3OmniAudioEncoder(config=self.config, mesh=self.mesh, rngs=self.rngs))
+      setattr(self, projector_name, qwen3.Qwen3OmniAudioProjector(config=self.config, rngs=self.rngs))
+      return encoder_name, projector_name
+    else:
+      raise ValueError(f"No AudioEncoder implemented for {self.config.model_name} yet")
+
+  def __call__(self, input_audio, deterministic=False):
+    # audio encoder output (includes convs + encoder, outputs before projector)
+    encoder = getattr(self, self.encoder_name)
+    embeddings = encoder(input_audio, deterministic=deterministic)
+
+    if self.config.freeze_audio_encoder_params:
+      embeddings = jax.lax.stop_gradient(embeddings)
+
+    # audio projector layer
+    projector = getattr(self, self.projector_name)
+    embeddings = projector(embeddings)
+
+    return embeddings
+
+
+def vision_encoder_as_linen(
+    config: Config,
+    mesh: Mesh,
+):
+  """Creates a VisionEncoder module."""
+  module = nnx_wrappers.to_linen(
+      VisionEncoder,
+      config=config,
+      mesh=mesh,
+      name="vision_encoder",
+      abstract_init=False,
+      metadata_fn=initializers.variable_to_logically_partitioned,
+  )
+  return module
+
+
+def audio_encoder_as_linen(
+    config: Config,
+    mesh: Mesh,
+):
+  """Creates an AudioEncoder module."""
+  module = nnx_wrappers.to_linen(
+      AudioEncoder,
+      config=config,
+      mesh=mesh,
+      name="audio_encoder",
+      abstract_init=False,
+      metadata_fn=initializers.variable_to_logically_partitioned,
+  )
+  return module

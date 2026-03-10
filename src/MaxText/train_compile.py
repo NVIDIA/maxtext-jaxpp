@@ -30,22 +30,22 @@ from absl import app
 
 import jax
 from jax.experimental.topologies import get_topology_desc
-from jax.sharding import Mesh
+from jax.sharding import Mesh, AxisType
 from jax.experimental.serialize_executable import serialize
 
 from flax.linen import partitioning as nn_partitioning
 
 from MaxText import accelerator_to_spec_map
 from MaxText import train
-from MaxText import maxtext_utils
 from MaxText import optimizers
-from MaxText import max_utils
 from MaxText import pyconfig
 from MaxText import sharding
-from MaxText.common_types import MODEL_MODE_TRAIN
+from MaxText.common_types import MODEL_MODE_TRAIN, ShardMode
 from MaxText.layers import models
 from MaxText.layers import quantizations
-from MaxText.utils import gcs_utils
+from maxtext.utils import gcs_utils
+from maxtext.utils import max_utils
+from maxtext.utils import maxtext_utils
 
 import jaxpp.api as jaxpp
 from jaxpp.api import MpmdMesh
@@ -81,8 +81,11 @@ def get_topology_mesh(config):
         num_slices=config.compile_topology_num_slices,
         wrap=target_hardware.wrap,
     ).devices
+  if config.shard_mode == ShardMode.EXPLICIT:
+    jax.config.update("jax_remove_size_one_mesh_axis_from_type", True)
   topology_device_mesh = maxtext_utils.create_device_mesh(config, topology_devices)
-  topology_mesh = Mesh(topology_device_mesh, config.mesh_axes)
+  mesh_axis_type = AxisType.Explicit if config.shard_mode == ShardMode.EXPLICIT else AxisType.Auto
+  topology_mesh = Mesh(topology_device_mesh, config.mesh_axes, axis_types=(mesh_axis_type,) * len(config.mesh_axes))
   return topology_mesh
 
 
@@ -93,7 +96,8 @@ def get_shaped_inputs(topology_mesh, config):
   model = Transformer(config, topology_mesh, quant=quant, model_mode=MODEL_MODE_TRAIN)
   # The learning_rate_schedule is baked into the compiled object.
   learning_rate_schedule = maxtext_utils.create_learning_rate_schedule(config)
-  tx = optimizers.get_optimizer(config, learning_rate_schedule)
+  # pass in model for muon
+  tx = optimizers.get_optimizer(config, learning_rate_schedule, model)
 
   # Shaped RNG keys
   _, example_rng = jax.random.split(jax.random.PRNGKey(0), 2)
@@ -104,12 +108,15 @@ def get_shaped_inputs(topology_mesh, config):
       model, tx, config, example_rng, topology_mesh
   )
 
+  # unsharded logical annotations
+  logical_annotations = maxtext_utils.get_logical_annotations(model, tx, config, example_rng, topology_mesh)
+
   # Shaped batch
   shaped_batch = maxtext_utils.get_shaped_batch(config)
 
   shaped_train_args = (abstract_state, shaped_batch, shaped_rng)
   shaped_train_kwargs = {}
-  return shaped_train_args, shaped_train_kwargs, state_mesh_shardings, model
+  return shaped_train_args, shaped_train_kwargs, state_mesh_shardings, logical_annotations, model
 
 
 def jit_and_compile(
@@ -121,18 +128,19 @@ def jit_and_compile(
     out_shardings,
     static_argnums,
     donate_argnums,
+    config,
     logical_axis_rules,
     mpmd_mesh=None,
 ):
   """Jit, lower, and compile func."""
-  with mesh, logical_axis_rules:
+  with jax.set_mesh(mesh), logical_axis_rules:
     if mpmd_mesh is not None:
       p_train_step = jaxpp.mpmd_jit_with_loop(
-        func,
-        mpmd_mesh=mpmd_mesh,
-        donate_argnums=donate_argnums,
-        in_shardings=in_shardings,
-        out_shardings=out_shardings,
+          func,
+          mpmd_mesh=mpmd_mesh,
+          donate_argnums=donate_argnums,
+          in_shardings=in_shardings,
+          out_shardings=out_shardings,
       )
       assert len(func_input_kwargs) == 0
       compiled = p_train_step.compile(*func_input_args)
@@ -144,6 +152,7 @@ def jit_and_compile(
           static_argnums=static_argnums,
           donate_argnums=donate_argnums,
       )
+      maxtext_utils.maybe_dump_jaxpr(config, jitted, func_input_args)
       lowered = jitted.lower(*func_input_args, **func_input_kwargs)
 
   if mpmd_mesh is None:
@@ -172,7 +181,13 @@ def is_oom(argv: Sequence[str]) -> bool:
   max_utils.print_system_information()
 
   # Get shaped inputs
-  shaped_train_args, shaped_train_kwargs, state_mesh_shardings, model = get_shaped_inputs(topology_mesh, config)
+  (
+      shaped_train_args,
+      shaped_train_kwargs,
+      state_mesh_shardings,
+      _,
+      model,
+  ) = get_shaped_inputs(topology_mesh, config)
 
   # Get data sharding
   data_sharding = sharding.get_input_data_sharding(config, topology_mesh)
@@ -194,6 +209,7 @@ def is_oom(argv: Sequence[str]) -> bool:
         out_shard,
         static_argnums,
         donate_argnums,
+        config,
         nn_partitioning.axis_rules(config.logical_axis_rules),
     )
     return False
@@ -233,8 +249,14 @@ def main(argv: Sequence[str]) -> None:
   max_utils.print_system_information()
 
   # Get shaped inputs
-  shaped_train_args, shaped_train_kwargs, state_mesh_shardings, model = get_shaped_inputs(mesh, config)
-  params_shardings, state_mesh_shardings = max_utils.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
+  (
+      shaped_train_args,
+      shaped_train_kwargs,
+      state_mesh_shardings,
+      logical_annotations,
+      model,
+  ) = get_shaped_inputs(topology_mesh, config)
+  params_shardings, state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
   # Get data sharding
   data_sharding = sharding.get_input_data_sharding(config, mesh)
@@ -245,6 +267,16 @@ def main(argv: Sequence[str]) -> None:
           train.train_step, data_sharding, state_mesh_shardings, model, config, params_shardings=params_shardings
       )
   )
+
+  # print weights sharding info under debug sharding mode
+  if config.debug_sharding:
+    max_utils.print_non_trivial_mesh_axis(topology_mesh)
+    maxtext_utils.print_shardings_params(
+        shaped_train_args[0].params,
+        state_mesh_shardings.params,
+        topology_mesh,
+        logical_annotations.params,
+    )
 
   # Compile
   print("Jitting and compiling train step...", flush=True)
@@ -257,6 +289,7 @@ def main(argv: Sequence[str]) -> None:
       out_shard,
       static_argnums,
       donate_argnums,
+      config,
       nn_partitioning.axis_rules(config.logical_axis_rules),
       mpmd_mesh=mpmd_mesh
   )

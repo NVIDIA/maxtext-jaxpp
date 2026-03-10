@@ -22,7 +22,6 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import Mesh
 import jax.numpy as jnp
 
-from MaxText import max_utils
 from MaxText.common_types import Config
 from MaxText.layers import initializers
 from MaxText.layers import nnx_wrappers
@@ -31,6 +30,7 @@ from MaxText.layers.attentions import Attention
 from MaxText.layers.linears import Dropout, MlpBlock
 from MaxText.layers.normalizations import RMSNorm
 from MaxText.layers.quantizations import AqtQuantization as Quant
+from maxtext.utils import max_utils
 
 
 # Decoder and Model definitions
@@ -132,6 +132,9 @@ class GemmaDecoderLayer(nnx.Module):
       kv_cache=None,
       attention_metadata=None,
   ):
+    # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
+    if isinstance(inputs, tuple):
+      inputs = inputs[0]
     inputs = nn.with_logical_constraint(inputs, self.activation_axis_names)
     inputs = checkpoint_name(inputs, "decoder_layer_input")
     # inputs: embedded inputs to the decoder with shape [batch, length, emb_dim]

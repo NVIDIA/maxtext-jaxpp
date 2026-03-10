@@ -27,29 +27,28 @@ import jax
 
 from flax.linen import partitioning as nn_partitioning
 
-from MaxText import checkpointing
-from MaxText import exceptions
-from MaxText import max_utils
-from MaxText import max_logging
-from MaxText import maxtext_utils
-from MaxText import profiler
 from MaxText import pyconfig
-from MaxText import train_utils
-from MaxText.data_loader import DataLoader
-from MaxText.metric_logger import MetricLogger
+from MaxText import sharding
 from MaxText.train import (
     eval_step,
     get_first_step,
     train_step,
 )
-from MaxText.train_utils import setup_train_loop, validate_train_config
-from MaxText.utils import gcs_utils
-from MaxText.utils.goodput_utils import (
+from maxtext.common import checkpointing, profiler
+from maxtext.common.data_loader import DataLoader
+from maxtext.common.goodput import (
     GoodputEvent,
     create_goodput_recorder,
     maybe_monitor_goodput,
     maybe_record_goodput,
 )
+from maxtext.common.metric_logger import MetricLogger
+from maxtext.utils import exceptions
+from maxtext.utils import gcs_utils
+from maxtext.utils import max_utils
+from maxtext.utils import max_logging
+from maxtext.utils import maxtext_utils
+from maxtext.utils import train_utils
 
 
 def train_loop(config, recorder, state=None):
@@ -65,15 +64,19 @@ def train_loop(config, recorder, state=None):
       mesh,
       learning_rate_schedule,
       data_iterator,
+      _,
+      _,
       eval_data_iterator,
       state,
-  ) = setup_train_loop(config, recorder)
+  ) = train_utils.setup_train_loop(config, recorder)
+
+  params_shardings, state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
   p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
-      config, model, mesh, state, state_mesh_shardings, train_step, eval_step, eval_data_iterator
+      config, model, mesh, state, state_mesh_shardings, train_step, eval_step, eval_data_iterator, params_shardings
   )
 
-  with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+  with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
     shaped_batch = maxtext_utils.get_shaped_batch(config)
     compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
     compiled_stats = compiled.memory_analysis()
@@ -97,7 +100,7 @@ def train_loop(config, recorder, state=None):
         # pylint: disable=not-callable
         nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
         with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
-          with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+          with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
             state, metrics = p_train_step(state, example_batch, nextrng)
 
       step_time_delta = datetime.datetime.now() - last_step_completion
@@ -122,7 +125,7 @@ def train_loop(config, recorder, state=None):
         for eval_batch in eval_data_iterator:
           if config.eval_steps > 0 and eval_step_count >= config.eval_steps:
             break
-          with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+          with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
             eval_metrics = p_eval_step(state, eval_batch, nextrng)
           metric_logger.record_eval_metrics(step, metrics=eval_metrics)
           max_logging.log(f"Completed eval step {eval_step_count}")
@@ -162,10 +165,10 @@ def main(argv: Sequence[str]) -> None:
     os.environ["LIBTPU_INIT_ARGS"] = (
         os.environ.get("LIBTPU_INIT_ARGS", "") + " --xla_tpu_spmd_rng_bit_generator_unsafe=true"
     )
-  config = pyconfig.initialize(argv)
+  config = pyconfig.initialize(argv, use_tunix_gradient_accumulation=False)
   jax.config.update("jax_use_shardy_partitioner", config.shardy)
   max_utils.print_system_information()
-  validate_train_config(config)
+  train_utils.validate_train_config(config)
   os.environ["TFDS_DATA_DIR"] = config.dataset_path
 
   recorder = create_goodput_recorder(config)

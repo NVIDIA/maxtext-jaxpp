@@ -32,12 +32,19 @@ AxisIdxes = tuple[int, ...]
 
 BATCH = "activation_batch"
 BATCH_NO_EXP = "activation_batch_no_exp"
+
+ATTN_LENGTH = "activation_attn_length"
+ATTN_LENGTH_NO_EXP = "activation_attn_length_no_exp"
+
 LENGTH = "activation_length"
 LENGTH_NO_EXP = "activation_length_no_exp"
 PREFILL_LENGTH = "prefill_activation_length"
 Q_LENGTH = "activation_q_length"
 Q_LENGTH_NO_EXP = "activation_q_length_no_exp"
+Q_LORA_UP_PROJ = "q_lora_up_proj"
 KV_LENGTH = "activation_kv_length"
+KV_LORA_UP_PROJ = "kv_lora_up_proj"
+ATTN_EMBED = "activation_attn_embed"
 EMBED = "activation_embed"
 HEAD = "activation_heads"
 PREFILL_KV_BATCH = "activation_prefill_kv_batch"
@@ -65,6 +72,7 @@ MODEL_MODE_TRAIN = "train"
 
 # expert_shard_attention_option
 EP_AS_CONTEXT = "context"
+EP_AS_FSDP = "fsdp"
 
 DECODING_ACTIVE_SEQUENCE_INDICATOR = 1
 
@@ -92,6 +100,7 @@ class DecoderBlockType(enum.Enum):
   SIMPLE = "simple"
   SIMPLE_MLP = "simple_mlp"
   LLAMA4 = "llama4"
+  OLMO3 = "olmo3"
 
 
 class AttentionType(enum.Enum):
@@ -105,3 +114,9 @@ class AttentionType(enum.Enum):
 class ShardMode(enum.Enum):
   AUTO = "auto"  # default
   EXPLICIT = "explicit"
+
+
+class HyperConnectionType(enum.Enum):
+  ATTENTION = "attention"
+  MLP_MOE = "mlp_moe"
+  MLP_DENSE = "mlp_dense"

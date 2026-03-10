@@ -23,7 +23,7 @@ from jax.sharding import Mesh, NamedSharding
 import jax
 import jax.numpy as jnp
 
-from flax import nnx, linen as nn
+from flax import nnx
 
 from MaxText.common_types import (
     DecoderBlockType,
@@ -34,8 +34,8 @@ from MaxText.common_types import (
     D_KV,
     AxisNames,
     AxisIdxes,
-    LENGTH,
-    LENGTH_NO_EXP,
+    ATTN_LENGTH,
+    ATTN_LENGTH_NO_EXP,
     DType,
     Config,
     Array,
@@ -46,23 +46,20 @@ from MaxText.common_types import (
     KV_HEAD_DIM,
     KV_BATCH,
     KV_BATCH_NO_EXP,
-    EMBED,
+    ATTN_EMBED,
     MODEL_MODE_AUTOREGRESSIVE,
     MODEL_MODE_TRAIN,
     MODEL_MODE_PREFILL,
     EP_AS_CONTEXT,
     AttentionType,
 )
-from MaxText.sharding import maybe_shard_with_logical
-from MaxText.inference import kvcache
-from MaxText.inference import page_manager
-from MaxText.inference import paged_attention
-from MaxText.inference.kvcache import KVQuant
+from MaxText.sharding import maybe_shard_with_logical, create_sharding
 from MaxText.layers import nnx_wrappers
 from MaxText.layers.attention_op import AttentionOp
 from MaxText.layers.embeddings import (
     LLaMARotaryEmbedding,
     LlamaVisionRotaryEmbedding,
+    Qwen3OmniMoeThinkerTextRotaryEmbedding,
     Qwen3OmniMoeVisionRotaryEmbedding,
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -72,6 +69,8 @@ from MaxText.layers.initializers import nd_dense_init, NdInitializer, variable_t
 from MaxText.layers.linears import DenseGeneral, canonicalize_tuple, normalize_axes
 from MaxText.layers.normalizations import RMSNorm, Qwen3NextRMSNorm
 from MaxText.layers.quantizations import AqtQuantization as Quant
+from maxtext.inference import kvcache, page_manager, paged_attention
+from maxtext.inference.kvcache import KVQuant
 
 # pylint: disable=line-too-long, g-doc-args, g-doc-return-or-yield, bad-continuation, g-inconsistent-quotes
 # pytype: disable=attribute-error
@@ -141,18 +140,18 @@ def attention_as_linen(
     prefill_query_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, KV_HEAD, KV_HEAD_DIM),
     prefill_key_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, KV_HEAD, KV_HEAD_DIM),
     prefill_value_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, KV_HEAD, KV_HEAD_DIM),
-    query_axis_names: AxisNames = (KV_BATCH, LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
-    key_axis_names: AxisNames = (KV_BATCH, LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
-    value_axis_names: AxisNames = (KV_BATCH, LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
-    ep_query_axis_names: AxisNames = (KV_BATCH_NO_EXP, LENGTH, KV_HEAD, KV_HEAD_DIM),
-    ep_key_axis_names: AxisNames = (KV_BATCH_NO_EXP, LENGTH, KV_HEAD, KV_HEAD_DIM),
-    ep_value_axis_names: AxisNames = (KV_BATCH_NO_EXP, LENGTH, KV_HEAD, KV_HEAD_DIM),
-    input_axis_names: AxisNames = (BATCH, LENGTH_NO_EXP, EMBED),
-    ep_input_axis_names: AxisNames = (BATCH_NO_EXP, LENGTH, EMBED),
-    out_axis_names: AxisNames = (BATCH, LENGTH_NO_EXP, HEAD, D_KV),
-    ep_out_axis_names: AxisNames = (BATCH_NO_EXP, LENGTH, HEAD, D_KV),
-    prefill_input_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, EMBED),
-    decode_input_axis_names: AxisNames = (DECODE_BATCH, DECODE_LENGTH, EMBED),
+    query_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
+    key_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
+    value_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
+    ep_query_axis_names: AxisNames = (KV_BATCH_NO_EXP, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
+    ep_key_axis_names: AxisNames = (KV_BATCH_NO_EXP, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
+    ep_value_axis_names: AxisNames = (KV_BATCH_NO_EXP, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
+    input_axis_names: AxisNames = (BATCH, ATTN_LENGTH_NO_EXP, ATTN_EMBED),
+    ep_input_axis_names: AxisNames = (BATCH_NO_EXP, ATTN_LENGTH, ATTN_EMBED),
+    out_axis_names: AxisNames = (BATCH, ATTN_LENGTH_NO_EXP, HEAD, D_KV),
+    ep_out_axis_names: AxisNames = (BATCH_NO_EXP, ATTN_LENGTH, HEAD, D_KV),
+    prefill_input_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, ATTN_EMBED),
+    decode_input_axis_names: AxisNames = (DECODE_BATCH, DECODE_LENGTH, ATTN_EMBED),
     prefill_out_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, HEAD, D_KV),
     decode_out_axis_names: AxisNames = (DECODE_BATCH, DECODE_LENGTH, HEAD, D_KV),
     prefill_cache_axis_order: AxisIdxes = (1, 2, 0, 3),
@@ -162,6 +161,8 @@ def attention_as_linen(
     is_nope_layer: bool = False,
     is_vision: bool = False,
     model_mode: str = MODEL_MODE_TRAIN,
+    use_mrope: bool = False,
+    mrope_section: tuple[int, int, int] | None = None,
     name: str | None = None,
 ):
   """A factory function to create an Attention as a Linen module.
@@ -224,6 +225,8 @@ def attention_as_linen(
       is_nope_layer=is_nope_layer,
       is_vision=is_vision,
       model_mode=model_mode,
+      use_mrope=use_mrope,
+      mrope_section=mrope_section,
       name=name,
       metadata_fn=variable_to_logically_partitioned,
       abstract_init=False,
@@ -300,18 +303,18 @@ class Attention(nnx.Module):
       prefill_query_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, KV_HEAD, KV_HEAD_DIM),
       prefill_key_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, KV_HEAD, KV_HEAD_DIM),
       prefill_value_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, KV_HEAD, KV_HEAD_DIM),
-      query_axis_names: AxisNames = (KV_BATCH, LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
-      key_axis_names: AxisNames = (KV_BATCH, LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
-      value_axis_names: AxisNames = (KV_BATCH, LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
-      ep_query_axis_names: AxisNames = (KV_BATCH_NO_EXP, LENGTH, KV_HEAD, KV_HEAD_DIM),
-      ep_key_axis_names: AxisNames = (KV_BATCH_NO_EXP, LENGTH, KV_HEAD, KV_HEAD_DIM),
-      ep_value_axis_names: AxisNames = (KV_BATCH_NO_EXP, LENGTH, KV_HEAD, KV_HEAD_DIM),
-      input_axis_names: AxisNames = (BATCH, LENGTH_NO_EXP, EMBED),
-      ep_input_axis_names: AxisNames = (BATCH_NO_EXP, LENGTH, EMBED),
-      out_axis_names: AxisNames = (BATCH, LENGTH_NO_EXP, HEAD, D_KV),
-      ep_out_axis_names: AxisNames = (BATCH_NO_EXP, LENGTH, HEAD, D_KV),
-      prefill_input_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, EMBED),
-      decode_input_axis_names: AxisNames = (DECODE_BATCH, DECODE_LENGTH, EMBED),
+      query_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
+      key_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
+      value_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
+      ep_query_axis_names: AxisNames = (KV_BATCH_NO_EXP, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
+      ep_key_axis_names: AxisNames = (KV_BATCH_NO_EXP, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
+      ep_value_axis_names: AxisNames = (KV_BATCH_NO_EXP, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
+      input_axis_names: AxisNames = (BATCH, ATTN_LENGTH_NO_EXP, ATTN_EMBED),
+      ep_input_axis_names: AxisNames = (BATCH_NO_EXP, ATTN_LENGTH, ATTN_EMBED),
+      out_axis_names: AxisNames = (BATCH, ATTN_LENGTH_NO_EXP, HEAD, D_KV),
+      ep_out_axis_names: AxisNames = (BATCH_NO_EXP, ATTN_LENGTH, HEAD, D_KV),
+      prefill_input_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, ATTN_EMBED),
+      decode_input_axis_names: AxisNames = (DECODE_BATCH, DECODE_LENGTH, ATTN_EMBED),
       prefill_out_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, HEAD, D_KV),
       decode_out_axis_names: AxisNames = (DECODE_BATCH, DECODE_LENGTH, HEAD, D_KV),
       prefill_cache_axis_order: AxisIdxes = (1, 2, 0, 3),
@@ -322,6 +325,8 @@ class Attention(nnx.Module):
       is_vision: bool = False,
       model_mode: str = MODEL_MODE_TRAIN,
       base_kv_cache: bool = True,
+      use_mrope: bool = False,
+      mrope_section: tuple[int, int, int] | None = None,
       name: str | None = None,
       rngs: Optional[nnx.Rngs] = None,
   ):
@@ -416,6 +421,8 @@ class Attention(nnx.Module):
     self.is_nope_layer = is_nope_layer
     self.is_vision = is_vision
     self.model_mode = model_mode
+    self.use_mrope = use_mrope
+    self.mrope_section = mrope_section
     self.rngs = rngs
 
     self.is_qwen3_next = self.config.decoder_block == DecoderBlockType.QWEN3_NEXT
@@ -423,7 +430,7 @@ class Attention(nnx.Module):
     # Module attribute names must match names previously passed to Linen for checkpointing
     self.KVCache_0 = (
         self.init_kv_caches(inputs_kv_shape=inputs_kv_shape)
-        if self.model_mode != MODEL_MODE_TRAIN and base_kv_cache
+        if self.model_mode != MODEL_MODE_TRAIN and base_kv_cache and config.attention != "vllm_rpa"
         else None
     )
 
@@ -525,6 +532,7 @@ class Attention(nnx.Module):
         maybe_shard_with_logical,
         mesh=mesh,
         shard_mode=config.shard_mode,
+        debug_sharding=config.debug_sharding,
     )
 
   def _init_projections(self, inputs_q_shape: Tuple, inputs_kv_shape: Tuple) -> None:
@@ -744,18 +752,32 @@ class Attention(nnx.Module):
       else:
         raise ValueError(f"Unsupported model type for vision rotary embedding: {self.config.model_name}")
 
+    elif self.use_mrope:
+      rotary_embedding = Qwen3OmniMoeThinkerTextRotaryEmbedding(
+          min_timescale=self.config.rope_min_timescale,
+          max_timescale=self.config.rope_max_timescale,
+          embedding_dims=rope_embedding_dims,
+          cast_as_fprop_dtype=True,
+          fprop_dtype=self.dtype,
+          mrope_section=self.mrope_section,
+          rngs=self.rngs,
+      )
+
     elif self.config.model_name.startswith("llama3.1") or rope_type.startswith("llama3.1"):
       rotary_embedding = LLaMARotaryEmbedding(
           min_timescale=self.config.rope_min_timescale,
           max_timescale=self.config.rope_max_timescale,
+          mesh=self.mesh,
           embedding_dims=rope_embedding_dims,
           fprop_dtype=self.dtype,
           use_scale=rope_use_scale,
+          shard_mode=self.config.shard_mode,
           rngs=self.rngs,
       )
     elif rope_type.startswith("yarn"):
       rotary_embedding = YarnRotaryEmbedding(
           max_position_embeddings=self.config.max_position_embeddings,
+          mesh=self.mesh,
           original_max_position_embeddings=self.config.original_max_position_embeddings,
           beta_fast=self.config.beta_fast,
           beta_slow=self.config.beta_slow,
@@ -766,16 +788,19 @@ class Attention(nnx.Module):
           interleave=self.config.rope_interleave,
           truncate=self.config.rope_truncate,
           attention_scaling=self.config.rope_attention_scaling,
+          shard_mode=self.config.shard_mode,
           rngs=self.rngs,
       )
     elif self.is_qwen3_next:
       rotary_embedding = Qwen3NextRotaryEmbedding(
           min_timescale=self.config.rope_min_timescale,
           max_timescale=self.config.rope_max_timescale,
+          mesh=self.mesh,
           embedding_dims=self.config.head_dim,
           partial_rotary_factor=self.config.partial_rotary_factor,
           cast_as_fprop_dtype=True,
           fprop_dtype=self.config.dtype,
+          shard_mode=self.config.shard_mode,
           rngs=self.rngs,
       )
     else:
@@ -792,9 +817,11 @@ class Attention(nnx.Module):
       rotary_embedding = RotaryEmbedding(
           min_timescale=self.config.rope_min_timescale,
           max_timescale=max_timescale,
+          mesh=self.mesh,
           embedding_dims=rope_embedding_dims,
           fprop_dtype=self.dtype,
           rope_linear_scaling_factor=rope_linear_scaling_factor,
+          shard_mode=self.config.shard_mode,
           rngs=self.rngs,
       )
     return rotary_embedding
@@ -901,14 +928,11 @@ class Attention(nnx.Module):
     try:
       # pylint: disable=import-outside-toplevel
       # pytype: disable=import-error
-      from tpu_inference.layers.jax.attention_interface import sharded_ragged_paged_attention as rpa_ops
+      from tpu_inference.layers.common.attention_interface import sharded_ragged_paged_attention as rpa_ops
     except ImportError as e:
       raise ImportError(
           "vLLM RPA attention ops require the vllm-tpu package. Please install it with `pip install vllm-tpu`."
       ) from e
-
-    if self.config.attention_sink:
-      raise NotImplementedError("Attention sink is not supported in MaxText vLLM RPA attention.")
 
     if rpa_kv_cache is None or rpa_metadata is None:
       raise ValueError("kv_cache and attention_metadata must be provided when using vLLM.")
@@ -917,12 +941,18 @@ class Attention(nnx.Module):
     key = key.reshape(-1, key.shape[2], key.shape[3])
     value = value.reshape(-1, value.shape[2], value.shape[3])
 
-    attention_chunk_size = self.config.chunk_attn_window_size if self.config.chunk_attn_window_size > 0 else None
+    if self.config.sliding_window_size > 0:
+      attention_chunk_size = self.config.sliding_window_size
+    else:
+      # Chunked attention currently not used in vLLM RPA.
+      attention_chunk_size = None
+
     q_scale, k_scale, v_scale = None, None, None
 
     md = rpa_metadata
 
-    output, kv_cache = rpa_ops(1.0, self.mesh, attention_chunk_size, q_scale, k_scale, v_scale)(
+    output, kv_cache = rpa_ops(
+        self.mesh,
         query,
         key,
         value,
@@ -931,6 +961,12 @@ class Attention(nnx.Module):
         md.block_tables,
         md.query_start_loc,
         md.request_distribution,
+        self.sinks.astype(jnp.float32) if self.sinks is not None else None,
+        1.0,
+        attention_chunk_size,
+        q_scale,
+        k_scale,
+        v_scale,
     )
     return kv_cache, output
 
@@ -985,28 +1021,25 @@ class Attention(nnx.Module):
       output of shape `[batch, length, q_features]`.
     """
     if model_mode == MODEL_MODE_PREFILL:
-      inputs_q = self._maybe_shard_with_logical(inputs_q, self.prefill_input_axis_names)
-      inputs_kv = self._maybe_shard_with_logical(inputs_kv, self.prefill_input_axis_names)
+      input_axis_names = self.prefill_input_axis_names
     elif model_mode == MODEL_MODE_TRAIN and self.config.expert_shard_attention_option == EP_AS_CONTEXT:
-      inputs_q = self._maybe_shard_with_logical(inputs_q, self.ep_input_axis_names)
-      inputs_kv = self._maybe_shard_with_logical(inputs_kv, self.ep_input_axis_names)
+      input_axis_names = self.ep_input_axis_names
     elif model_mode == MODEL_MODE_TRAIN:
-      inputs_q = self._maybe_shard_with_logical(inputs_q, self.input_axis_names)
-      inputs_kv = self._maybe_shard_with_logical(inputs_kv, self.input_axis_names)
+      input_axis_names = self.input_axis_names
     else:
-      inputs_q = self._maybe_shard_with_logical(inputs_q, self.decode_input_axis_names)
-      inputs_kv = self._maybe_shard_with_logical(inputs_kv, self.decode_input_axis_names)
+      input_axis_names = self.decode_input_axis_names
+
+    inputs_q = self._maybe_shard_with_logical(inputs_q, input_axis_names)
+    inputs_kv = self._maybe_shard_with_logical(inputs_kv, input_axis_names)
+    qkv_sharding = create_sharding(self.mesh, input_axis_names)
 
     # apply projection.
     if self.config.fused_qkv:
       query, key, value = self.qkv_projection(inputs_q, proj_name="qkv_proj")
     else:
-      query_sharding = NamedSharding(self.mesh, nn.logical_to_mesh_axes(self.query_axis_names))
-      query = self.query_projection(inputs_q, out_sharding=query_sharding)
-      key_sharding = NamedSharding(self.mesh, nn.logical_to_mesh_axes(self.key_axis_names))
-      key = self.kv_projection(inputs_kv, proj_name="key", out_sharding=key_sharding)
-      value_sharding = NamedSharding(self.mesh, nn.logical_to_mesh_axes(self.value_axis_names))
-      value = self.kv_projection(inputs_kv, proj_name="value", out_sharding=value_sharding)
+      query = self.query_projection(inputs_q, out_sharding=qkv_sharding)
+      key = self.kv_projection(inputs_kv, proj_name="key", out_sharding=qkv_sharding)
+      value = self.kv_projection(inputs_kv, proj_name="value", out_sharding=qkv_sharding)
 
     gate = None
     if self.is_qwen3_next:
@@ -1099,9 +1132,6 @@ class Attention(nnx.Module):
           bidirectional_mask,
           self.sinks,
       )
-    if self.is_qwen3_next:
-      out = out.reshape(batch_size, seq_len, self.config.num_query_heads * self.config.head_dim)
-      out = out * jax.nn.sigmoid(gate)
     if model_mode == MODEL_MODE_PREFILL:
       out = self._maybe_shard_with_logical(out, self.prefill_out_axis_names)
     elif model_mode == MODEL_MODE_TRAIN and self.config.expert_shard_attention_option == EP_AS_CONTEXT:
@@ -1110,6 +1140,9 @@ class Attention(nnx.Module):
       out = self._maybe_shard_with_logical(out, self.out_axis_names)
     else:
       out = self._maybe_shard_with_logical(out, self.decode_out_axis_names)
+    if self.is_qwen3_next:
+      out = out.reshape(batch_size, seq_len, self.config.num_query_heads * self.config.head_dim)
+      out = out * jax.nn.sigmoid(gate)
     out = self.out_projection(out, out_sharding=out_sharding)
     out = checkpoint_name(out, "out_proj")
     return out, kv_cache

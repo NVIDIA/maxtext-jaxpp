@@ -13,18 +13,16 @@
 # limitations under the License.
 
 """
-GRPO Trainer
+RL Trainer
 
 This module provides a unified `rl_train` function that consolidates the common
 RL training logic. It handles model loading, reward function setup, dataset
 processing, and training orchestration. By default, we run Group Relative Policy Optimization (GRPO) on 
-GSM8K math reasoning benchmark. GRPO can enhance your model's problem-solving skills on mathematical word problems,
-coding problems, etc. 
+GSM8K math reasoning benchmark. The script is also flexible enough to run Group Sequence Policy Optimization (GSPO).
 
-Usage:
-  Usage Examples:
+Usage Examples:
 
-# Llama3.1-8B-Instruct
+# GRPO on Llama3.1-8B-Instruct
 python3 -m src.MaxText.rl.train_rl src/MaxText/configs/rl.yml \
   model_name=llama3.1-8b \
   tokenizer_path=meta-llama/Llama-3.1-8B-Instruct \
@@ -33,56 +31,54 @@ python3 -m src.MaxText.rl.train_rl src/MaxText/configs/rl.yml \
   base_output_directory=$OUTPUT_PATH \
   hf_access_token=$HF_TOKEN
 
-# Llama3.1-70B-Instruct
+# GSPO on Llama3.1-70B-Instruct
 python3 -m src.MaxText.rl.train_rl src/MaxText/configs/rl.yml \
   model_name=llama3.1-70b \
   tokenizer_path=meta-llama/Llama-3.1-70B-Instruct \
   load_parameters_path=gs://path/to/checkpoint/0/items \
   run_name=$WORKLOAD \
   base_output_directory=$OUTPUT_PATH \
-  hf_access_token=$HF_TOKEN
+  hf_access_token=$HF_TOKEN \
+  loss_algo=gspo-token
 
 """
 
+from __future__ import annotations
 from typing import Sequence
-import os
-from pprint import pprint
+
 import collections
+import grain
+import jax
+import json
+import logging
+import os
+import pathwaysutils
+import tensorflow_datasets as tfds
 
 from absl import app
+from absl import logging as absl_logging
+from etils import epath
 from flax import nnx
 from flax.linen import partitioning as nn_partitioning
-import grain
-from etils import epath
-
-from vllm.outputs import PoolingRequestOutput  # pylint: disable=unused-import
-import jax
 from jax.sharding import Mesh
 from orbax import checkpoint as ocp
-import tensorflow_datasets as tfds
+from pprint import pprint
+from transformers import AutoTokenizer
 from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.rollout import base_rollout
 from tunix.rl.grpo.grpo_learner import GrpoConfig, GrpoLearner
 from tunix.sft import metrics_logger, profiler
 
-
-from transformers import AutoTokenizer
-
-
-import pathwaysutils
-
-pathwaysutils.initialize()
-
 # for vLLM we can skip JAX precompilation with this flag, it makes startup faster
 os.environ["SKIP_JAX_PRECOMPILE"] = "1"
 
-
-from MaxText import max_logging, max_utils, maxtext_utils, pyconfig
-from MaxText import model_creation_utils
+from MaxText import pyconfig
+from MaxText.globals import MAXTEXT_PKG_DIR
 from MaxText.integration.tunix.tunix_adapter import TunixMaxTextAdapter
 from MaxText.rl.evaluate_rl import evaluate
 from MaxText.rl import utils_rl
 from MaxText.input_pipeline.instruction_data_processing import load_template_from_file
+from maxtext.utils import max_logging, max_utils, maxtext_utils, model_creation_utils
 
 
 def get_maxtext_model(config, devices=None):
@@ -100,64 +96,62 @@ def get_maxtext_model(config, devices=None):
   # Please ensure that you pass the full path ending in `/0/items` for load_parameters_path to train_rl.py i.e.,
   # load_parameters_path=/path/to/your/output/directory/0/items
   """
-  model, mesh = model_creation_utils.create_nnx_model(config, devices)
+  model, mesh = model_creation_utils.create_nnx_model(config, devices=devices)
   with mesh:
-    tunix_model = TunixMaxTextAdapter(base_model=model)
+    use_no_op_mappings = "maxtext_config" in config.vllm_additional_config
+    tunix_model = TunixMaxTextAdapter(base_model=model, use_no_op_mappings=use_no_op_mappings)
     tunix_model.config = None
   return tunix_model, mesh
 
 
-def get_dataset(model_tokenizer, tmvp_config, data_dir, split="train") -> grain.MapDataset:
+def get_dataset(
+    model_tokenizer, tmvp_config, data_dir, split="train", data_files=None, dataset_name=None
+) -> grain.MapDataset:
   """Download data"""
   if not os.path.exists(data_dir):
     os.makedirs(data_dir)
 
-  data = tfds.data_source(
-      tmvp_config.dataset_name,
-      split=split,
-      data_dir=data_dir,
-      builder_kwargs={"file_format": tfds.core.FileFormat.ARRAY_RECORD},
-      download=True,
-  )
+  if dataset_name is None:
+    raise ValueError("dataset_name must be provided")
+
+  if dataset_name.startswith("huggingface:"):
+    import datasets  # pylint: disable=import-outside-toplevel
+
+    if data_files is None:
+      hf_dataset_name = dataset_name.replace("huggingface:", "")
+      data = datasets.load_dataset(hf_dataset_name, split=split, cache_dir=data_dir)
+      if tmvp_config.debug.rl:
+        max_logging.log(f"Loaded Hugging Face dataset {hf_dataset_name} with split {split}. Size: {len(data)}")
+    else:  # data_files have been provided, useful for using slices of large datasets like nvidia/OpenMathInstruct-2
+      data = datasets.load_dataset(
+          "parquet",
+          data_files={tmvp_config.train_split: data_files},
+          split=split,
+          cache_dir=data_dir,
+      )
+  else:
+    builder_kwargs = {"file_format": tfds.core.FileFormat.ARRAY_RECORD}
+    data = tfds.data_source(
+        dataset_name,
+        split=split,
+        data_dir=data_dir,
+        builder_kwargs=builder_kwargs,
+        download=True,
+    )
 
   template_config = load_template_from_file(tmvp_config.chat_template_path)
+
   loaded_dataset = (
       grain.MapDataset.source(data)
       .shuffle(seed=tmvp_config.data_shuffle_seed)
-      .map(
-          lambda x: {
-              # passed to model forward pass
-              "prompts": model_tokenizer.apply_chat_template(
-                  [
-                      {
-                          "role": "user",
-                          "content": template_config["TEMPLATE"].format(
-                              system_prompt=template_config["SYSTEM_PROMPT"].format(
-                                  reasoning_start_token=tmvp_config.reasoning_start_token,
-                                  reasoning_end_token=tmvp_config.reasoning_end_token,
-                                  solution_start_token=tmvp_config.solution_start_token,
-                                  solution_end_token=tmvp_config.solution_end_token,
-                              ),
-                              question=x["question"].decode("utf-8"),
-                          ),
-                      },
-                  ],
-                  tokenize=False,
-                  add_generation_prompt=True,
-              ),
-              # passed to reward functions
-              "question": x["question"].decode("utf-8"),
-              # passed to reward functions
-              "answer": utils_rl.extract_hash_answer(x["answer"].decode("utf-8")),
-          }
-      )
+      .map(lambda x: utils_rl.process_data(dataset_name, model_tokenizer, template_config, tmvp_config, x))
   )
   return loaded_dataset
 
 
-def setup_configs_and_devices(argv: Sequence[str]):
+def setup_configs_and_devices(argv: list[str]):
   """Setup device allocation and configs for training and inference."""
-  config = pyconfig.initialize(argv)
+  config = pyconfig.initialize_pydantic(argv)
   devices = jax.devices()
   if config.num_trainer_slices == -1 and config.num_samplers_slices == -1:
     max_logging.log("Running RL on a single slice")
@@ -197,22 +191,72 @@ def setup_configs_and_devices(argv: Sequence[str]):
     for i in range(config.num_trainer_slices, config.num_trainer_slices + config.num_samplers_slices):
       sampler_devices.extend(devices_by_slice[slice_indices[i]])
 
-    trainer_config = pyconfig.initialize(
-        argv,
-        num_slices=config.num_trainer_slices,
-        ici_fsdp_parallelism=len(trainer_devices) // config.num_trainer_slices,
-        dcn_data_parallelism=config.num_trainer_slices,
-    )
-    sampler_config = pyconfig.initialize(
-        argv,
-        num_slices=config.num_samplers_slices,
-        ici_fsdp_parallelism=len(sampler_devices) // config.num_samplers_slices,
-        dcn_data_parallelism=config.num_samplers_slices,
-    )
+    trainer_devices_per_slice = len(trainer_devices) // config.num_trainer_slices
+    trainer_fsdp = trainer_devices_per_slice
+    tp = config.ici_tensor_parallelism
+    if tp > 1:
+      if trainer_devices_per_slice % tp != 0:
+        raise ValueError(
+            f"trainer_devices_per_slice ({trainer_devices_per_slice}) must be divisible by tensor parallelism ({tp})"
+        )
+      if config.ici_fsdp_parallelism != -1 and config.ici_fsdp_parallelism * tp != trainer_devices_per_slice:
+        raise ValueError(
+            f"ici_fsdp_parallelism ({config.ici_fsdp_parallelism}) * ici_tensor_parallelism ({tp}) must equal "
+            f"devices_per_slice ({trainer_devices_per_slice})"
+        )
+      trainer_fsdp = trainer_devices_per_slice // tp
+
+    trainer_update = {
+        "num_slices": config.num_trainer_slices,
+        "ici_fsdp_parallelism": trainer_fsdp,
+        "ici_tensor_parallelism": tp,
+        "dcn_data_parallelism": config.num_trainer_slices,
+    }
+
+    sampler_update = {
+        "num_slices": config.num_samplers_slices,
+        "ici_fsdp_parallelism": len(sampler_devices) // config.num_samplers_slices,
+        "ici_tensor_parallelism": -1,
+        "dcn_data_parallelism": config.num_samplers_slices,
+    }
+
+    trainer_config = pyconfig.initialize_pydantic(argv, **trainer_update)
+    sampler_config = pyconfig.initialize_pydantic(argv, **sampler_update)
+
   else:
     raise ValueError("num_trainer_slices and num_samplers_slices should be both -1 or positive")
 
   return trainer_config, sampler_config, trainer_devices, sampler_devices
+
+
+def get_rollout_kwargs_for_data_parallelism(sampler_config, num_sampler_devices):
+  """Get rollout kwargs for vLLM rollout when using data parallelism."""
+  dp = sampler_config.rollout_data_parallelism
+  if dp == -1:
+    return {}
+
+  rollout_kwargs = {}
+  tp = sampler_config.rollout_tensor_parallelism
+
+  if tp == -1:
+    if num_sampler_devices % dp != 0:
+      raise ValueError(
+          f"num_sampler_devices({num_sampler_devices}) must be divisible by "
+          f"rollout_data_parallelism({dp}) "
+          f"when rollout_tensor_parallelism is -1."
+      )
+    tp = num_sampler_devices // dp
+  elif tp * dp != num_sampler_devices:
+    raise ValueError(
+        f"rollout_tensor_parallelism({tp}) * "
+        f"rollout_data_parallelism({dp}) "
+        f"!= len(sampler_devices)({num_sampler_devices})"
+    )
+  rollout_kwargs["tensor_parallel_size"] = tp
+  rollout_kwargs["data_parallel_size"] = dp
+  rollout_kwargs["rollout_vllm_async_scheduling"] = True
+
+  return rollout_kwargs
 
 
 def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
@@ -225,7 +269,13 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
     trainer_devices: JAX devices for the trainer.
     sampler_devices: JAX devices for the sampler.
   """
-  max_logging.log("Starting GRPO Training")
+  if not trainer_config.debug.rl:
+    # Apply filter to suppress noisy logs
+    noise_filter = max_logging.NoisyLogFilter()
+    logging.getLogger().addFilter(noise_filter)
+    absl_logging.get_absl_logger().addFilter(noise_filter)
+
+  max_logging.log("Starting RL Training")
   max_logging.log(f"Ensuring TensorBoard log directory exists: {trainer_config.tensorboard_dir}")
   if not epath.Path(trainer_config.tensorboard_dir).exists():
     epath.Path(trainer_config.tensorboard_dir).mkdir(parents=True, exist_ok=True)
@@ -236,11 +286,10 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
   # Number of training steps.
   max_train_steps = int(
       trainer_config.num_batches
-      * trainer_config.num_iterations
+      * trainer_config.rl.num_iterations
       * trainer_config.train_fraction
-      * trainer_config.num_epochs
+      * trainer_config.num_epoch
   )
-
   # ====== Data ======
   # Setup data directories
   home = os.path.expanduser("~") + "/"
@@ -255,22 +304,36 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
   model_tokenizer = AutoTokenizer.from_pretrained(trainer_config.tokenizer_path)
 
   # Load datasets
-  dataset = get_dataset(model_tokenizer, trainer_config, train_data_dir, trainer_config.train_split).batch(
-      trainer_config.batch_size
-  )[: trainer_config.num_batches]
+  dataset = get_dataset(
+      model_tokenizer,
+      trainer_config,
+      train_data_dir,
+      trainer_config.train_split,
+      data_files=trainer_config.hf_train_files,
+      dataset_name=trainer_config.dataset_name,
+  ).batch(trainer_config.batch_size)[: trainer_config.num_batches]
 
   if trainer_config.train_fraction == 1.0:
-    train_dataset = dataset.repeat(trainer_config.num_epochs)
+    train_dataset = dataset.repeat(trainer_config.num_epoch)
   else:
     train_dataset = dataset[: int(len(dataset) * trainer_config.train_fraction)]
-    train_dataset = train_dataset.repeat(trainer_config.num_epochs)
+    train_dataset = train_dataset.repeat(trainer_config.num_epoch)
 
-  test_dataset = get_dataset(model_tokenizer, trainer_config, test_data_dir, trainer_config.eval_split).batch(
-      trainer_config.batch_size
-  )[: trainer_config.num_test_batches]
+  eval_dataset_name = getattr(trainer_config, "eval_dataset_name", None)
+  if not eval_dataset_name:
+    eval_dataset_name = trainer_config.dataset_name
+
+  test_dataset = get_dataset(
+      model_tokenizer,
+      trainer_config,
+      test_data_dir,
+      trainer_config.eval_split,
+      data_files=trainer_config.hf_eval_files,
+      dataset_name=eval_dataset_name,
+  ).batch(trainer_config.batch_size)[: trainer_config.num_test_batches]
 
   # Let's see how one batch of the dataset looks like!
-  if trainer_config.debug["rl"]:
+  if trainer_config.debug.rl:
     for ele in train_dataset[:1]:
       pprint(ele)
 
@@ -281,7 +344,7 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
   # if trainer_devices=sampler_devices, then rollout_mesh=reference_mesh
   # else rollout_mesh uses sampler_devices
   rollout_mesh = Mesh(devices_array, sampler_config.mesh_axes)
-  if trainer_config.debug["rl"]:
+  if trainer_config.debug.rl:
     max_logging.log("Reference Model initialized successfully")
     nnx.display(reference_model)
     max_logging.log(f"Reference mesh shape: {reference_mesh.shape}")
@@ -291,7 +354,7 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
     maxtext_state_flatten = {".".join(str(key) for key in keys): v for keys, v in _maxtext_state_flatten}
     max_logging.log(
         f"maxtext_state_flatten[base.token_embedder.embedding].value=\
-          {maxtext_state_flatten['base.token_embedder.embedding'].value}"
+          {maxtext_state_flatten['base.token_embedder.embedding'][...]}"
     )
 
   # TODO: @mazumdera: change this to use lora
@@ -300,7 +363,7 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
   max_logging.log("Creating policy model with same config as reference model on trainer mesh")
   actor_model, actor_mesh = get_maxtext_model(trainer_config, trainer_devices)
 
-  if trainer_config.debug["rl"]:
+  if trainer_config.debug.rl:
     max_logging.log("Policy Model initialized successfully")
     nnx.display(actor_model)
     max_logging.log(f"Policy mesh shape: {actor_mesh.shape}")
@@ -331,6 +394,21 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
         set_profile_options=False,
     )
 
+  # Parse vllm_additional_config
+  rollout_additional_config = None
+  if trainer_config.vllm_additional_config:
+    if isinstance(trainer_config.vllm_additional_config, dict):
+      # It's already parsed into a dict
+      rollout_additional_config = trainer_config.vllm_additional_config
+    elif isinstance(trainer_config.vllm_additional_config, str):
+      # It's a string, so we need to parse it
+      try:
+        rollout_additional_config = json.loads(trainer_config.vllm_additional_config)
+      except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse additional_config JSON: {e}") from e
+
+    max_logging.log(f"Parsed additional config: {rollout_additional_config}")
+
   # RL Cluster config
   # Note that we use vLLM as the rollout engine.
   # and we are using Tensor Parallelism for rollout
@@ -339,6 +417,10 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
           rl_cluster_lib.Role.ACTOR: actor_mesh,
           rl_cluster_lib.Role.REFERENCE: reference_mesh,
           rl_cluster_lib.Role.ROLLOUT: rollout_mesh,
+      },
+      role_to_logical_axis_rule={
+          rl_cluster_lib.Role.ACTOR: trainer_config.logical_axis_rules,
+          rl_cluster_lib.Role.REFERENCE: trainer_config.logical_axis_rules,
       },
       rollout_engine="vllm",
       offload_to_cpu=False,
@@ -369,14 +451,21 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
           rollout_vllm_hbm_utilization=trainer_config.hbm_utilization_vllm,
           rollout_vllm_tpu_backend_type="jax",
           rollout_vllm_swap_space_size_gb=trainer_config.swap_space_vllm_gb,
+          rollout_vllm_hf_config_path=trainer_config.vllm_hf_config_path,
+          rollout_vllm_additional_config=rollout_additional_config,
+          rollout_vllm_init_with_random_weights=True,
+          rollout_vllm_enable_dp_attention=trainer_config.enable_dp_attention,
+          rollout_vllm_max_num_batched_tokens=trainer_config.max_num_batched_tokens,
+          rollout_vllm_max_num_seqs=trainer_config.max_num_seqs,
+          **get_rollout_kwargs_for_data_parallelism(sampler_config, len(sampler_devices)),
       ),
   )
   grpo_config = GrpoConfig(
-      num_generations=trainer_config.num_generations,
-      num_iterations=trainer_config.num_iterations,
-      beta=trainer_config.grpo_beta,
-      epsilon=trainer_config.grpo_epsilon,
-      loss_algo=trainer_config.loss_algo,
+      num_generations=trainer_config.rl.num_generations,
+      num_iterations=trainer_config.rl.num_iterations,
+      beta=trainer_config.rl.grpo_beta,
+      epsilon=trainer_config.rl.grpo_epsilon,
+      loss_algo=trainer_config.rl.loss_algo,
   )
 
   # Create RL cluster
@@ -397,7 +486,13 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
       max_logging.log(
           "enable_tunix_perf_metrics is True but tunix.perf modules are not available, skipping Tunix-managed metrics."
       )
-  with nn_partitioning.axis_rules(trainer_config.logical_axis_rules):
+
+  pkg_dir = os.environ.get("MAXTEXT_PKG_DIR", MAXTEXT_PKG_DIR)
+  vllm_config_path = epath.Path(pkg_dir) / "configs" / "vllm.yml"
+  argv_list = ["", str(vllm_config_path), "log_config=False"]
+  vllm_config = pyconfig.initialize(argv_list)
+
+  with nn_partitioning.axis_rules(vllm_config.logical_axis_rules):
     rl_cluster = rl_cluster_lib.RLCluster(
         actor=actor_model,
         reference=reference_model,
@@ -406,8 +501,8 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
         **rl_cluster_kwargs,
     )
 
-  # Create GRPO trainer
-  max_logging.log("Setting up GRPO trainer...")
+  # Create RL trainer
+  max_logging.log("Setting up RL trainer...")
   rl_trainer = GrpoLearner(
       rl_cluster=rl_cluster,
       reward_fns=[  # type: ignore
@@ -416,7 +511,7 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
           lambda **kwargs: utils_rl.check_answer(tmvp_config=trainer_config, **kwargs),
           lambda **kwargs: utils_rl.check_numbers(tmvp_config=trainer_config, **kwargs),
       ],
-      grpo_config=grpo_config,
+      algo_config=grpo_config,
   )
 
   # Before we train the model, let's evaluate the model on the test set so we can
@@ -430,16 +525,17 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
       corr_lst=trainer_config.eval_corr_lst,
       make_lst=trainer_config.eval_make_lst,
   )
-  max_logging.log(f"Pre GRPO Training: {corr=}, {total=}, {accuracy=}%, {partial_accuracy=}%," f" {format_accuracy=}%")
+  # TODO: @mazumdera: Change this to max_logging.log once b/473703277 is resolved
+  max_logging.warning(f"Pre RL Training: {corr=}, {total=}, {accuracy=}%, {partial_accuracy=}%," f" {format_accuracy=}%")
 
   # Start training
 
-  max_logging.log("Starting GRPO training...")
+  max_logging.warning("Starting RL training...")
 
   with reference_mesh, nn_partitioning.axis_rules(trainer_config.logical_axis_rules):
     rl_trainer.train(train_dataset)
 
-  max_logging.log("GRPO Training Completed Successfully!")
+  max_logging.warning("RL Training Completed Successfully!")
 
   # Let's evaluate our model!
   (corr, total, accuracy, partial_accuracy, format_accuracy), _ = evaluate(
@@ -450,7 +546,7 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
       corr_lst=trainer_config.eval_corr_lst,
       make_lst=trainer_config.eval_make_lst,
   )
-  max_logging.log(f"Post GRPO Training: {corr=}, {total=}, {accuracy=}%, {partial_accuracy=}%," f" {format_accuracy=}%")
+  max_logging.warning(f"Post RL Training: {corr=}, {total=}, {accuracy=}%, {partial_accuracy=}%," f" {format_accuracy=}%")
 
 
 def main(argv: Sequence[str]) -> None:
@@ -460,12 +556,7 @@ def main(argv: Sequence[str]) -> None:
     argv: Command-line arguments.
   """
   pathwaysutils.initialize()
-  jax.config.update("jax_default_prng_impl", "unsafe_rbg")
   os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
-  if "xla_tpu_spmd_rng_bit_generator_unsafe" not in os.environ.get("LIBTPU_INIT_ARGS", ""):
-    os.environ["LIBTPU_INIT_ARGS"] = (
-        os.environ.get("LIBTPU_INIT_ARGS", "") + " --xla_tpu_spmd_rng_bit_generator_unsafe=true"
-    )
 
   max_utils.print_system_information()
   trainer_config, sampler_config, trainer_devices, sampler_devices = setup_configs_and_devices(argv)

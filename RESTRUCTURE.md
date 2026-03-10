@@ -27,14 +27,8 @@ comments, or questions by creating a new
 ├── README.md
 ├── dependencies/
 │   ├── dockerfiles/
-│   │   ├── jetstream_pathways.Dockerfile
-│   │   ├── maxengine_server.Dockerfile
-│   │   ├── maxtext_custom_wheels.Dockerfile
-│   │   ├── maxtext_db_dependencies.Dockerfile
-│   │   ├── maxtext_dependencies.Dockerfile
+│   │   ├── maxtext_tpu_dependencies.Dockerfile
 │   │   ├── maxtext_gpu_dependencies.Dockerfile
-│   │   ├── maxtext_jax_ai_image.Dockerfile
-│   │   ├── maxtext_libtpu_path.Dockerfile
 │   │   └── maxtext_runner.Dockerfile
 │   ├── requirements/
 │   │   └── requirements.txt
@@ -91,7 +85,6 @@ comments, or questions by creating a new
 │   │   │       ├── recipes/
 │   │   │       │   ├── args_helper.py
 │   │   │       │   ├── mcjax_long_running_recipe.py
-│   │   │       │   └── py_elastic_training_recipe.py
 │   │   │       │   └── ...
 │   │   │       ├── llama2_v6e-256_benchmarks.py
 │   │   │       └── xla_flags_library.py
@@ -253,7 +246,6 @@ comments, or questions by creating a new
 │   │   │   │   └── sft/
 │   │   │   │       └── sft_train.py
 │   │   │   └── pretrain/
-│   │   │       ├── elastic_train.py
 │   │   │       ├── train.py
 │   │   │       ├── train_compile.py
 │   │   │       ├── train_tokenizer.py
@@ -285,9 +277,18 @@ comments, or questions by creating a new
 │   │               └── ...
 │   │       └── ...
 │   ├── integration/
-│   │   └── hf_checkpoint_conversion_checker.py
+│   │   └── smoke/
+│   │       └── llama3.1/
+│   │           └── train_smoke_test.py
+│   │           └── ...
+│   │   └── checkpointing_test.py
+│   |   └── ...
 │   └── unit/
-│       └── ...
+│   |   └── configs_tests.py
+│   │   └── ...
+│   └── utils/
+│   │   └── hf_checkpoint_conversion_checker.py
+│   │   └── ...
 ├── pylintrc
 ├── pyproject.toml
 ├── pytest.ini

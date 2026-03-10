@@ -20,36 +20,125 @@ from flax import linen as nn
 from collections.abc import Iterable
 
 import jax
+from jax.core import Tracer
 from jax.sharding import PartitionSpec as P, NamedSharding, reshard
 
 import optax
 
-from MaxText import max_utils
 from MaxText.common_types import ShardMode
+from maxtext.utils import max_logging
+from maxtext.utils import max_utils
+
+
+_LOGGED_ACTIVATION_SHARDINGS = set()
+_LOGGED_LOGICAL_AXES = set()
 
 
 def get_input_data_sharding(config, mesh):
   """Get the input data sharding for the model"""
-  return nn.logical_to_mesh_sharding(P(*config.input_data_sharding_logical_axes), mesh, config.logical_axis_rules)
+  return create_sharding(mesh, config.input_data_sharding_logical_axes, rules=config.logical_axis_rules)
 
 
-def maybe_shard_with_name(inputs, named_sharding, shard_mode):
+def maybe_shard_with_name(inputs, named_sharding, shard_mode, debug_sharding=False, extra_stack_level=0):
   """
   In auto shardmode, this function hints inputs follow given named_sharding.
   In explicit shardmode, this function enforces inputs following named_sharding.
   """
+  if inputs is None:
+    return None
+  if (
+      debug_sharding and isinstance(inputs, Tracer) and isinstance(named_sharding, NamedSharding)
+  ):  # only print pspec for JitTracer
+    pspec = remove_size_one_mesh_axis(getattr(named_sharding, "spec"), getattr(named_sharding, "mesh"))
+    log_key = (str(jax.typeof(inputs)), tuple(pspec), extra_stack_level)
+    if log_key not in _LOGGED_ACTIVATION_SHARDINGS:
+      max_logging.info(f"Physical: {log_key[0]:.<80} {log_key[1]}.", stacklevel=3 + extra_stack_level)
+      _LOGGED_ACTIVATION_SHARDINGS.add(log_key)
   if shard_mode == ShardMode.EXPLICIT:
     return reshard(inputs, named_sharding)
   else:
     return jax.lax.with_sharding_constraint(inputs, named_sharding)
 
 
-def maybe_shard_with_logical(inputs, logical_axes, mesh, shard_mode):
+def maybe_shard_with_logical(
+    inputs, logical_axes, mesh, shard_mode, rules=None, debug_sharding=False, extra_stack_level=0
+):
   """
   A wrapper of maybe_shard_with_name when logical axes are inputs
   """
-  named_sharding = NamedSharding(mesh, nn.logical_to_mesh_axes(logical_axes))
-  return maybe_shard_with_name(inputs, named_sharding, shard_mode)
+  if inputs is None:
+    return None
+
+  named_sharding = create_sharding(mesh, logical_axes, rules=rules)
+
+  if debug_sharding and isinstance(inputs, Tracer):
+    log_key = (str(jax.typeof(inputs)), logical_axes, extra_stack_level)
+
+    if log_key not in _LOGGED_LOGICAL_AXES:
+      max_logging.info(f"Logical:  {log_key[0]:.<60} {log_key[1]}", stacklevel=3 + extra_stack_level)
+      _LOGGED_LOGICAL_AXES.add(log_key)
+
+  return maybe_shard_with_name(
+      inputs,
+      named_sharding,
+      shard_mode,
+      debug_sharding=debug_sharding,
+      extra_stack_level=extra_stack_level + 1,
+  )
+
+
+def remove_size_one_mesh_axis(spec, mesh):
+  """
+  Removes mesh axes from a PartitionSpec (P) where the axis size is 1.
+
+  This is a common optimization to simplify sharding by excluding redundant axes.
+  Function originally from jax._src.core:
+  https://github.com/jax-ml/jax/blob/main/jax/_src/core.py
+  """
+  if spec is None:
+    return None
+  new_spec = []  # type: ignore
+  for s in spec:
+    if s is None or s == P.UNCONSTRAINED:
+      new_spec.append(s)  # type: ignore
+    elif isinstance(s, tuple):
+      new_spec.append(tuple(i for i in s if mesh.shape[i] != 1))
+    else:
+      new_spec.append(None if mesh.shape[s] == 1 else s)  # type: ignore
+  return P(*new_spec, unreduced=spec.unreduced, reduced=spec.reduced)
+
+
+def logical_to_mesh_axes(logical_names, mesh, rules=None):
+  """Remove size one mesh axes given logical names."""
+  tensor_spec = nn.logical_to_mesh_axes(logical_names, rules=rules)
+  return remove_size_one_mesh_axis(tensor_spec, mesh)
+
+
+def logical_to_mesh(tree, mesh, rules=None):
+  """Remove size one mesh axes given logical pspec pytree."""
+  if tree is None:
+    return None
+  return jax.tree.map(
+      lambda x: logical_to_mesh_axes(x, mesh, rules=rules),
+      tree,
+      is_leaf=lambda x: isinstance(x, P),
+  )
+
+
+def logical_to_mesh_sharding(tree, mesh, rules=None):
+  """Return sharding pytree given logical specs pytree"""
+  if tree is None:
+    return None
+  return jax.tree.map(
+      lambda x: NamedSharding(mesh, x),
+      logical_to_mesh(tree, mesh, rules=rules),
+      is_leaf=lambda x: isinstance(x, P),
+  )
+
+
+def create_sharding(mesh, logical_names, rules=None):
+  """Create NamedSharding with given logical names."""
+  return NamedSharding(mesh, logical_to_mesh_axes(logical_names, mesh, rules=rules))
 
 
 def get_mesh_axes_used_by_tensor_spec(tensor_sharding_spec):
@@ -424,6 +513,36 @@ def get_formatted_sharding_annotations(params, mesh=None):
   return "\n".join(annotation_lines)
 
 
+def remove_fsdp_sharding(sharding_tree):
+  """Recursively traverses the sharding tree to remove fsdp axes."""
+
+  def _remove_fsdp_from_partition_spec(named_sharding):
+    """Removes 'fsdp' and 'fsdp_transpose' from a PartitionSpec."""
+    if isinstance(named_sharding, jax.sharding.NamedSharding):
+      new_spec = []
+      # Iterate through each axis in the original PartitionSpec.
+      for axis in named_sharding.spec:
+        if axis is None:
+          new_spec.append(None)
+        elif isinstance(axis, str):
+          # If the axis is 'fsdp', replace it with None to signify replication.
+          if axis not in ("fsdp", "fsdp_transpose"):
+            new_spec.append(axis)
+          else:
+            new_spec.append(None)
+        elif isinstance(axis, (list, tuple)):
+          # If the axis is a collection, filter out 'fsdp'.
+          new_axis = [a for a in axis if a not in ("fsdp", "fsdp_transpose")]
+          new_spec.append(tuple(new_axis))
+        else:
+          raise ValueError(f"Unsupported_axis_type: {type(axis)}")
+        # Return a new sharding object with the modified spec.
+      return jax.sharding.NamedSharding(named_sharding.mesh, jax.sharding.PartitionSpec(*new_spec))
+    return named_sharding
+
+  return jax.tree.map(_remove_fsdp_from_partition_spec, sharding_tree)
+
+
 def get_physical_spec_no_fsdp(full_logical, mesh, logical_axis_rules):
   """
   Generates a physical sharding spec for fully replicated weights.
@@ -448,43 +567,14 @@ def get_physical_spec_no_fsdp(full_logical, mesh, logical_axis_rules):
     mesh axis.
   """
 
-  def remove_fsdp_sharding(sharding_tree):
-    """Recursively traverses the sharding tree to remove fsdp axes."""
-
-    def _remove_fsdp_from_partition_spec(named_sharding):
-      """Removes 'fsdp' and 'fsdp_transpose' from a PartitionSpec."""
-      if isinstance(named_sharding, jax.sharding.NamedSharding):
-        new_spec = []
-        # Iterate through each axis in the original PartitionSpec.
-        for axis in named_sharding.spec:
-          if axis is None:
-            new_spec.append(None)
-          elif isinstance(axis, str):
-            # If the axis is 'fsdp', replace it with None to signify replication.
-            if axis not in ("fsdp", "fsdp_transpose"):
-              new_spec.append(axis)
-            else:
-              new_spec.append(None)
-          elif isinstance(axis, (list, tuple)):
-            # If the axis is a collection, filter out 'fsdp'.
-            new_axis = [a for a in axis if a not in ("fsdp", "fsdp_transpose")]
-            new_spec.append(tuple(new_axis))
-          else:
-            raise ValueError(f"Unsupported_axis_type: {type(axis)}")
-          # Return a new sharding object with the modified spec.
-        return jax.sharding.NamedSharding(named_sharding.mesh, jax.sharding.PartitionSpec(*new_spec))
-      return named_sharding
-
-    return jax.tree.map(_remove_fsdp_from_partition_spec, sharding_tree)
-
   # Convert the high-level logical spec to a physical one using default rules.
-  physical = nn.logical_to_mesh_sharding(full_logical, mesh=mesh, rules=logical_axis_rules)
+  physical = logical_to_mesh_sharding(full_logical, mesh=mesh, rules=logical_axis_rules)
   # Apply the function to remove the FSDP sharding, defining our target layout.
   physical_no_fsdp = remove_fsdp_sharding(physical)
   return physical_no_fsdp
 
 
-def all_gather_over_fsdp(variables, sharding_info, mesh, logical_axis_rules):
+def all_gather_over_fsdp(variables, sharding_info, mesh, logical_axis_rules, shard_mode):
   """Performs an all-gather on FSDP-sharded variables via a sharding constraint.
   This function triggers an all-gather operation on the model's parameters.
   It does so by applying a sharding constraint that specifies a fully
@@ -499,6 +589,7 @@ def all_gather_over_fsdp(variables, sharding_info, mesh, logical_axis_rules):
     sharding_info: The logical partition spec of the currently sharded `variables`.
     mesh: The JAX device mesh.
     logical_axis_rules: Rules for converting logical axes to physical mesh axes.
+    shard_mode: auto or explicit shard mode.
 
   Returns:
     The model's variables with the all-gather operation applied, resulting
@@ -508,4 +599,4 @@ def all_gather_over_fsdp(variables, sharding_info, mesh, logical_axis_rules):
   physical_constraint_no_fsdp = get_physical_spec_no_fsdp(sharding_info, mesh, logical_axis_rules)
   # Apply the constraint to the model's current variables. This tells JAX to
   # gather the weights into this layout.
-  return jax.lax.with_sharding_constraint(variables, physical_constraint_no_fsdp)
+  return maybe_shard_with_name(variables, physical_constraint_no_fsdp, shard_mode=shard_mode)

@@ -8,6 +8,7 @@ flax==0.12.0
 gcsfs
 google-api-python-client
 google-cloud-aiplatform
+google-cloud-mldiagnostics
 google-cloud-monitoring
 grain[parquet]
 huggingface_hub

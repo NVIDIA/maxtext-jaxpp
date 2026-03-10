@@ -67,33 +67,29 @@ import transformers
 from ml_goodput_measurement.src.goodput import GoodputRecorder
 
 import MaxText as mt
-from MaxText import checkpointing
-from MaxText import exceptions
-from MaxText import max_logging
-from MaxText import max_utils
-from MaxText import maxtext_utils
 from MaxText import sharding
-from MaxText import train_utils
-from MaxText import profiler
 from MaxText import pyconfig
-from MaxText.checkpointing import CheckpointManager
-from MaxText.utils import gcs_utils
-from MaxText.inference import offline_engine
-from MaxText.data_loader import DataLoader
 from MaxText.experimental.rl import grpo_input_pipeline
 from MaxText.experimental.rl import grpo_utils
 from MaxText.globals import EPS
-from MaxText.metric_logger import MetricLogger
 from MaxText.train import get_first_step
-from MaxText.train_utils import validate_train_config
-from MaxText.utils.goodput_utils import (
+from maxtext.common import checkpointing, profiler
+from maxtext.common.data_loader import DataLoader
+from maxtext.common.goodput import (
     GoodputEvent,
     create_goodput_recorder,
     maybe_monitor_goodput,
     maybe_record_goodput,
 )
-from MaxText.vertex_tensorboard import VertexTensorboardManager
-
+from maxtext.common.metric_logger import MetricLogger
+from maxtext.common.vertex_tensorboard import VertexTensorboardManager
+from maxtext.inference import offline_engine
+from maxtext.utils import exceptions
+from maxtext.utils import gcs_utils
+from maxtext.utils import max_logging
+from maxtext.utils import max_utils
+from maxtext.utils import maxtext_utils
+from maxtext.utils import train_utils
 
 # pylint: disable=too-many-positional-arguments
 
@@ -505,7 +501,7 @@ def setup_train_loop(
     recorder: GoodputRecorder,
 ) -> tuple[
     jax.Array,
-    CheckpointManager,
+    checkpointing.CheckpointManager,
     TrainState,
     TrainState,
     mt.Transformer,
@@ -824,7 +820,7 @@ def train_loop(config, config_inference, recorder, state=None):
               continue
         train_rng, rng = random.split(init_rng)
         example_batch = jax.device_put(example_batch, data_sharding)
-        with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+        with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
           state, metrics = p_train_step(state, example_batch, train_rng)
       with jax.profiler.StepTraceAnnotation("transfer data", step_num=step):
         if step != 0 and step % config.inference_rollouts == 0:
@@ -862,7 +858,7 @@ def train_loop(config, config_inference, recorder, state=None):
         for eval_batch in eval_data_iterator:
           if 0 < config.eval_steps <= eval_step_count:
             break
-          with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+          with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
             eval_metrics = p_eval_step(state, eval_batch, rng)
           metric_logger.record_eval_metrics(step, metrics=eval_metrics)
           max_logging.log(f"Completed eval step {eval_step_count}")
@@ -940,7 +936,7 @@ def main(argv: Sequence[str]) -> None:
     raise ValueError("GRPO does not support setting per_device_batch_size < 1.0")
   jax.config.update("jax_use_shardy_partitioner", config.shardy)
   max_utils.print_system_information()
-  validate_train_config(config)
+  train_utils.validate_train_config(config)
   os.environ["TFDS_DATA_DIR"] = config.dataset_path
   vertex_tensorboard_manager = VertexTensorboardManager()
   if config.use_vertex_tensorboard or os.environ.get("UPLOAD_DATA_TO_TENSORBOARD"):

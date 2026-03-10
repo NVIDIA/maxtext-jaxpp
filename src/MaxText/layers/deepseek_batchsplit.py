@@ -12,309 +12,824 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# fmt: off
 
 """Alternative DeepSeek model definition with batch-split schedule."""
 
-from flax import linen as nn
+import functools
+import math
+from typing import Sequence
+
 import jax
 import jax.numpy as jnp
-from MaxText import common_types
-from MaxText.inference import page_manager
-from MaxText.layers import attention_mla
-from MaxText.layers import initializers
-from MaxText.layers import linears
-from MaxText.layers import moe
-from MaxText.layers import normalizations
+from maxtext.kernels import megablox
+from maxtext.kernels import sort_activations
+from MaxText.layers import attention_op
 from MaxText.layers import quantizations
 
 
-class DeepSeekGenericLayer(nn.Module):
-  """Generic DeepSeek layer with Multi-Head Latent Attention.
+def fetch_weights(params, dtype):
+  """Fetches weights from params in the proper format for batch-split schedule."""
+  return jax.tree.map(
+      lambda x: jnp.asarray(x[...], dtype),
+      (
+          (
+              (
+                  params["pre_self_attention_layer_norm"]["scale"],
+                  params["post_self_attention_layer_norm"]["scale"],
+              ),
+              (
+                  params["self_attention"]["wq_a"]["kernel"],
+                  params["self_attention"]["wq_b"]["kernel"],
+                  params["self_attention"]["q_norm"]["scale"],
+                  params["self_attention"]["wkv_a"]["kernel"],
+                  params["self_attention"]["wkv_b"]["kernel"],
+                  params["self_attention"]["kv_norm"]["scale"],
+                  params["self_attention"]["out"]["kernel"],
+              ),
+          ),
+          (
+              (
+                  params["DeepSeekMoeBlock_0"]["MoeBlock_0"]["gate"]["kernel"],
+                  params["DeepSeekMoeBlock_0"]["MoeBlock_0"]["gate"]["bias"],
+              ),
+              (
+                  params["DeepSeekMoeBlock_0"]["MoeBlock_0"]["wi_0"],
+                  params["DeepSeekMoeBlock_0"]["MoeBlock_0"]["wi_1"],
+                  params["DeepSeekMoeBlock_0"]["MoeBlock_0"]["wo"],
+              ),
+              (
+                  params["DeepSeekMoeBlock_0"]["shared_experts"]["wi_0"]["kernel"],
+                  params["DeepSeekMoeBlock_0"]["shared_experts"]["wi_1"]["kernel"],
+                  params["DeepSeekMoeBlock_0"]["shared_experts"]["wo"]["kernel"],
+              ),
+          ),
+      ),
+      is_leaf=lambda x: not isinstance(x, Sequence),
+  )
 
-  This is to be used as a base class for DeepSeek layers with dense/sparse MLPs.
 
-  This class follows a pattern of separating module creation from execution.
-  `*_layer()` methods (e.g., `attention_layer`) are factories for `nn.Module`s,
-  called in `setup()` to initialize sub-layers. The module instances are stored
-  in `*_op` attributes (e.g., `self.attention_op`). The corresponding methods
-  (e.g., `attention`) are called during execution in `__call__` and wrap the
-  `*_op` modules with logic like logical constraints. This keeps `__call__`
-  clean and readable.
-  """
+@jax.named_scope("deepseek_batchsplit_split")
+def split(x, split_factor=2):
+  """Splits the input into `split_factor` parts along the batch dimension."""
+  if split_factor == 1:
+    return [x]
+  if x is None:
+    return [None] * split_factor
+  else:
+    x = jnp.reshape(x, (-1, split_factor) + x.shape[1:])
+    return [x[:, i, ...] for i in range(split_factor)]
 
-  config: common_types.Config
-  mesh: jax.sharding.Mesh
-  model_mode: str
-  quant: None | quantizations.AqtQuantization = None
 
-  def __call__(
-      self,
-      inputs,
-      decoder_segment_ids,
-      decoder_positions,
-      deterministic,
-      model_mode,
-      previous_chunk=None,
-      page_state: None | page_manager.PageState = None,
-      slot: None | int = None,
-      kv_cache=None,
-      attention_metadata=None,
-  ):
-    x = self.with_logical_constraint(inputs)
-    x = jax.ad_checkpoint.checkpoint_name(x, "decoder_layer_input")
+@jax.named_scope("deepseek_batchsplit_merge")
+def merge(x, split_factor=2):
+  """Merges the input microbatches back into a single tensor."""
+  if split_factor == 1:
+    return x[0]
+  x = jnp.stack(x, axis=1)
+  return jnp.reshape(x, (-1,) + x.shape[2:])
 
-    x += self.attention(
-        self.pre_attention_norm(x),
-        decoder_segment_ids,
-        decoder_positions,
-        deterministic,
-        previous_chunk,
-        page_state,
-        slot,
-    )
 
-    x += self.mlp(self.post_attention_norm(x), deterministic)
-    x = self.dropout(x, deterministic)
-    return self.post_process(x, kv_cache)
+def batch_split_schedule(
+    inputs,
+    params,
+    positions,
+    segment_ids,
+    *,
+    model_mode,
+    mesh,
+    quant,
+    cfg,
+):
+  """Applies the DeepSeek MoE layer with batch-split schedule."""
+  activation_pspec = jax.sharding.PartitionSpec(
+      ("data", "fsdp", "fsdp_transpose", "expert", "context"),
+      None,
+      None,
+  )
+  xs = jax.shard_map(
+      functools.partial(split, split_factor=cfg.batch_split_factor),
+      mesh=mesh,
+      in_specs=activation_pspec,
+      out_specs=[activation_pspec] * cfg.batch_split_factor,
+  )(inputs)
+  dpos = split(positions, split_factor=cfg.batch_split_factor)
+  dseg = split(segment_ids, split_factor=cfg.batch_split_factor)
+  xs = [with_data_parallel_constraint(x, mesh) for x in xs]
+  xs = jax.ad_checkpoint.checkpoint_name(xs, "decoder_layer_input")
 
-  def setup(self):
-    self.pre_attention_norm_op = self.rms_norm_layer("pre_attention_layer_norm")
-    self.post_attention_norm_op = self.rms_norm_layer(
-        "post_attention_layer_norm"
-    )
-    self.attention_op = self.attention_layer()
-    self.mlp_op = self.mlp_layer()
-    self.dropout_op = self.dropout_layer()
+  attn_op = attention_op.AttentionOp(
+      config=cfg,
+      mesh=mesh,
+      attention_kernel=cfg.attention,
+      max_target_length=cfg.max_target_length,
+      max_prefill_predict_length=cfg.max_prefill_predict_length,
+      quant=quant,
+      kv_quant=quantizations.configure_kv_quant(cfg),
+      num_query_heads=cfg.num_query_heads,
+      num_kv_heads=cfg.num_kv_heads,
+      dropout_rate=cfg.dropout_rate,
+      dtype=cfg.dtype,
+      attention_type=cfg.attention_type,
+  )
+  norm_mla_ws, moe_ws = fetch_weights(params, cfg.dtype)
+  xs = mla_with_norms(
+      xs,
+      norm_mla_ws,
+      dpos,
+      dseg,
+      mesh=mesh,
+      model_mode=model_mode,
+      attn_op=attn_op,
+      normalization_layer_epsilon=cfg.normalization_layer_epsilon,
+      kv_lora_rank=cfg.kv_lora_rank,
+      qk_nope_head_dim=cfg.qk_nope_head_dim,
+      qk_rope_head_dim=cfg.qk_rope_head_dim,
+      rope_max_timescale=cfg.rope_max_timescale,
+      num_query_heads=cfg.num_query_heads,
+      max_position_embeddings=cfg.max_position_embeddings,
+      original_max_position_embeddings=cfg.original_max_position_embeddings,
+      beta_fast=cfg.beta_fast,
+      beta_slow=cfg.beta_slow,
+      rope_factor=cfg.rope_factor,
+      mscale=cfg.mscale,
+      dtype=cfg.dtype,
+  )
 
-  @property
-  def logical_axis_names(self):
-    if self.model_mode == common_types.MODEL_MODE_PREFILL:
-      return (
-          "activation_batch",
-          "prefill_activation_norm_length",
-          "activation_embed",
-      )
+  xs = moe(
+      xs,
+      moe_ws,
+      mesh=mesh,
+      num_experts=cfg.num_experts,
+      num_experts_per_tok=cfg.num_experts_per_tok,
+      routed_scaling_factor=cfg.routed_scaling_factor,
+      expert_axis_name="expert",
+      use_gather_mosaic_kernel=False,
+      wi_tile_size=(
+          cfg.wi_tile_fwd_batch_seq,
+          cfg.wi_tile_fwd_embed_dim,
+          cfg.wi_tile_fwd_mlp_dim,
+          cfg.wi_tile_dlhs_batch_seq,
+          cfg.wi_tile_dlhs_embed_dim,
+          cfg.wi_tile_dlhs_mlp_dim,
+          cfg.wi_tile_drhs_batch_seq,
+          cfg.wi_tile_drhs_embed_dim,
+          cfg.wi_tile_drhs_mlp_dim,
+      ),
+      wo_tile_size=(
+          cfg.wo_tile_fwd_batch_seq,
+          cfg.wo_tile_fwd_embed_dim,
+          cfg.wo_tile_fwd_mlp_dim,
+          cfg.wo_tile_dlhs_batch_seq,
+          cfg.wo_tile_dlhs_embed_dim,
+          cfg.wo_tile_dlhs_mlp_dim,
+          cfg.wo_tile_drhs_batch_seq,
+          cfg.wo_tile_drhs_embed_dim,
+          cfg.wo_tile_drhs_mlp_dim,
+      ),
+      dtype=cfg.dtype,
+  )
+  xs = jax.shard_map(
+      functools.partial(merge, split_factor=cfg.batch_split_factor),
+      mesh=mesh,
+      in_specs=([activation_pspec] * cfg.batch_split_factor,),
+      out_specs=activation_pspec,
+  )(xs)
+  return xs
+
+
+def staggered_call(fn, xs):
+  for i, x in enumerate(xs):
+    if i == len(xs) - 1:
+      xs[i] = fn(x)
     else:
-      return (
-          "activation_batch",
-          "activation_norm_length",
-          "activation_embed",
-      )
+      xs[i], xs[i + 1] = jax.lax.optimization_barrier((fn(x), xs[i + 1]))
+  return xs
 
-  def with_logical_constraint(self, x):
-    return nn.with_logical_constraint(x, self.logical_axis_names)
 
-  def rms_norm_layer(self, name):
-    return normalizations.rms_norm(
-        num_features=self.config.base_emb_dim,
-        dtype=self.config.dtype,
-        weight_dtype=self.config.weight_dtype,
-        name=name,
-        kernel_axes=("norm",),
-        epsilon=self.config.normalization_layer_epsilon,
+def with_data_parallel_constraint(x, mesh):
+  activation_pspec = jax.sharding.PartitionSpec(
+      ("data", "fsdp", "fsdp_transpose", "expert", "context"),
+      None,
+      None,
+  )
+  return jax.lax.with_sharding_constraint(x, jax.NamedSharding(mesh, activation_pspec))
+
+
+def dot(x, y, axes=1):
+  return jnp.tensordot(x, y, axes=axes)
+
+
+def mla_with_norms(
+    inputs,
+    weights,
+    decoder_positions,
+    decoder_segment_ids,
+    *,
+    mesh,
+    model_mode,
+    attn_op,
+    normalization_layer_epsilon,
+    kv_lora_rank,
+    qk_nope_head_dim,
+    qk_rope_head_dim,
+    rope_max_timescale,
+    num_query_heads,
+    max_position_embeddings,
+    original_max_position_embeddings,
+    beta_fast,
+    beta_slow,
+    rope_factor,
+    mscale,
+    dtype,
+):
+  """Performs MLA with pre- and post-normalization."""
+  (pre_attn_scale, post_attn_scale), attn_ws = weights
+
+  def fn(args):
+    x, dseg, dpos = args
+    y = rms_norm(
+        x,
+        pre_attn_scale,
+        epsilon=normalization_layer_epsilon,
+        dtype=dtype,
     )
-
-  def pre_attention_norm(self, x):
-    return self.with_logical_constraint(self.pre_attention_norm_op(x))
-
-  def post_attention_norm(self, x):
-    return self.with_logical_constraint(self.post_attention_norm_op(x))
-
-  def attention_layer(self):
-    inputs_shape = (
-        self.config.per_device_batch_size,
-        self.config.max_target_length,
-        self.config.base_emb_dim,
-    )
-    return attention_mla.mla_as_linen(
-        config=self.config,
-        num_query_heads=self.config.num_query_heads,
-        num_kv_heads=self.config.num_kv_heads,
-        head_dim=self.config.head_dim,
-        max_target_length=self.config.max_target_length,
-        max_prefill_predict_length=self.config.max_prefill_predict_length,
-        attention_kernel=self.config.attention,
-        attention_type=self.config.attention_type,
-        inputs_q_shape=inputs_shape,
-        inputs_kv_shape=inputs_shape,
-        mesh=self.mesh,
-        dtype=self.config.dtype,
-        weight_dtype=self.config.weight_dtype,
-        dropout_rate=self.config.dropout_rate,
-        name="self_attention",
-        quant=self.quant,
-        kv_quant=quantizations.configure_kv_quant(self.config),
-        q_lora_rank=self.config.q_lora_rank,
-        kv_lora_rank=self.config.kv_lora_rank,
-        qk_nope_head_dim=self.config.qk_nope_head_dim,
-        qk_rope_head_dim=self.config.qk_rope_head_dim,
-        v_head_dim=self.config.v_head_dim,
-        max_position_embeddings=self.config.max_position_embeddings,
-        original_max_position_embeddings=self.config.original_max_position_embeddings,
-        mscale=self.config.mscale,
-        rope_factor=self.config.rope_factor,
-        model_mode=self.model_mode,
-    )
-
-  def attention(
-      self,
-      x,
-      decoder_segment_ids,
-      decoder_positions,
-      deterministic,
-      previous_chunk=None,
-      page_state: None | page_manager.PageState = None,
-      slot: None | int = None,
-  ):
-    """Executes the attention layer."""
-    return self.with_logical_constraint(
-        self.attention_op(
-            x,
-            x,
-            decoder_positions,
-            decoder_segment_ids=decoder_segment_ids,
-            deterministic=deterministic,
-            model_mode=self.model_mode,
-            previous_chunk=previous_chunk,
-            page_state=page_state,
-            slot=slot,
-        )[0]
-    )
-
-  def mlp_layer(self):
-    raise NotImplementedError()
-
-  def mlp(self, x, deterministic):
-    raise NotImplementedError()
-
-  def dropout_layer(self):
-    return nn.Dropout(rate=self.config.dropout_rate, broadcast_dims=(-2,))
-
-  def dropout(self, x, deterministic):
-    return self.with_logical_constraint(
-        self.dropout_op(x, deterministic=deterministic)
-    )
-
-  def post_process(self, x, kv_cache=None):
-    """Collect statistics about the output of the layer."""
-    if self.config.record_internal_nn_metrics:
-      self.sow("intermediates", "activation_mean", jnp.mean(x))
-      self.sow("intermediates", "activation_stdev", jnp.std(x))
-      self.sow(
-          "intermediates",
-          "activation_fraction_zero",
-          jnp.sum(x == 0) / jnp.size(x),
-      )
-
-    if self.config.scan_layers:
-      return x, None
-    else:
-      return x, kv_cache
-
-
-class DeepSeekDenseLayer(DeepSeekGenericLayer):
-  """DeepSeek layer with dense MLP."""
-
-  def mlp_layer(self):
-    return linears.mlp_block(
-        in_features=self.config.base_emb_dim,
-        intermediate_dim=self.config.mlp_dim,
-        activations=self.config.mlp_activations,
-        intermediate_dropout_rate=self.config.dropout_rate,
-        dtype=self.config.dtype,
-        weight_dtype=self.config.weight_dtype,
-        name="mlp",
-        config=self.config,
-        quant=self.quant,
-        mesh=self.mesh,
-    )
-
-  def mlp(self, x, deterministic):
-    return self.with_logical_constraint(self.mlp_op(x, deterministic))
-
-
-class DeepSeekMoELayer(DeepSeekGenericLayer):
-  """DeepSeek MoE layer that uses a batch-split schedule."""
-
-  def __call__(
-      self,
-      inputs,
-      decoder_segment_ids,
-      decoder_positions,
-      deterministic,
-      model_mode,
-      previous_chunk=None,
-      page_state: None | page_manager.PageState = None,
-      slot: None | int = None,
-      kv_cache=None,
-      attention_metadata=None,
-      split_factor: int = 2,
-  ):
-    x = self.with_logical_constraint(inputs)
-    x = jax.ad_checkpoint.checkpoint_name(x, "decoder_layer_input")
-
-    # Helper functions.
-    def _split(x):
-      if x is None:
-        return [None] * split_factor
-      else:
-        return jnp.split(x, split_factor, axis=0)
-
-    def _merge(x):
-      return jnp.concatenate(x, axis=0)
-
-    def _attn(x, decoder_segment_ids, decoder_positions):
-      return self.attention(
-          self.pre_attention_norm(x),
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          previous_chunk,
-          page_state,
-          slot,
-      )
-
-    def _moe(x):
-      return self.mlp(self.post_attention_norm(x), deterministic)
-
-    # Split the inputs into micro-batches.
-    x = _split(x)
-    dpos = _split(decoder_positions)
-    dseg = _split(decoder_segment_ids)
-
-    # Attention.
-    x = [xi + _attn(xi, yi, zi) for xi, yi, zi in zip(x, dseg, dpos)]
-
-    # Mixture-of-experts.
-    x = [xi + _moe(xi) for xi in x]
-
-    # Merge the micro-batches back into a single batch.
-    x = _merge(x)
-
-    x = self.dropout(x, deterministic)
-    return self.post_process(x, kv_cache)
-
-  def init(self, *args, **kwargs):
-    # Calls the parent init method for testing parity.
-    return super().init(*args, **kwargs, method=super().__call__)
-
-  def mlp_layer(self):
-    # NOTE: the naming mismatch here is to ensure reverse compatibility with
-    # existing checkpoints. The `name` represents the weight name in
-    # JAX/checkpoints and so the class name is just for readability.
-    return moe.get_routed_and_shared_moe(
-        name="DeepSeekMoeBlock_0",
-        config=self.config,
-        mesh=self.mesh,
-        kernel_init=initializers.nd_dense_init(
-            1.0, "fan_in", "truncated_normal"
+    out = x + with_data_parallel_constraint(
+        mla(
+            y,
+            dpos,
+            dseg,
+            attn_ws,
+            model_mode=model_mode,
+            epsilon=normalization_layer_epsilon,
+            kv_lora_rank=kv_lora_rank,
+            kv_norm_epsilon=normalization_layer_epsilon,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            rope_theta=rope_max_timescale,
+            num_query_heads=num_query_heads,
+            max_position_embeddings=max_position_embeddings,
+            original_max_position_embeddings=original_max_position_embeddings,
+            beta_fast=beta_fast,
+            beta_slow=beta_slow,
+            rope_factor=rope_factor,
+            dtype=dtype,
+            mscale=mscale,
+            attention_op_fn=attn_op,
         ),
-        kernel_axes=("embed", None),
-        dtype=self.config.dtype,
-        weight_dtype=self.config.weight_dtype,
-        quant=self.quant,
+        mesh,
+    )
+    return out, rms_norm(
+        out,
+        post_attn_scale,
+        epsilon=normalization_layer_epsilon,
+        dtype=dtype,
     )
 
-  def mlp(self, x, _):
-    return self.with_logical_constraint(self.mlp_op(x))
+  return staggered_call(fn, list(zip(inputs, decoder_segment_ids, decoder_positions)))
+
+
+def mla(
+    inputs,
+    positions,
+    segment_ids,
+    weights,
+    *,
+    model_mode,
+    epsilon,
+    kv_lora_rank,
+    kv_norm_epsilon,
+    qk_nope_head_dim,
+    qk_rope_head_dim,
+    num_query_heads,
+    rope_theta,
+    max_position_embeddings,
+    original_max_position_embeddings,
+    beta_fast,
+    beta_slow,
+    rope_factor,
+    mscale,
+    attention_op_fn,
+    dtype,
+):
+  """Performs MLA."""
+  (
+      wq_a_weights,
+      wq_b_weights,
+      q_norm_scale_weights,
+      wkv_a_weights,
+      wkv_b_weights,
+      kv_norm_scale_weights,
+      out_weights,
+  ) = weights
+  query = query_projection(
+      inputs,
+      positions,
+      wq_a_weights,
+      wq_b_weights,
+      q_norm_scale_weights,
+      epsilon=epsilon,
+      qk_rope_head_dim=qk_rope_head_dim,
+      rope_theta=rope_theta,
+      max_position_embeddings=max_position_embeddings,
+      original_max_position_embeddings=original_max_position_embeddings,
+      beta_fast=beta_fast,
+      beta_slow=beta_slow,
+      rope_factor=rope_factor,
+      dtype=dtype,
+      qk_nope_head_dim=qk_nope_head_dim,
+      mscale=mscale,
+  )
+  key, value = kv_projection(
+      inputs,
+      positions,
+      wkv_a_weights,
+      wkv_b_weights,
+      kv_norm_scale_weights,
+      kv_lora_rank=kv_lora_rank,
+      kv_norm_epsilon=kv_norm_epsilon,
+      qk_rope_head_dim=qk_rope_head_dim,
+      rope_theta=rope_theta,
+      max_position_embeddings=max_position_embeddings,
+      original_max_position_embeddings=original_max_position_embeddings,
+      beta_fast=beta_fast,
+      beta_slow=beta_slow,
+      rope_factor=rope_factor,
+      dtype=dtype,
+      qk_nope_head_dim=qk_nope_head_dim,
+      num_query_heads=num_query_heads,
+  )
+  out = attention_op_fn(
+      query,
+      key,
+      value,
+      segment_ids,
+      model_mode,
+      cached_values=[None, None],
+  )
+  out = dot(out, out_weights, axes=2)
+  return out
+
+
+def query_projection(
+    inputs_q,
+    inputs_positions,
+    wq_a_weights,
+    wq_b_weights,
+    q_norm_scale_weights,
+    *,
+    epsilon,
+    qk_nope_head_dim,
+    qk_rope_head_dim,
+    rope_theta,
+    max_position_embeddings,
+    original_max_position_embeddings,
+    beta_fast,
+    beta_slow,
+    rope_factor,
+    dtype,
+    mscale,
+):
+  """Performs query projection."""
+  # Set softmax scaling.
+  qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+  softmax_scale = qk_head_dim**-0.5
+  if max_position_embeddings > original_max_position_embeddings:
+    m = 0.1 * mscale * math.log(rope_factor) + 1.0
+    softmax_scale = softmax_scale * m * m
+
+  # LoRA path
+  low_rank_q = dot(inputs_q, wq_a_weights)
+  low_rank_q = rms_norm(
+      low_rank_q,
+      q_norm_scale_weights,
+      epsilon=epsilon,
+      dtype=dtype,
+  )
+  q = dot(low_rank_q, wq_b_weights)
+
+  # Split into non-positional and rotary parts.
+  q_nope, q_pe = jnp.split(q, [qk_nope_head_dim], axis=-1)
+  q_pe = yarn(
+      q_pe,
+      inputs_positions,
+      embedding_dims=qk_rope_head_dim,
+      rope_theta=rope_theta,
+      max_position_embeddings=max_position_embeddings,
+      original_max_position_embeddings=original_max_position_embeddings,
+      beta_fast=beta_fast,
+      beta_slow=beta_slow,
+      rope_factor=rope_factor,
+      fprop_dtype=dtype,
+  )
+  query = jnp.concatenate([q_nope, q_pe], axis=-1) * softmax_scale
+  return query
+
+
+def kv_projection(
+    inputs,
+    inputs_positions,
+    wkv_a_weights,
+    wkv_b_weights,
+    kv_norm_scale_weights,
+    *,
+    kv_lora_rank,
+    kv_norm_epsilon,
+    qk_rope_head_dim,
+    rope_theta,
+    max_position_embeddings,
+    original_max_position_embeddings,
+    beta_fast,
+    beta_slow,
+    rope_factor,
+    dtype,
+    qk_nope_head_dim,
+    num_query_heads,
+):
+  """Performs KV projection."""
+  low_rank = dot(inputs, wkv_a_weights)
+  low_rank_main, low_rank_rope = jnp.split(low_rank, [kv_lora_rank], axis=-1)
+  low_rank_main = rms_norm(
+      low_rank_main,
+      kv_norm_scale_weights,
+      epsilon=kv_norm_epsilon,
+      dtype=dtype,
+  )
+  key_rope = jnp.expand_dims(low_rank_rope, axis=2)
+  key_rope = yarn(
+      key_rope,
+      inputs_positions,
+      embedding_dims=qk_rope_head_dim,
+      rope_theta=rope_theta,
+      max_position_embeddings=max_position_embeddings,
+      original_max_position_embeddings=original_max_position_embeddings,
+      beta_fast=beta_fast,
+      beta_slow=beta_slow,
+      rope_factor=rope_factor,
+      fprop_dtype=dtype,
+  )
+
+  return get_key_value(
+      low_rank_main,
+      key_rope,
+      wkv_b_weights,
+      qk_nope_head_dim=qk_nope_head_dim,
+      num_query_heads=num_query_heads,
+  )
+
+
+def get_key_value(low_rank_main, key_rope, wkv_b_weights, *, qk_nope_head_dim, num_query_heads):
+  """Gets key and value from compressed KV latent vector and key rope."""
+  kv_out = dot(low_rank_main, wkv_b_weights)
+
+  # Split kv_out into key_nope and value parts.
+  key_nope, value = jnp.split(kv_out, [qk_nope_head_dim], axis=-1)
+  key_rope = jnp.broadcast_to(
+      key_rope,
+      (
+          key_nope.shape[0],
+          key_nope.shape[1],
+          num_query_heads,
+          key_rope.shape[3],
+      ),
+  )
+
+  key = jnp.concatenate([key_nope, key_rope], axis=-1)
+
+  return key, value
+
+
+def rms_norm(x, scale, *, epsilon, dtype):
+  """RMS normalization."""
+  x = jnp.asarray(x, jnp.float32)
+  mean2 = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
+  y = jnp.asarray(x * jax.lax.rsqrt(mean2 + epsilon), dtype)
+  return jnp.einsum("i...k,...k->i...k", y, scale)
+
+
+def yarn(
+    inputs,
+    positions,
+    *,
+    embedding_dims,
+    rope_theta,
+    max_position_embeddings,
+    original_max_position_embeddings,
+    beta_fast,
+    beta_slow,
+    rope_factor,
+    fprop_dtype,
+):
+  """Performs YaRN rotary embedding."""
+  # Initialize the swap and negate mask.
+  indices = jnp.arange(embedding_dims)
+  # [1, 0, 3, 2, 5, 4, ...]
+  swap_indices = jnp.where(indices % 2 == 0, indices + 1, indices - 1)
+  negation_mask = jnp.where(indices % 2 == 0, -1, 1)
+  identity = jnp.eye(embedding_dims, dtype=jnp.int32)
+  pairwise_swap_and_negate_mask = identity[swap_indices] * negation_mask
+
+  # Calculate the frequencies.
+  half_dim = embedding_dims // 2
+  # Compute base frequencies for each (even-indexed) dimension.
+  # (Note: We use jnp.arange with float32 for precision.)
+  freqs = 1.0 / (rope_theta ** (2.0 * jnp.arange(0, half_dim, dtype=jnp.float32) / embedding_dims))
+
+  low = (
+      embedding_dims * math.log(original_max_position_embeddings / (beta_fast * 2 * math.pi)) / (2 * math.log(rope_theta))
+  )
+  high = (
+      embedding_dims * math.log(original_max_position_embeddings / (beta_slow * 2 * math.pi)) / (2 * math.log(rope_theta))
+  )
+  low = max(math.floor(low), 0)
+  high = min(math.ceil(high), embedding_dims - 1)
+  diff = high - low if high > low else 0.001
+  linear_func = (jnp.arange(half_dim, dtype=jnp.float32) - low) / diff
+  smooth = 1 - jnp.clip(linear_func, 0, 1)
+  # The corrected frequency is a weighted mix of the scaled and base values.
+  freqs = freqs / rope_factor * (1 - smooth) + freqs * smooth
+
+  # Precompute frequencies for all positions by taking the outer product.
+  t = jnp.arange(max_position_embeddings, dtype=jnp.float32)  # shape [max_position_embeddings]
+  # This gives a [max_position_embeddings, half_dim] tensor with rows as time steps.
+  freqs = jnp.outer(t, freqs)
+
+  # Lookup the precomputed frequencies using the position indices.
+  # self.freqs has shape [max_position_embeddings, half_dim] so we use jnp.take along axis 0.
+  # After indexing, shape becomes [B, S, half_dim]; we then add an axis for the heads.
+  freqs = jnp.take(freqs, positions, axis=0)  # shape: [B, S, half_dim]
+  freqs = freqs[:, :, jnp.newaxis, :]  # shape: [B, S, 1, half_dim]
+  freqs = jnp.repeat(freqs, 2, axis=-1)  # shape: [B, S, 1, embedding_dims]
+  # inputs @ mask: [B, S, N, embedding_dims] @ [embedding_dims, embedding_dims] -> [B, S, N, embedding_dims]
+  output = inputs * jnp.cos(freqs) + jnp.matmul(inputs, pairwise_swap_and_negate_mask) * jnp.sin(freqs)
+  return output.astype(fprop_dtype)
+
+
+def moe(
+    inputs,
+    weights,
+    *,
+    mesh,
+    num_experts,
+    num_experts_per_tok,
+    routed_scaling_factor,
+    expert_axis_name,
+    use_gather_mosaic_kernel,
+    wi_tile_size,
+    wo_tile_size,
+    dtype,
+):
+  """Performs dropless MoE with tensor/expert parallelism."""
+  xs, ys = list(zip(*inputs))
+  ys = with_data_parallel_constraint(
+      process_activations(
+          ys,
+          weights,
+          mesh=mesh,
+          num_experts=num_experts,
+          num_experts_per_tok=num_experts_per_tok,
+          routed_scaling_factor=routed_scaling_factor,
+          expert_axis_name=expert_axis_name,
+          use_gather_mosaic_kernel=use_gather_mosaic_kernel,
+          wi_tile_size=wi_tile_size,
+          wo_tile_size=wo_tile_size,
+          dtype=dtype,
+      ),
+      mesh,
+  )
+  return [x + y for x, y in zip(xs, ys)]
+
+
+def expert_indices_and_weights(
+    gate_logits: jax.Array,
+    pre_bias_logits: jax.Array,
+    num_experts_per_tok: int,
+    routed_scaling_factor: float,
+) -> tuple[jax.Array, jax.Array]:
+  """Computes expert indices for each token and their corresponding weights."""
+  _, indices = jax.lax.top_k(
+      gate_logits,
+      k=num_experts_per_tok,
+  )
+  weights = jnp.take_along_axis(pre_bias_logits, indices, axis=-1)
+  weights = routed_scaling_factor * (weights / weights.sum(-1, keepdims=True))
+  return indices, weights
+
+
+def expert_selection(
+    x,
+    routing_kernel,
+    routing_bias,
+    *,
+    num_experts,
+    num_experts_per_tok,
+    routed_scaling_factor,
+):
+  """Selects experts for each token and calculates group sizes for each expert."""
+  pre_bias_logits = jax.nn.sigmoid(dot(x, routing_kernel))
+  logits = pre_bias_logits + routing_bias
+
+  selected_experts, weights = expert_indices_and_weights(
+      logits,
+      pre_bias_logits,
+      num_experts_per_tok=num_experts_per_tok,
+      routed_scaling_factor=routed_scaling_factor,
+  )
+  group_sizes = jnp.bincount(jnp.ravel(selected_experts), length=num_experts)
+  return selected_experts, weights, group_sizes
+
+
+def route(
+    x,
+    selected_experts,
+    weights,
+    group_sizes,
+    *,
+    expert_axis_name,
+    use_gather_mosaic_kernel,
+):
+  """All-gather tokens and then perform local routing."""
+  # Communicate local results across the expert axis.
+  x = jax.lax.all_gather(x, axis_name=expert_axis_name, tiled=True)
+  weights = jax.lax.all_gather(weights, axis_name=expert_axis_name, tiled=True)
+  selected_experts = jax.lax.all_gather(selected_experts, axis_name=expert_axis_name, tiled=True)
+  group_sizes = jax.lax.psum(group_sizes, axis_name=expert_axis_name)
+
+  # Sort the gathered tokens and weights.
+  weights = jnp.ravel(weights)[jnp.argsort(jnp.ravel(selected_experts))]
+  x = sort_activations.route(
+      x,
+      selected_experts,
+      use_custom_mosaic_kernel=use_gather_mosaic_kernel,
+  )
+
+  return x, selected_experts, weights, group_sizes
+
+
+def unroute(
+    x,
+    selected_experts,
+    *,
+    expert_axis_name,
+    use_gather_mosaic_kernel,
+):
+  """Undo `route()`."""
+  # Unsort the output.
+  x = sort_activations.unroute(
+      x,
+      selected_experts,
+      use_custom_mosaic_kernel=use_gather_mosaic_kernel,
+  )
+
+  # Sum across expert shards.
+  return jax.lax.psum_scatter(x, expert_axis_name, scatter_dimension=0, tiled=True)
+
+
+def compute(x, w0, w1, wo, group_sizes, weights, *, wi_tile_size, wo_tile_size, dtype):
+  """Processes routed tokens through the MLP."""
+  gmm_fn = functools.partial(
+      megablox.gmm,
+      group_sizes=group_sizes,
+      preferred_element_type=dtype,
+  )
+  layer_w0 = gmm_fn(x, w0, tiling=wi_tile_size)
+  layer_w1 = gmm_fn(x, w1, tiling=wi_tile_size)
+  intermediate_layer = jax.nn.silu(layer_w0) * layer_w1
+  intermediate_layer *= weights[:, None]
+  return gmm_fn(intermediate_layer, wo, tiling=wo_tile_size)
+
+
+def route_compute_unroute(
+    xs,
+    weights,
+    *,
+    num_experts,
+    num_experts_per_tok,
+    routed_scaling_factor,
+    expert_axis_name,
+    use_gather_mosaic_kernel,
+    wi_tile_size,
+    wo_tile_size,
+    dtype,
+):
+  """Routes, processes, and unroutes activations."""
+  orig_shape = xs[0].shape
+  (
+      (gate_kernel, gate_bias),
+      (routed_w0, routed_w1, routed_wo),
+      (shared_w0, shared_w1, shared_wo),
+  ) = weights
+
+  def route_fn(inputs):
+    # Shared expert.
+    y = dot(jax.nn.silu(dot(inputs, shared_w0)) * dot(inputs, shared_w1), shared_wo)
+
+    inputs = jnp.reshape(inputs, (-1, inputs.shape[-1]))
+    selected_experts, weights, group_sizes = expert_selection(
+        inputs,
+        gate_kernel,
+        gate_bias,
+        num_experts=num_experts,
+        num_experts_per_tok=num_experts_per_tok,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+    x, selected_experts, weights, group_sizes = route(
+        inputs,
+        selected_experts,
+        weights,
+        group_sizes,
+        expert_axis_name=expert_axis_name,
+        use_gather_mosaic_kernel=use_gather_mosaic_kernel,
+    )
+    return x, y, selected_experts, weights, group_sizes
+
+  def compute_fn(inputs):
+    x, y, selected_experts, weights, group_sizes = inputs
+    x = compute(
+        x,
+        routed_w0,
+        routed_w1,
+        routed_wo,
+        group_sizes,
+        weights,
+        wi_tile_size=wi_tile_size,
+        wo_tile_size=wo_tile_size,
+        dtype=dtype,
+    )
+    return x, y, selected_experts
+
+  def unroute_fn(inputs):
+    x, y, selected_experts = inputs
+    x = unroute(
+        x,
+        selected_experts,
+        expert_axis_name=expert_axis_name,
+        use_gather_mosaic_kernel=use_gather_mosaic_kernel,
+    )
+    return jnp.reshape(x, orig_shape) + y
+
+  xs = staggered_call(route_fn, xs)
+  xs = staggered_call(compute_fn, xs)
+  xs = staggered_call(unroute_fn, xs)
+  return xs
+
+
+def process_activations(
+    xs,
+    weights,
+    *,
+    mesh,
+    num_experts,
+    num_experts_per_tok,
+    routed_scaling_factor,
+    expert_axis_name,
+    use_gather_mosaic_kernel,
+    wi_tile_size,
+    wo_tile_size,
+    dtype,
+):
+  """Processes activations, which are fully sharded on the batch axis, with tensor/expert sharded weights."""
+  activation_pspec = jax.sharding.PartitionSpec(
+      ("data", "fsdp", "fsdp_transpose", "expert", "context"),
+      None,
+      None,
+  )
+  gating_pspec, linear_pspec = (
+      jax.sharding.PartitionSpec(None, None, expert_axis_name),
+      jax.sharding.PartitionSpec(None, expert_axis_name, None),
+  )
+
+  return jax.shard_map(
+      functools.partial(
+          route_compute_unroute,
+          num_experts=num_experts,
+          num_experts_per_tok=num_experts_per_tok,
+          routed_scaling_factor=routed_scaling_factor,
+          expert_axis_name=expert_axis_name,
+          use_gather_mosaic_kernel=use_gather_mosaic_kernel,
+          wi_tile_size=wi_tile_size,
+          wo_tile_size=wo_tile_size,
+          dtype=dtype,
+      ),
+      mesh=mesh,
+      in_specs=(
+          [activation_pspec] * len(xs),
+          (
+              (
+                  jax.sharding.PartitionSpec(None, None),
+                  jax.sharding.PartitionSpec(None),
+              ),
+              (
+                  gating_pspec,
+                  gating_pspec,
+                  linear_pspec,
+              ),
+              (
+                  jax.sharding.PartitionSpec(None, None),
+                  jax.sharding.PartitionSpec(None, None),
+                  jax.sharding.PartitionSpec(None, None),
+              ),
+          ),
+      ),
+      out_specs=activation_pspec,
+      check_vma=False,
+  )([x.astype(dtype) for x in xs], weights)

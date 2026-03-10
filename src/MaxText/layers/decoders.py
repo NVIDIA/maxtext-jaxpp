@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""""Module for decoder layers."""
+"""Module for decoder layers"""
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
 
@@ -23,7 +23,7 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import Mesh
 
 from flax import linen as nn
 from flax import nnx
@@ -31,14 +31,11 @@ from flax.linen.partitioning import ScanIn
 
 from MaxText.common_types import DecoderBlockType, ShardMode, Config, EP_AS_CONTEXT
 from MaxText.common_types import MODEL_MODE_TRAIN, MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE
-from MaxText import max_logging
-from MaxText import max_utils
-from MaxText.inference import page_manager
+from MaxText.sharding import create_sharding
 from MaxText.layers import linears
+from MaxText.layers import normalizations
 from MaxText.layers import quantizations
 from MaxText.layers import pipeline
-from MaxText import maxtext_utils
-from MaxText import multimodal_utils
 from MaxText import sharding
 from MaxText.layers.attentions import attention_as_linen
 from MaxText.layers.normalizations import rms_norm
@@ -46,7 +43,6 @@ from MaxText.layers.embeddings import attend_on_embedding, embed_as_linen, posit
 from MaxText.layers.quantizations import AqtQuantization as Quant
 from MaxText.layers import (
     deepseek,
-    deepseek_batchsplit,
     gemma,
     gemma2,
     gemma3,
@@ -58,7 +54,13 @@ from MaxText.layers import (
     mixtral,
     qwen3,
     simple_layer,
+    olmo3,
 )
+from maxtext.inference import page_manager
+from maxtext.multimodal import utils as mm_utils
+from maxtext.utils import max_logging
+from maxtext.utils import max_utils
+from maxtext.utils import maxtext_utils
 
 import jaxpp
 from packaging.version import Version
@@ -100,6 +102,7 @@ class DecoderLayer(nn.Module):
         sharding.maybe_shard_with_logical,
         mesh=mesh,
         shard_mode=cfg.shard_mode,
+        debug_sharding=cfg.debug_sharding,
     )
 
     if self.model_mode == MODEL_MODE_PREFILL:
@@ -152,6 +155,8 @@ class DecoderLayer(nn.Module):
         ar_cache_axis_order=tuple(map(int, cfg.ar_cache_axis_order.split(","))),
         compute_axis_order=tuple(map(int, cfg.compute_axis_order.split(","))),
         reshape_q=cfg.reshape_q,
+        use_mrope=cfg.use_mrope,
+        mrope_section=cfg.mrope_section,
         model_mode=model_mode,
     )
 
@@ -407,10 +412,10 @@ class Decoder(nn.Module):
       case DecoderBlockType.MIXTRAL:
         return [mixtral.MixtralDecoderLayerToLinen]
       case DecoderBlockType.DEEPSEEK:
-        if self.config.use_batch_split_schedule:
-          return [deepseek_batchsplit.DeepSeekDenseLayer, deepseek_batchsplit.DeepSeekMoELayer]
-        else:
-          return [deepseek.DeepSeekDenseLayer, deepseek.DeepSeekMoELayer]
+        return [
+            deepseek.DeepSeekDenseLayerToLinen,
+            deepseek.DeepSeekMoELayerToLinen,
+        ]
       case DecoderBlockType.GEMMA:
         return [gemma.GemmaDecoderLayerToLinen]
       case DecoderBlockType.GEMMA2:
@@ -418,7 +423,7 @@ class Decoder(nn.Module):
       case DecoderBlockType.GEMMA3:
         return [gemma3.Gemma3DecoderLayerToLinen]
       case DecoderBlockType.GPT3:
-        return [gpt3.Gpt3DecoderLayer]
+        return [gpt3.Gpt3DecoderLayerToLinen]
       case DecoderBlockType.GPT_OSS:
         return [gpt_oss.GptOssScannableBlockToLinen] if self.config.scan_layers else [gpt_oss.GptOssDecoderLayerToLinen]
       case DecoderBlockType.QWEN3:
@@ -433,6 +438,9 @@ class Decoder(nn.Module):
         return [simple_layer.SimpleMlpDecoderLayerToLinen]
       case DecoderBlockType.LLAMA4:
         return [llama4.Llama4ScannableBlockToLinen] if self.config.scan_layers else [llama4.Llama4DecoderLayerToLinen]
+      case DecoderBlockType.OLMO3:
+        return [olmo3.Olmo3ScannableBlockToLinen] if self.config.scan_layers else [olmo3.Olmo3DecoderLayerToLinen]
+
       case _:
         # Default case to handle any unknown decoder block types.
         raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
@@ -478,15 +486,19 @@ class Decoder(nn.Module):
         DecoderBlockType.GEMMA3,
         DecoderBlockType.QWEN3,
         DecoderBlockType.QWEN3_MOE,
-        DecoderBlockType.QWEN3_NEXT,
         DecoderBlockType.GPT_OSS,
         DecoderBlockType.SIMPLE,
         DecoderBlockType.SIMPLE_MLP,
         DecoderBlockType.LLAMA4,
+        DecoderBlockType.OLMO3,
     ):
       return functools.partial(rms_norm, num_features=num_features, shard_mode=self.config.shard_mode)
     elif self.config.decoder_block == DecoderBlockType.GPT3:
       return functools.partial(gpt3.gpt3_layer_norm, num_features=num_features, reductions_in_fp32=False, use_bias=True)
+    elif self.config.decoder_block == DecoderBlockType.QWEN3_NEXT:
+      return functools.partial(
+          normalizations.Qwen3NextRMSNormLinen, num_features=num_features, shard_mode=self.config.shard_mode
+      )
     else:
       raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
 
@@ -563,6 +575,8 @@ class Decoder(nn.Module):
       image_embeddings=None,
       bidirectional_mask=None,
       image_masks=None,
+      audio_embeddings=None,
+      audio_masks=None,
   ):
     """Applies token and positional embeddings to the input tokens."""
     cfg = self.config
@@ -579,21 +593,32 @@ class Decoder(nn.Module):
           "llama4-17b-128e",
           "qwen3-omni-30b-a3b",
       ]:
-        y = multimodal_utils.merge_mm_embeddings(
+        y = mm_utils.merge_mm_embeddings(
             text_embeddings=y,
-            vision_embeddings=image_embeddings,
+            multimodal_embeddings=image_embeddings,
             mask=bidirectional_mask,
-            image_masks=image_masks,
+            token_masks=image_masks,
         )
       # TODO(hengtaoguo): Add support for other multimodal models such as Llama4, refactor if needed
       else:
         raise ValueError(f"Unsupported model_name for multimodal: {cfg.model_name}")
 
+    if audio_embeddings is not None and cfg.use_audio:
+      if cfg.model_name in ["qwen3-omni-30b-a3b"]:
+        y = mm_utils.merge_mm_embeddings(
+            text_embeddings=y,
+            multimodal_embeddings=audio_embeddings,
+            mask=audio_masks,
+            token_masks=None,
+        )
+      else:
+        raise ValueError(f"Unsupported model_name for audio: {cfg.model_name}")
+
     y = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2,))(y, deterministic=deterministic)
     y = y.astype(cfg.dtype)
 
     if cfg.use_untrainable_positional_embedding:
-      y = positional_embedding_as_linen(embedding_dims=cfg.base_emb_dim)(y, decoder_positions)
+      y += positional_embedding_as_linen(embedding_dims=cfg.base_emb_dim)(y.shape[1], decoder_positions)
 
     if cfg.trainable_position_size > 0:
       y += embed_as_linen(
@@ -604,7 +629,7 @@ class Decoder(nn.Module):
           name="position_embedder",
           config=cfg,
           mesh=self.mesh,
-      )(decoder_positions, model_mode=model_mode)
+      )(decoder_positions.astype("int32"), model_mode=model_mode)
     return y
 
   @nn.compact
@@ -613,16 +638,7 @@ class Decoder(nn.Module):
 
     cfg = self.config
     if cfg.shard_mode == ShardMode.EXPLICIT:
-      norm_out_sharding = NamedSharding(
-          self.mesh,
-          nn.logical_to_mesh_axes(
-              (
-                  "activation_batch",
-                  "activation_length_no_exp",
-                  "activation_embed",
-              )
-          ),
-      )
+      norm_out_sharding = create_sharding(self.mesh, ("activation_batch", "activation_length_no_exp", "activation_embed"))
     else:
       norm_out_sharding = None
 
@@ -637,17 +653,10 @@ class Decoder(nn.Module):
     y = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2,))(y, deterministic=deterministic)
 
     if model_mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
-      out_sharding = NamedSharding(self.mesh, nn.logical_to_mesh_axes((None, None, "activation_vocab")))
+      out_sharding = create_sharding(self.mesh, (None, None, "activation_vocab"))
     else:
-      out_sharding = NamedSharding(
-          self.mesh,
-          nn.logical_to_mesh_axes(
-              (
-                  "activation_embed_and_logits_batch",
-                  "activation_length_no_exp",
-                  "activation_vocab",
-              )
-          ),
+      out_sharding = create_sharding(
+          self.mesh, ("activation_embed_and_logits_batch", "activation_length_no_exp", "activation_vocab")
       )
 
     # [batch, length, emb_dim] -> [batch, length, vocab_size]
@@ -689,6 +698,7 @@ class Decoder(nn.Module):
 
     return logits
 
+  # TODO(aireenmei, Hengtaoguo): consolidate all multimodal inputs into a class as input to the encoder
   @nn.compact
   def __call__(
       self,
@@ -706,6 +716,8 @@ class Decoder(nn.Module):
       image_masks: None | jnp.ndarray = None,
       kv_caches: list[jax.Array] | None = None,
       attention_metadata=None,
+      audio_embeddings: None | jnp.ndarray = None,
+      audio_masks: None | jnp.ndarray = None,
   ):
     cfg = self.config
     mesh = self.mesh
@@ -721,6 +733,8 @@ class Decoder(nn.Module):
         image_embeddings,
         bidirectional_mask,
         image_masks,
+        audio_embeddings,
+        audio_masks,
     )
 
     policy = self.get_remat_policy()
@@ -734,11 +748,11 @@ class Decoder(nn.Module):
     )
     if cfg.using_pipeline_parallelism and not cfg.use_jaxpp:
       if cfg.pipeline_fsdp_ag_once:
-        partition_spec = self.pipeline_module.get_weight_sharding(
+        logical_partition_spec = self.pipeline_module.get_weight_sharding(
             y, decoder_segment_ids, decoder_positions, deterministic, model_mode
         )
       else:
-        partition_spec = None  # This partition spec is only used for the fsdp_ag_once feature.
+        logical_partition_spec = None  # This partition spec is only used for the fsdp_ag_once feature.
       if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
         assert len(RemattedBlockLayers) == 2, "Scanned layers must have a length of 2 using deepseek."
         dense_layer = RemattedBlockLayers[0]
@@ -767,9 +781,9 @@ class Decoder(nn.Module):
                 in_axes_tuple=(nn.broadcast,) * len(broadcast_args),
                 model_mode=model_mode,
             )(y, *broadcast_args)
-        y = self.pipeline_module(y, *broadcast_args, partition_spec=partition_spec)
+        y = self.pipeline_module(y, *broadcast_args, logical_partition_spec=logical_partition_spec)
       else:  # Not DeepSeek
-        y = self.pipeline_module(y, *broadcast_args, partition_spec=partition_spec)
+        y = self.pipeline_module(y, *broadcast_args, logical_partition_spec=logical_partition_spec)
         remaining_layers = self.config.num_decoder_layers - self.config.pipeline_parallel_layers
         if remaining_layers > 0:
           logical_axis_rules_pp_as_dp = sharding.logical_axis_rules_pp_act_as_dp(self.config.logical_axis_rules)
@@ -948,11 +962,21 @@ class Decoder(nn.Module):
     # After the final transformer layer, `y` holds the raw, un-normalized hidden state.
     hidden_state = y
 
+    # When initializing with vLLM RPA attention, we need to run the output head to
+    # initialize any parameters associated with it.
+    if self.is_initializing() and cfg.attention == "vllm_rpa":
+      _ = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
+
+    # When invoking from vLLM with RPA attention, logit computation is deferred to a later stage.
+    if cfg.attention == "vllm_rpa":
+      logits = None
+
     # When vocab tiling is enabled in training mode, full logits won't generate to reduce memory
     # Instead, we keep track on the hidden states, which has smaller size compared to full logits
-    if cfg.num_vocab_tiling > 1 and self.model_mode == MODEL_MODE_TRAIN:
+    elif cfg.num_vocab_tiling > 1 and self.model_mode == MODEL_MODE_TRAIN:
       logits = None
       self.sow("intermediates", "hidden_states", hidden_state)
+
     else:
       logits = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
 

@@ -16,7 +16,66 @@
 """RL Utils Module."""
 import re
 import optax
-from MaxText import max_logging
+from maxtext.utils import max_logging
+
+
+# Constants for normalization
+SUBSTITUTIONS = [
+    ("an ", ""),
+    ("a ", ""),
+    (".$", "$"),
+    ("\\$", ""),
+    (r"\ ", ""),
+    (" ", ""),
+    ("mbox", "text"),
+    (",\\text{and}", ","),
+    ("\\text{and}", ","),
+    ("\\text{m}", "\\text{}"),
+]
+
+REMOVED_EXPRESSIONS = [
+    "square",
+    "ways",
+    "integers",
+    "dollars",
+    "mph",
+    "inches",
+    "hours",
+    "km",
+    "units",
+    "\\ldots",
+    "sue",
+    "points",
+    "feet",
+    "minutes",
+    "digits",
+    "cents",
+    "degrees",
+    "cm",
+    "gm",
+    "pounds",
+    "meters",
+    "meals",
+    "edges",
+    "students",
+    "childrentickets",
+    "multiples",
+    "\\text{s}",
+    "\\text{.}",
+    "\\text{\ns}",
+    "\\text{}^2",
+    "\\text{}^3",
+    "\\text{\n}",
+    "\\text{}",
+    r"\mathrm{th}",
+    r"^\circ",
+    r"^{\circ}",
+    r"\;",
+    r",\!",
+    "{,}",
+    '"',
+    "\\dots",
+]
 
 
 # Let's define a RegEx for checking whether the format matches.
@@ -32,7 +91,7 @@ def get_match_format_regex(tmvp_config):
       ),
       flags=re.MULTILINE | re.DOTALL,
   )
-  if tmvp_config.debug["rl"]:
+  if tmvp_config.debug.rl:
     match_format.search(
         f"{tmvp_config.reasoning_start_token}Let me"
         f" think!{tmvp_config.reasoning_end_token}{tmvp_config.solution_start_token}2{tmvp_config.solution_end_token}",
@@ -90,6 +149,47 @@ def match_format_approximately(prompts, completions, tmvp_config, **kargs):
   return scores
 
 
+def normalize_final_answer(final_answer: str) -> str:
+  """Normalize a final answer to a quantitative reasoning question.
+
+  Args:
+      final_answer: The answer string to normalize
+
+  Returns:
+      Normalized answer string
+  """
+  final_answer = final_answer.split("=")[-1]
+
+  # Apply substitutions and removals
+  for before, after in SUBSTITUTIONS:
+    final_answer = final_answer.replace(before, after)
+  for expr in REMOVED_EXPRESSIONS:
+    final_answer = final_answer.replace(expr, "")
+
+  # Extract and normalize LaTeX math
+  final_answer = re.sub(r"(.*?)(\$)(.*?)(\$)(.*)", "$\\3$", final_answer)
+  final_answer = re.sub(r"(\\text\{)(.*?)(\})", "\\2", final_answer)
+  final_answer = re.sub(r"(\\textbf\{)(.*?)(\})", "\\2", final_answer)
+  final_answer = re.sub(r"(\\overline\{)(.*?)(\})", "\\2", final_answer)
+  final_answer = re.sub(r"(\\boxed\{)(.*)(\})", "\\2", final_answer)
+
+  # Normalize shorthand TeX:
+  #  \fracab -> \frac{a}{b}
+  #  \frac{abc}{bef} -> \frac{abc}{bef}
+  #  \fracabc -> \frac{a}{b}c
+  #  \sqrta -> \sqrt{a}
+  #  \sqrtab -> sqrt{a}b
+  final_answer = re.sub(r"(frac)([^{])(.)", "frac{\\2}{\\3}", final_answer)
+  final_answer = re.sub(r"(sqrt)([^{])", "sqrt{\\2}", final_answer)
+  final_answer = final_answer.replace("$", "")
+
+  # Normalize numbers
+  if final_answer.replace(",", "").isdigit():
+    final_answer = final_answer.replace(",", "")
+
+  return final_answer.strip()
+
+
 def check_answer(prompts, completions, answer, tmvp_config, **kargs):
   """
   Reward the model if the answer is correct. A reward is also given if the answer
@@ -105,6 +205,9 @@ def check_answer(prompts, completions, answer, tmvp_config, **kargs):
     if guess is None:
       scores.append(0)
       continue
+    if "DAPO" in tmvp_config.dataset_name:
+      guess = normalize_final_answer(guess)
+      true_answer = normalize_final_answer(true_answer)
     # Correct answer gets tmvp_config.reward_exact_format_match points!
     if guess == true_answer:
       score += tmvp_config.reward_exact_format_match
@@ -135,7 +238,7 @@ def check_answer(prompts, completions, answer, tmvp_config, **kargs):
 def get_match_numbers_regex(tmvp_config):
   """Returns a compiled regex to extract the answer from a completion."""
   match_numbers = re.compile(rf"{tmvp_config.solution_start_token}.*?([\d\.]{{1,}})", flags=re.MULTILINE | re.DOTALL)
-  if tmvp_config.debug["rl"]:
+  if tmvp_config.debug.rl:
     match_numbers.findall(f"{tmvp_config.solution_start_token}  0.34  {tmvp_config.solution_end_token}")
   return match_numbers
 
@@ -150,7 +253,7 @@ def check_numbers(prompts, completions, answer, tmvp_config, **kargs):
   extracted_responses = [guess.group(1) if (guess := match_numbers.search(c)) is not None else None for c in completions]
 
   scores = []
-  if tmvp_config.debug["rl"]:
+  if tmvp_config.debug.rl:
     max_logging.log("START ============================")
     max_logging.log(f"Question: {question[0]}")
     max_logging.log(f"Answer: {answer[0]}")
@@ -207,3 +310,68 @@ def get_optimizer(tmvp_config, max_train_steps):
         optimizer,
     )
   return optimizer
+
+
+def process_data(dataset_name, model_tokenizer, template_config, tmvp_config, x):
+  """Function to process input dataset"""
+
+  def _to_str(val):
+    if isinstance(val, bytes):
+      return val.decode("utf-8")
+    return str(val)
+
+  # Handle DAPO dataset schema
+  # originally (prompt is a list, answer is in reward_model)
+  # https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k/viewer/default/train?row=0
+  # but using https://huggingface.co/datasets/open-r1/DAPO-Math-17k-Processed/viewer/all/train?row=1
+  # so question is prompt and answer is solution
+
+  question = x.get("question", x.get("prompt"))
+  answer = x.get("answer")
+  if answer is None and "solution" in x:
+    answer = x["solution"]
+
+  # Handle OpenMathInstruct-2
+  if "problem" in x:
+    question = x["problem"]
+  if "expected_answer" in x:
+    answer = x["expected_answer"]
+
+  # Handle AIME-2024
+  if "extra_info" in x and isinstance(x["extra_info"], dict) and "raw_problem" in x["extra_info"]:
+    question = x["extra_info"]["raw_problem"]
+
+  if "reward_model" in x and isinstance(x["reward_model"], dict) and "ground_truth" in x["reward_model"]:
+    answer = x["reward_model"]["ground_truth"]
+
+  question = _to_str(question)
+  answer = _to_str(answer)
+
+  if dataset_name == "gsm8k":
+    answer = extract_hash_answer(answer)
+
+  return {
+      # passed to model forward pass
+      "prompts": model_tokenizer.apply_chat_template(
+          [
+              {
+                  "role": "user",
+                  "content": template_config["TEMPLATE"].format(
+                      system_prompt=template_config["SYSTEM_PROMPT"].format(
+                          reasoning_start_token=tmvp_config.reasoning_start_token,
+                          reasoning_end_token=tmvp_config.reasoning_end_token,
+                          solution_start_token=tmvp_config.solution_start_token,
+                          solution_end_token=tmvp_config.solution_end_token,
+                      ),
+                      question=question,
+                  ),
+              },
+          ],
+          tokenize=False,
+          add_generation_prompt=True,
+      ),
+      # passed to reward functions
+      "question": question,
+      # passed to reward functions
+      "answer": answer,
+  }
