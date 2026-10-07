@@ -2,6 +2,23 @@
   "version": "0.2.0",
   "configurations": [
     {
+      // python -m debugpy --listen 5678 --wait-for-client
+      "name": "Python Debugger: Remote Attach",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": {
+        "host": "localhost",
+        "port": 5678
+      },
+      "pathMappings": [
+        {
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "."
+        }
+      ],
+      "justMyCode": false
+    },
+    {
       "name": "Debug MaxText Decode (llama2-7b-int8)",
       "type": "python",
       "request": "launch",

@@ -454,7 +454,6 @@ class ModelArchitecture(BaseModel):
       description="If True, adds a learnable bias to the query, key, and value projections.",
   )
   fused_mlp: bool = Field(False, description="If supported, fuse the MLP layers.")
-  
 
 
 class MTP(BaseModel):
@@ -662,7 +661,6 @@ class MoEGeneral(BaseModel):
       True,
       description="Whether to use full fp32 precision to sum expert weights for numerical stability.",
   )
-  
 
 
 class MoEKernels(BaseModel):
@@ -2328,8 +2326,24 @@ class MaxTextConfig(
     self.using_pipeline_parallelism = self.use_jaxpp or self.ici_pipeline_parallelism > 1 or self.dcn_pipeline_parallelism > 1
     if self.using_pipeline_parallelism:
       num_stages = int(self.ici_pipeline_parallelism * self.dcn_pipeline_parallelism)
+      if self.use_jaxpp:
+        assert self.pipeline_delay_activation_forwarding is False, "JaxPP does not support pipeline_delay_activation_forwarding"
+        assert self.num_pipeline_repeats >= 1, "num_pipeline_repeats must be >= 1 for JaxPP"
+        assert self.num_pipeline_microbatches >= 1, "num_pipeline_microbatches must be >= 1 for JaxPP"
 
-      if self.pipeline_fsdp_ag_per_repeat:
+      if self.num_pipeline_repeats == -1 and not self.use_jaxpp:
+        num_pipeline_repeats, remainder = divmod(
+            self.pipeline_parallel_layers,
+            num_stages * self.num_layers_per_pipeline_stage,
+        )
+        assert not remainder, (
+            f"The number of layers per stage ({self.num_layers_per_pipeline_stage}) times the number of stages "
+            f"({num_stages}) must divide the number of pipeline_parallel_layers which defaults to decoder layers "
+            f"({self.pipeline_parallel_layers}) "
+        )
+        self.num_pipeline_repeats = num_pipeline_repeats
+
+      if self.pipeline_fsdp_ag_per_repeat and not self.use_jaxpp:
         assert self.num_pipeline_repeats > 1, "Pipeline weight prefetching only supports circular pipeline."
         assert (
             self.num_layers_per_pipeline_stage == 1
@@ -2340,19 +2354,34 @@ class MaxTextConfig(
         assert not self.quantization, "Quantization is currently not supported for pipeline prefetching."
         assert not self.scan_layers_per_stage, "Pipeline weight prefetching currently does not support scan."
 
-      assert (num_stages * self.num_pipeline_repeats * self.num_layers_per_pipeline_stage) == (
+      assert self.use_jaxpp or (num_stages * self.num_pipeline_repeats * self.num_layers_per_pipeline_stage) == (
           self.pipeline_parallel_layers
       ), (
           f"The product of pipeline stages ({num_stages}), repeats ({self.num_pipeline_repeats}), and layers "
           f"per stage ({self.num_layers_per_pipeline_stage}) must be equal to pipeline_parallel_layers "
           f"which defaults to decoder layers ({self.pipeline_parallel_layers})"
       )
-      if self.num_pipeline_microbatches == -1:
+      if self.num_pipeline_microbatches == -1 and not self.use_jaxpp:
         if self.pipeline_delay_activation_forwarding:
-          assert self.num_pipeline_microbatches >= 2 * num_stages, (
-              f"Delayed activation forwarding requires at least 2 * num_stages microbatches, but {num_stages} stages "
-              f"are used with {self.num_pipeline_microbatches} microbatches"
-          )
+          self.num_pipeline_microbatches = 2 * num_stages
+        else:
+          self.num_pipeline_microbatches = num_stages
+
+      assert self.num_pipeline_microbatches > 0, "num_pipeline_microbatches must be positive"
+      assert self.use_jaxpp or self.num_pipeline_microbatches % num_stages == 0, (
+          f"The number of microbatches ({self.num_pipeline_microbatches}) must be divisible by the number of "
+          f"stages ({num_stages})"
+      )
+      if self.micro_batch_size_to_train_on > 0 and not self.use_jaxpp:
+        assert self.micro_batch_size_to_train_on % self.num_pipeline_microbatches == 0, (
+            f"The batch size for a single forward pass ({self.micro_batch_size_to_train_on}) must be divisible "
+            f"by the number of microbatches ({self.num_pipeline_microbatches})"
+        )
+      if self.pipeline_delay_activation_forwarding:
+        assert self.num_pipeline_microbatches >= 2 * num_stages, (
+            f"Delayed activation forwarding requires at least 2 * num_stages microbatches, but {num_stages} stages "
+            f"are used with {self.num_pipeline_microbatches} microbatches"
+        )
 
       # For AOT compilation and correctness, always prioritize the 'stage' axis for sharding when pipelining.
       for rule in self.logical_axis_rules:
@@ -2552,6 +2581,10 @@ class MaxTextConfig(
     ):
       logger.warning("`tokenizer_type` is not 'tiktoken' when using llama3 tokenizer. Overriding to 'tiktoken'.")
       self.tokenizer_type = TokenizerType.TIKTOKEN
+
+    if self.use_jaxpp and self.eval_interval > 0:
+      raise ValueError("JaxPP evaluation is not supported; set eval_interval <= 0.")
+
     # Data input validations
     if self.dataset_type == DatasetType.HF:
       if not self.hf_path:

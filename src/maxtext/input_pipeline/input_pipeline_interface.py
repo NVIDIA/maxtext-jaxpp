@@ -1,5 +1,4 @@
 # Copyright 2023–2025 Google LLC
-# Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -65,7 +64,7 @@ def create_data_iterator(config: pyconfig.HyperParameters, mesh):
 
   # Return synthetic dataset if selected
   if config.dataset_type == "synthetic":
-    return SyntheticDataIterator(config, mesh), SyntheticDataIterator(config, mesh)
+    return SyntheticDataIterator(config, mesh), None
   dataset_type_to_train_eval_iterator = {
       "tfds": (make_tfds_train_iterator, make_tfds_eval_iterator),
       "grain": (make_grain_train_iterator, make_grain_eval_iterator),
@@ -100,7 +99,7 @@ def create_data_iterator(config: pyconfig.HyperParameters, mesh):
 
   # Generate output eval iterator
   output_eval_iterator = None
-  if config.eval_interval > 0 and not config.use_jaxpp:
+  if config.eval_interval > 0:
     process_indices_eval = get_process_loading_real_data(
         config.data_sharding,
         config.global_batch_size_to_load_eval,

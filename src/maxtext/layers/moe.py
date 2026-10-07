@@ -278,7 +278,7 @@ class GateLogit(nnx.Module):
 
     contract_ind = tuple(range(0, len(norm_axis)))
     output_sharding = (
-        create_sharding(self.mesh, ("activation_batch_no_exp_moe", "activation_length_no_exp_moe", None))
+        create_sharding(self.mesh, ("activation_batch_moe", "activation_length_no_exp_moe", None))
         if self.shard_mode == ShardMode.EXPLICIT
         else None
     )

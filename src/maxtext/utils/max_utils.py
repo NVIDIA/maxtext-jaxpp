@@ -914,7 +914,6 @@ def reorder_mask_load_balancing(tensor, cp_size: int, seq_dim: int):
   # Reshape back to original dimensions
   return reordered.reshape(ori_tensor_shape)
 
-
 def parse_custom_args(argv):
   """Load multiple YAML config files from command line arguments."""
   configs = []

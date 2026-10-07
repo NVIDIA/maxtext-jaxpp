@@ -91,6 +91,14 @@ def create_training_tools(config, model, mesh):
 
 def jit_train_step(config, model, state, state_mesh_shardings, data_sharding, train_step, params_shardings):
   """Returns a JIT-compiled train step function, which is loaded from a file if specified in the config."""
+
+  mpmd_mesh = None
+  if config.use_jaxpp:
+    mpmd_mesh = jaxpp.MpmdMesh(model.mesh, "stage")
+    model.mesh = mpmd_mesh.lowering_mesh()
+    state_mesh_shardings = jax.tree.map(lambda s: s.update(mesh=model.mesh), state_mesh_shardings)
+    params_shardings = jax.tree.map(lambda s: s.update(mesh=model.mesh), params_shardings)
+
   if config.enable_diloco:
     functional_train = train_step
     in_shardings = (state_mesh_shardings, data_sharding, None)  # State, batch, rng
@@ -137,7 +145,7 @@ def jit_train_step(config, model, state, state_mesh_shardings, data_sharding, tr
   return p_train_step
 
 
-def jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step, maybe_mpmd_mesh):
+def jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step):
   """Returns a JIT-compiled eval step function."""
   (
       functional_eval,
@@ -149,23 +157,13 @@ def jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step,
 
   p_eval_step = None
   if config.compiled_trainstep_file == "":
-    if not config.use_jaxpp:
-      p_eval_step = jax.jit(
-          functional_eval,
-          in_shardings=in_shardings,
-          out_shardings=out_shardings,
-          static_argnums=static_argnums,
-          donate_argnums=donate_argnums,
-      )
-    else:
-      p_eval_step = jaxpp.mpmd_jit_by_yield(
+    p_eval_step = jax.jit(
         functional_eval,
-        mpmd_mesh=maybe_mpmd_mesh,
         in_shardings=in_shardings,
         out_shardings=out_shardings,
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
-      )
+    )
 
   return p_eval_step
 
@@ -182,6 +180,8 @@ def jit_train_and_eval_step(
     params_shardings=None,
 ):
   """Returns a JIT-compiled train and eval step function."""
+  # NOTE(jaxpp): all shardings/model/mesh etc. are the full SPMD mesh here
+
   if config.enable_diloco:
     train_step_partial = functools.partial(train_step, model, config, state_mesh_shardings, params_shardings)
     train_step = diloco.build_diloco_train_step(config, train_step_partial, mesh=mesh)
@@ -189,7 +189,7 @@ def jit_train_and_eval_step(
   p_train_step = jit_train_step(config, model, state, state_mesh_shardings, data_sharding, train_step, params_shardings)
   p_eval_step = None
   if eval_data_iterator:
-    p_eval_step = jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step, mesh)
+    p_eval_step = jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step)
 
   return p_train_step, p_eval_step
 

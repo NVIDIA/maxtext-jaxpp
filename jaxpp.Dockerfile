@@ -18,6 +18,18 @@ ARG JAX_INSTALL_URL
 
 COPY --chown=$USER_UID:$USER_GID . maxtext
 
-RUN uv pip install --no-cache-dir -e '/workdir/jaxpp[dev]'
-RUN uv pip install --no-cache-dir -e /workdir/maxtext[cuda12] --resolution=lowest && \
+ARG JAXPP_PATH=/workdir/jaxpp
+RUN JAXPP_JAX_VERSION=$(python -c \
+        'from importlib.metadata import version; print(version("jax"))') && \
+    uv pip install --no-cache-dir \
+        -e '/workdir/maxtext[cuda13]' \
+        -e "${JAXPP_PATH}" \
+        "jax[cuda13]==${JAXPP_JAX_VERSION}" \
+        --resolution=lowest && \
+    if [ -z "${VIRTUAL_ENV}" ]; then \
+        echo "[failed] VIRTUAL_ENV variable is not set."; \
+        exit 1; \
+    fi && \
+    "${VIRTUAL_ENV}/bin/pip" install --no-build-isolation transformer-engine[jax]==2.16.0 && \
+    uv pip install triton==3.7.1 && \
     if [[ -n "$JAX_INSTALL_URL" ]]; then uv pip install $JAX_INSTALL_URL; fi

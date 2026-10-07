@@ -2,7 +2,7 @@ export TEST_CONFIG="
     override_model_config=True dataset_type=synthetic steps=10
 "
 
-export COMMAND="python3 -u -m MaxText.train src/MaxText/configs/base.yml \
+export COMMAND="python3 -u -m maxtext.trainers.pre_train.train src/maxtext/configs/base.yml \
     base_output_directory=run_local_mc_outputs \
     run_name=run_$(date +%Y-%m-%d-%H:%M:%S) \
     enable_checkpointing=false \

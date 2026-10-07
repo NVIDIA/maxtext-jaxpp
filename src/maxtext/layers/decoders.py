@@ -1,4 +1,5 @@
 # Copyright 2023–2026 Google LLC
+# Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -64,7 +65,7 @@ from maxtext.utils import maxtext_utils
 from maxtext.utils import sharding
 
 import jaxpp
-from packaging.version import Version
+
 
 # ------------------------------------------------------------------------------
 # The network: Decoder Definitions
@@ -348,6 +349,8 @@ class Decoder(nn.Module):
       elif cfg.remat_policy == "minimal":
         # save all except context
         policy = self.minimal_policy()
+      elif cfg.remat_policy == "save_dot_only":
+        policy = jax.checkpoint_policies.checkpoint_dots
       elif cfg.remat_policy == "minimal_with_quantization":
         if cfg.scan_layers:
           warnings.warn(
@@ -800,7 +803,7 @@ class Decoder(nn.Module):
         deterministic,
         model_mode,
     )
-    if cfg.using_pipeline_parallelism:
+    if cfg.using_pipeline_parallelism and not cfg.use_jaxpp:
       logical_partition_spec = (
           self.pipeline_module.get_weight_sharding(y, decoder_segment_ids, decoder_positions, deterministic, model_mode)
           if cfg.pipeline_fsdp_ag_once or cfg.pipeline_fsdp_ag_per_repeat
@@ -973,7 +976,6 @@ class Decoder(nn.Module):
           )(y, *broadcast_args)
       else:
         num_logical_stages = 1
-        layers_per_stage = cfg.num_decoder_layers
         cutoffs = [cfg.num_decoder_layers]
         if cfg.use_jaxpp:
           num_logical_stages = cfg.dcn_pipeline_parallelism * cfg.ici_pipeline_parallelism * cfg.num_pipeline_repeats
@@ -987,7 +989,6 @@ class Decoder(nn.Module):
             cutoffs.append(tot - 1)
 
         stage_id = 0
-        add_last_enter_stage = Version(jaxpp.__version__) > Version("0.6.1")
         if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
           assert len(RemattedBlockLayers) == 2, "Unscanned layers must have a length of 2 using deepseek."
 
@@ -997,7 +998,6 @@ class Decoder(nn.Module):
           layer_prefixes = ["dense_layers", "moe_layers"]
           num_moe_layers = cfg.num_decoder_layers - cfg.first_num_dense_layers
           num_layers_list = [cfg.first_num_dense_layers, num_moe_layers]
-          layer_offset = 0
           # Iterate over the two layer groups (dense and MoE) and apply layer transformation
           global_layer_idx_offset = 0
           for layer, num_layers, layer_prefix in zip(layers, num_layers_list, layer_prefixes):
@@ -1027,7 +1027,15 @@ class Decoder(nn.Module):
               )
               if kv_caches is not None and kv_cache is not None:
                 kv_caches[index] = kv_cache
+              if (
+                  cfg.use_jaxpp
+                  and global_layer_idx != cfg.num_decoder_layers - 1
+                  and cutoffs[stage_id] == global_layer_idx
+              ):
+                y = jaxpp.api.pipeline_enter_stage(y, f"stage_{stage_id}")
+                stage_id += 1
             global_layer_idx_offset += num_layers
+
         else:
           for lyr in range(cfg.num_decoder_layers):
             RemattedBlockLayer = RemattedBlockLayers[0]
@@ -1056,7 +1064,8 @@ class Decoder(nn.Module):
               layer_kwargs = {"attention_type": gpt_oss.get_attention_type(layer_id=lyr)}
             if cfg.decoder_block == DecoderBlockType.OLMO3:
               layer_kwargs = {"attention_type": olmo3.get_attention_type(layer_id=lyr)}
-            layer = RemattedBlockLayer(
+            layer_ctor = RemattedBlockLayer if (not cfg.use_jaxpp or stage_id != num_logical_stages - 1) else self.decoder_layer[0]
+            layer = layer_ctor(
                 config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant, model_mode=self.model_mode, **layer_kwargs
             )
             y, returned_cache = layer(
@@ -1085,7 +1094,7 @@ class Decoder(nn.Module):
               if bidirectional_mask is not None and visual_embeds is not None:
                 y = deepstack_process(y, bidirectional_mask, visual_embeds)
 
-            if lyr != cfg.num_decoder_layers - 1 and cutoffs[stage_id] == lyr:
+            if cfg.use_jaxpp and lyr != cfg.num_decoder_layers - 1 and cutoffs[stage_id] == lyr:
               y = jaxpp.api.pipeline_enter_stage(y, f"stage_{stage_id}")
               stage_id += 1
 
@@ -1119,7 +1128,7 @@ class Decoder(nn.Module):
     else:
       logits = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
 
-    if add_last_enter_stage:
+    if cfg.use_jaxpp:
       logits = jaxpp.api.pipeline_enter_stage(logits, f"stage_{stage_id}")
 
     # The API of the Decoder is now a tuple, providing both the main output

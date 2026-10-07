@@ -1090,15 +1090,12 @@ class MLA(Attention):
     if model_mode == MODEL_MODE_PREFILL:
       inputs_q = self._maybe_shard_with_logical(inputs_q, self.prefill_input_axis_names)
       inputs_kv = self._maybe_shard_with_logical(inputs_kv, self.prefill_input_axis_names)
-      out_logical_name = (PREFILL_KV_BATCH, PREFILL_LENGTH, HEAD, D_KV)
     elif model_mode == MODEL_MODE_TRAIN and self.config.expert_shard_attention_option == EP_AS_CONTEXT:
       inputs_q = self._maybe_shard_with_logical(inputs_q, self.ep_input_axis_names)
       inputs_kv = self._maybe_shard_with_logical(inputs_kv, self.ep_input_axis_names)
-      out_logical_name = (BATCH_NO_EXP, LENGTH, HEAD, D_KV)
     else:
       inputs_q = self._maybe_shard_with_logical(inputs_q, self.input_axis_names)
       inputs_kv = self._maybe_shard_with_logical(inputs_kv, self.input_axis_names)
-      out_logical_name = (BATCH, LENGTH_NO_EXP, HEAD, D_KV)
 
     query, low_rank_q = self.mla_query_projection(inputs_q, inputs_positions, model_mode)
     if self.config.force_q_layout:
@@ -1169,7 +1166,6 @@ class MLA(Attention):
     else:
       out = self._maybe_shard_with_logical(out, self.out_axis_names)
 
-    out_sharding = create_sharding(self.mesh, out_logical_name)
     out = self.out_projection(out, out_sharding=out_sharding)
     out = checkpoint_name(out, "out_proj")
     return out, kv_cache

@@ -271,7 +271,7 @@ inhomogeneous_layer_cycle_interval: 1
 # but a smaller size per microbatch which may hurt per-stage performance. Additionally, note when microbatches > num_stages we have the opportunity to
 # perform the circular transfer (last stage to first) asynchronously.
 # The bubble fraction is (num_stages - 1) / (num_pipeline_repeats * num_pipeline_microbatches + num_stages - 1)
-num_layers_per_pipeline_stage: 1 # NOTE(jaxpp) unused in JaxPP
+num_layers_per_pipeline_stage: 1
 # The number of repeats will be set to num_decoder_layers / (num_pipeline_stages * num_layers_per_pipeline_stage)
 num_pipeline_repeats: -1
 pipeline_parallel_layers: -1 # Pipeline only this number of layers - for the remaining layers the "stage" mesh axes will act like data parallelism.
@@ -432,7 +432,7 @@ local_checkpoint_period: 0
 jax_cache_dir: "~/jax_cache"
 
 # Hardware
-hardware: 'tpu' # Supported hardware types are 'tpu', 'gpu', 'gpu_multiprocess' and 'cpu'
+hardware: 'gpu' # Supported hardware types are 'tpu', 'gpu', 'gpu_multiprocess' and 'cpu'
 
 # internal_compile allows bypassing open-source topology name mappings when using internal topologies directly via get_topology_desc.
 internal_compile: False
@@ -443,10 +443,10 @@ shard_mode: "auto" # can be either auto or explicit
 custom_mesh_and_rule: "" # replace default mesh and logical rule by specifying yml name under config/mesh_and_rule/.
 mesh_axes: ['diloco', 'data', 'stage', 'fsdp', 'fsdp_transpose', 'sequence', 'context', 'context_autoregressive', 'tensor', 'tensor_transpose', 'tensor_sequence', 'expert', 'autoregressive']
 logical_axis_rules: [
-                      ['activation_batch', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
-                      ['activation_batch_moe', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
-                      ['activation_batch_no_exp', ['data', 'fsdp', 'fsdp_transpose']],
-                      ['activation_batch_no_exp_moe', ['data', 'fsdp', 'fsdp_transpose']],
+                      ['activation_batch', ['fsdp', 'fsdp_transpose', 'expert']],
+                      ['activation_batch_moe', ['fsdp', 'fsdp_transpose', 'expert']],
+                      ['activation_batch_no_exp', ['fsdp', 'fsdp_transpose']],
+                      ['activation_batch_no_exp_moe', ['fsdp', 'fsdp_transpose']],
                       ['activation_embed_and_logits_batch', ['data', 'stage', 'fsdp', 'fsdp_transpose', 'expert']],
                       ['activation_embed_and_logits_batch_sequence', ['data', 'stage', 'fsdp', 'fsdp_transpose', 'sequence', 'context', 'expert']],
                       ['activation_heads', ['tensor', 'tensor_transpose', 'sequence','tensor_sequence','autoregressive']],
@@ -887,6 +887,7 @@ abort_on_inf_loss: True # Check for Inf and abort if found in training loss
 use_jaxpp: False
 schedule: "eager_1f1b"
 fuse_steady_state: False
+
 # NOTE(jaxpp): end parameters
 
 # Goodput parameters

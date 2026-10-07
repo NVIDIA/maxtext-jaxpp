@@ -1,4 +1,5 @@
 # Copyright 2025-2026 Google LLC
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -444,6 +445,52 @@ def add_data_to_sharding(mesh, path, aval, sharding):
 
     if size % mesh.shape["data"] == 0 and (partition is None or "tensor" not in partition):
       added_component = ("data",) + partition
+      new_pspec = jax.sharding.PartitionSpec(*(pspec[:idx] + (added_component,) + pspec[idx + 1 :]))
+      new_sharding = jax.sharding.NamedSharding(sharding.mesh, new_pspec)
+      return new_sharding
+  return sharding
+
+
+def add_stage_to_sharding(mesh, path, aval, sharding):
+  """Adds 'stage' dimension to sharding spec if compatible and not already present.
+
+  This function attempts to add stage dimension to a sharding specification by finding
+  a dimension that is divisible by the 'stage' mesh axis size and doesn't conflict with
+  existing partitioning (e.g., tensor parallelism).
+  This function is mainly used for reshard between spmd and mpmd.
+
+  Args:
+    mesh: The device mesh
+    path: JAX tree path to the value being sharded
+    aval: Abstract value with shape information
+    sharding: Current NamedSharding to potentially augment
+
+  Returns:
+    NamedSharding: Updated sharding with 'stage' dimension added, or original if unchanged
+
+  Raises:
+    AssertionError: If sharding is not NamedSharding or shape cannot be sharded
+  """
+  if not isinstance(sharding, jax.sharding.NamedSharding):
+    raise AssertionError(f"Expected NamedSharding, found {sharding} of {type(sharding)=} at {jax.tree_util.keystr(path)}")
+  try:
+    sharded_shape = sharding.shard_shape(aval.shape)
+  except Exception as e:
+    raise AssertionError(f"Could not shard {jax.tree_util.keystr(path)} of shape={aval.shape} with {sharding=}") from e
+  pspec = sharding.spec
+
+  if "stage" in jax.tree.leaves(pspec):
+    return sharding
+
+  for idx, (size, partition) in enumerate(zip(sharded_shape, pspec)):
+    if partition is None:
+      partition = ()
+
+    if isinstance(partition, str):
+      partition = (partition,)
+
+    if size % mesh.shape["stage"] == 0:
+      added_component = ("stage",) + partition
       new_pspec = jax.sharding.PartitionSpec(*(pspec[:idx] + (added_component,) + pspec[idx + 1 :]))
       new_sharding = jax.sharding.NamedSharding(sharding.mesh, new_pspec)
       return new_sharding

@@ -1,4 +1,5 @@
 # Copyright 2023–2026 Google LLC
+# Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -70,13 +71,82 @@ from maxtext.utils import train_utils
 from maxtext.utils.gradient_accumulation import gradient_accumulation_loss_and_grad
 from maxtext.utils.vocabulary_tiling import vocab_tiling_linen_loss
 
+"""
+JaxPP related imports
+"""
+# system
+import subprocess
+
+from statistics import mean
+
+# jaxpp
+import jaxpp.api as jaxpp
+
+_PERFORMANCE_TRIM_FRACTION = 0.2
+
 _diag_modules = _cloud_diag()
 diagnostic, debug_configuration, diagnostic_configuration, stack_trace_configuration = _diag_modules
 VertexTensorboardManager, _vertex_tb_is_stub = vertex_tensorboard_modules()
 
 
 def get_first_step(state):
-  return int(state.step)
+  return int(max_utils.maybe_unwrap(state.step))
+
+
+def _trimmed_performance_summary(
+    step_times: Sequence[float],
+    step_tflops: Sequence[float],
+) -> tuple[float, float, int, int]:
+  """Returns means after trimming equally from both step-time tails."""
+  if len(step_times) != len(step_tflops):
+    raise ValueError("Step-time and TFLOP/s sample counts do not match")
+  if not step_times:
+    raise ValueError("No performance samples remain after warmup")
+
+  # Keep the metrics paired so both means describe the same training steps.
+  samples = sorted(
+      zip(step_times, step_tflops),
+      key=lambda sample: sample[0],
+  )
+  trim_count = int(len(samples) * _PERFORMANCE_TRIM_FRACTION)
+  retained_samples = samples[trim_count:-trim_count] if trim_count else samples
+  if not retained_samples:
+    raise ValueError("No performance samples remain after trimming")
+
+  return (
+      mean(sample[0] for sample in retained_samples),
+      mean(sample[1] for sample in retained_samples),
+      trim_count,
+      len(retained_samples),
+  )
+
+
+def _performance_summary_after_warmup(
+    step_times: Sequence[float],
+    step_tflops: Sequence[float],
+    num_warmup_steps: int,
+) -> tuple[float, float, int, int] | None:
+  """Returns a performance summary, or None when only warmup samples exist."""
+  summary_times = step_times[num_warmup_steps:]
+  summary_tflops = step_tflops[num_warmup_steps:]
+  if not summary_times and not summary_tflops:
+    return None
+  return _trimmed_performance_summary(summary_times, summary_tflops)
+
+
+def _jaxpp_performance_warmup_steps(
+    use_jaxpp: bool,
+    profiler_mode: str,
+    finished_initial_profile_step: int,
+    start_step: int,
+) -> int | None:
+  """Returns the number of JaxPP performance samples to exclude."""
+  if not use_jaxpp:
+    return None
+
+  # Exclude every sample through the step after profiling, whose time includes xplane merging.
+  # Profiler steps are absolute, while samples start at start_step for resumed runs.
+  return finished_initial_profile_step - start_step + 2 if profiler_mode else 6
 
 
 # -----------------------------------------------------------------------------
@@ -100,7 +170,7 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
     aux: a dictionary including intermediate_outputs, total_loss, and total_weights
   """
   # decimate proportion of data when per_device_batch_size<1
-  if is_train:
+  if is_train and not config.use_jaxpp:
     for k, v in data.items():
       data[k] = v[: config.micro_batch_size_to_train_on, :]
   else:
@@ -323,7 +393,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
 
   params = state.params
 
-  if config.gradient_accumulation_steps > 1:
+  if config.gradient_accumulation_steps > 1 or config.use_jaxpp:
     loss, aux, raw_grads = gradient_accumulation_loss_and_grad(
         _loss_fn,
         config,
@@ -351,10 +421,15 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     grad_func = jax.value_and_grad(_loss_fn, argnums=4, has_aux=True)
     (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, params, *extra_dpo_args, is_train=True)
 
+  raw_grads = jax.lax.with_sharding_constraint(raw_grads, state_mesh_shardings.params)
+  # Pop owg from raw_grads as we don't want to convert its type.
+  owg = raw_grads.pop(nn.fp8_ops.OVERWRITE_WITH_GRADIENT, None)
   raw_grads = jax.tree_util.tree_map(
       lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x,
       raw_grads,
   )
+  # Compute raw gradient norm for clipping and metrics (before extracting aux values)
+  raw_grad_norm = max_utils.l2norm_pytree(raw_grads)
   if config.parameter_memory_host_offload:
     raw_grads = jax.device_put(
         raw_grads,
@@ -369,9 +444,11 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   mtp_loss = aux["mtp_loss"]
 
   if config.gradient_clipping_threshold > 0:
-    grads = maxtext_utils.apply_gradient_clipping(raw_grads, state, config.gradient_clipping_threshold)
+    grads = maxtext_utils.apply_gradient_clipping(raw_grads, state, raw_grad_norm, config.gradient_clipping_threshold)
   else:
     grads = raw_grads
+  if owg is not None:
+    grads[nn.fp8_ops.OVERWRITE_WITH_GRADIENT] = owg
   if config.optimizer_memory_host_offload:
     state = state.replace(
         opt_state=jax.device_put(
@@ -414,6 +491,15 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "learning/mtp_loss": mtp_loss,
       "learning/total_weights": total_weights,
   }
+  if config.use_jaxpp:
+    # TODO: refine logic to match the one in MaxText's gradient accumulation
+    #  or use that altogether (add support for scan instead of
+    #  treduce in JaxPP)
+    scalar_metrics["learning/loss"] = loss.sum()
+    scalar_metrics["learning/total_weights"] = total_weights.sum()
+    for name in ("learning/z_loss", "learning/moe_lb_loss", "learning/indexer_loss", "learning/mtp_loss"):
+      value = scalar_metrics[name]
+      scalar_metrics[name] = value.sum() if hasattr(value, "sum") else value
   if config.use_qk_clip:
     # Apply QK-Clip
     new_state = qk_clip_utils.apply_qk_clip(new_state, intermediate_outputs, config)
@@ -424,9 +510,18 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       scalar_metrics["learning/max_logits"] = global_max_logit
 
   if not config.optimizer_memory_host_offload:
-    scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
-    scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
-    scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(new_state.params)
+    owg = grads.pop(nn.fp8_ops.OVERWRITE_WITH_GRADIENT, None)
+    scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads["params"])
+    if owg is not None:
+      grads[nn.fp8_ops.OVERWRITE_WITH_GRADIENT] = owg
+    scalar_metrics["learning/raw_grad_norm"] = raw_grad_norm
+
+    new_params = new_state.params
+    owg = new_params.pop(nn.fp8_ops.OVERWRITE_WITH_GRADIENT, None)
+    scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(new_params)
+    if owg is not None:
+      new_params[nn.fp8_ops.OVERWRITE_WITH_GRADIENT] = owg
+    new_state = new_state.replace(params=new_params)
   if config.use_dpo:
     scalar_metrics["learning/dpo_reward_accuracy"] = aux["reward_accuracy"]
   metrics = {
@@ -507,26 +602,43 @@ def train_loop(config, recorder, state=None):
 
   params_shardings, state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
-  with jax.set_mesh(mesh), mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-    p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
-        config,
-        model,
-        mesh,
-        state,
-        state_mesh_shardings,
-        train_step,
-        eval_step,
-        eval_data_iterator,
-        params_shardings,
+  mpmd_mesh = None
+  if config.use_jaxpp:
+    state_spmd_shardings = jax.tree.map_with_path(
+      functools.partial(sharding.add_stage_to_sharding, mesh),
+      state,
+      state_mesh_shardings,
     )
+    mpmd_mesh = jaxpp.MpmdMesh(mesh, "stage")
+    mesh = mpmd_mesh.lowering_mesh()
+
+  p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
+      config,
+      model,
+      mpmd_mesh.jax_mesh if config.use_jaxpp else mesh,
+      state,
+      state_mesh_shardings,
+      train_step,
+      eval_step,
+      eval_data_iterator,
+      params_shardings,
+  )
+
+  if config.use_jaxpp:
     shaped_batch = maxtext_utils.get_shaped_batch(config)
-    if config.shard_optimizer_over_data:
-      state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
-    maxtext_utils.maybe_dump_jaxpr(config, p_train_step, (state, shaped_batch, init_rng))
-    if config.compiled_trainstep_file == "":  # compile only when there is no pre-compiled file loaded
-      compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
-      compiled_stats = compiled.memory_analysis()
-      max_utils.print_compiled_memory_stats(compiled_stats)
+    with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
+      p_train_step = p_train_step.compile(state, shaped_batch, init_rng)
+    state = jaxpp.spmd_to_mpmd_reshard(mpmd_mesh, state, p_train_step.in_shardings[0][0])
+  else:
+    with jax.set_mesh(mesh), mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+      shaped_batch = maxtext_utils.get_shaped_batch(config)
+      if config.shard_optimizer_over_data:
+        state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
+      maxtext_utils.maybe_dump_jaxpr(config, p_train_step, (state, shaped_batch, init_rng))
+      if config.compiled_trainstep_file == "":  # compile only when there is no pre-compiled file loaded
+        compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
+        compiled_stats = compiled.memory_analysis()
+        max_utils.print_compiled_memory_stats(compiled_stats)
 
   start_step = get_first_step(state)  # this is the start_step for training
   prof = profiler.Profiler(config, offset_step=start_step)
@@ -535,21 +647,39 @@ def train_loop(config, recorder, state=None):
   # Write train config params, num model params, and XLA flags to tensorboard
   metric_logger.write_setup_info_to_tensorboard(state.params)
 
+  task_times = None
   _job_completed_gracefully = False
   try:
+    step_time = []
+    step_tflops = []
+    profiling_process_ids = None
+    if config.use_jaxpp:
+      idx = tuple(slice(None) if i == mpmd_mesh.mpmd_axis else 0 for i in range(len(mpmd_mesh.jax_mesh.shape)))
+      first_device_per_mpmd_rank = mpmd_mesh.jax_mesh.devices[idx]
+      profiling_process_ids = {d.process_index: d for d in first_device_per_mpmd_rank}
+
     last_step_completion = datetime.datetime.now()
     for step in np.arange(start_step, config.steps):
-      prof.maybe_activate_profiler(step, state)
+      prof.maybe_activate_profiler(step, state, maybe_mpmd_mesh=mpmd_mesh, profiling_process_ids=profiling_process_ids)
 
       with jax.profiler.StepTraceAnnotation("train", step_num=step):
         example_batch = data_loader.load_next_batch(rampup_manager=rampup_manager)
         # pylint: disable=not-callable
         nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
-        with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
+
+        if config.use_jaxpp:
+          example_batch, nextrng = jaxpp.spmd_to_mpmd_reshard(mpmd_mesh, (example_batch, nextrng), p_train_step.in_shardings[0][1:])
+
+        # We don't want to collect task times at the same time we're profiling
+        enable_task_times = config.use_jaxpp and step == start_step + config.skip_first_n_steps_for_profiler + 1
+        with maybe_record_goodput(recorder, GoodputEvent.STEP, step), jaxpp.collect_task_times_ms(enable_task_times) as step_task_times:
           with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
-            if config.shard_optimizer_over_data:
+            if config.shard_optimizer_over_data and not config.use_jaxpp:
               state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
             state, metrics = p_train_step(state, example_batch, nextrng)
+
+          if step_task_times is not None:
+            task_times = step_task_times
 
       step_time_delta = datetime.datetime.now() - last_step_completion
       last_step_completion = datetime.datetime.now()
@@ -588,12 +718,26 @@ def train_loop(config, recorder, state=None):
           prof.deactivate()
           raise exceptions.StopTraining(f"Target loss {config.target_eval_loss=} is achieved.")
 
-      prof.maybe_deactivate_profiler(step, state)
+      prof.maybe_deactivate_profiler(step, state, profiling_process_ids=profiling_process_ids)
 
       if step == start_step:
         max_utils.print_mem_stats("After params initialized")
 
       metric_logger.buffer_and_write_train_metrics(metrics, step, step_time_delta)
+      if config.use_jaxpp:
+        step_time.append(metrics["scalar"]["perf/step_time_seconds"])
+        step_tflops.append(metrics["scalar"]["perf/per_device_tflops_per_sec"])
+
+    if config.use_jaxpp:
+      assert mpmd_mesh is not None
+      state = jaxpp.mpmd_to_spmd_reshard(mpmd_mesh, state, state_spmd_shardings)
+
+      if prof.mode != "":
+        command = """find . -wholename '*proc_*_mpmd*/*.xplane.pb' | sort | awk '{line=$0; sub(/.*mpmd_/, "", line); sub(/_.*/, "", line); printf "%d:%s:0 ", line, $0}'"""
+        subprocess.run(
+          [f"merge_multihost_xplanes $({command})"],
+          shell=True, cwd=config.tensorboard_dir, check=True
+        )
 
     if config.save_checkpoint_on_completion:
       state_to_save = state if not config.use_dpo else _split_dpo_state(state)[0]
@@ -609,6 +753,32 @@ def train_loop(config, recorder, state=None):
     if _job_completed_gracefully:
       record_goodput(recorder, RECORD_JOB_END_TIME)
     metric_logger.flush_metrics_and_cleanup()
+
+  num_warmup_steps = _jaxpp_performance_warmup_steps(
+      config.use_jaxpp,
+      prof.mode,
+      prof.finished_initial_profile_step,
+      start_step,
+  )
+  if num_warmup_steps is not None:
+    performance_summary = _performance_summary_after_warmup(step_time, step_tflops, num_warmup_steps)
+    if performance_summary is not None:
+      average_step_time, average_step_tflops, trim_count, retained_count = performance_summary
+      max_logging.log(
+          f"excluding the first {num_warmup_steps} steps and using a "
+          f"{_PERFORMANCE_TRIM_FRACTION:.0%} trimmed mean "
+          f"({trim_count} samples removed from each tail, {retained_count} retained): "
+          f"avg time per step {average_step_time}, avg tflops per step {average_step_tflops}"
+      )
+    else:
+      max_logging.log(
+          f"Skipping JaxPP performance summary: {len(step_time)} steps do not exceed "
+          f"the {num_warmup_steps}-step warmup."
+      )
+
+  if task_times is not None:
+    for task_name, times in task_times.items():
+      max_logging.log(f"task {task_name}: {mean(times)} ms")
 
   return state
 

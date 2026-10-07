@@ -1,4 +1,5 @@
 # Copyright 2023–2025 Google LLC
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -130,11 +131,25 @@ def jit_and_compile(
     donate_argnums,
     config,
     logical_axis_rules,
+    mpmd_mesh=None,
 ):
   """Jit, lower, and compile func."""
   # Use both jax.set_mesh (new API) and `with mesh:` (old API) so that drjax,
   # which reads from pxla.thread_resources.env.physical_mesh, can find the mesh.
   with jax.set_mesh(mesh), mesh, logical_axis_rules:
+    if mpmd_mesh is not None:
+      import jaxpp.api as jaxpp  # pylint: disable=import-outside-toplevel
+
+      p_train_step = jaxpp.mpmd_jit_with_loop(
+          func,
+          mpmd_mesh=mpmd_mesh,
+          donate_argnums=donate_argnums,
+          in_shardings=in_shardings,
+          out_shardings=out_shardings,
+      )
+      assert len(func_input_kwargs) == 0
+      return p_train_step.compile(*func_input_args)
+
     jitted = jax.jit(
         func,
         in_shardings=in_shardings,
@@ -229,6 +244,14 @@ def main(argv: Sequence[str]) -> None:
 
   # Create target mesh
   topology_mesh = get_topology_mesh(config)
+  if config.use_jaxpp:
+    from jaxpp.api import MpmdMesh  # pylint: disable=import-outside-toplevel
+
+    mpmd_mesh = MpmdMesh(topology_mesh, 'stage')
+    mesh = mpmd_mesh.lowering_mesh()
+  else:
+    mpmd_mesh = None
+    mesh = topology_mesh
 
   # Print system information after building the compile topology to avoid
   # prematurely initializing the backend.
@@ -242,9 +265,10 @@ def main(argv: Sequence[str]) -> None:
       logical_annotations,
       model,
   ) = get_shaped_inputs(topology_mesh, config)
+  params_shardings, state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
   # Get data sharding
-  data_sharding = sharding.get_input_data_sharding(config, topology_mesh)
+  data_sharding = sharding.get_input_data_sharding(config, mesh)
   if config.enable_diloco:
     # Build abstract DiLoCo state and shardings for AOT compilation
     abstract_state = shaped_train_args[0]
@@ -273,7 +297,7 @@ def main(argv: Sequence[str]) -> None:
         static_argnums,
         donate_argnums,
     ) = maxtext_utils.get_functional_train_with_signature(
-        train.train_step, data_sharding, state_mesh_shardings, model, config
+        train.train_step, data_sharding, state_mesh_shardings, model, config, params_shardings=params_shardings
     )
 
   # print weights sharding info under debug sharding mode
@@ -292,13 +316,14 @@ def main(argv: Sequence[str]) -> None:
       func_to_compile,
       shaped_train_args,
       shaped_train_kwargs,
-      topology_mesh,
+      mesh,
       in_shard,
       out_shard,
       static_argnums,
       donate_argnums,
       config,
       nn_partitioning.axis_rules(config.logical_axis_rules),
+      mpmd_mesh=mpmd_mesh,
   )
   print("Jitting and compilation complete!", flush=True)
 
@@ -307,9 +332,11 @@ def main(argv: Sequence[str]) -> None:
     print("Saving compiled object...")
     save_compiled(compiled, config.compiled_trainstep_file)
     print(f"Successfully saved compiled object as {config.compiled_trainstep_file}")
-  print("Finished train_compile.py successfully!", flush=True)
-  print(f"Cost analysis: {compiled.cost_analysis()}")
-  print(f"Memory analysis: {compiled.memory_analysis()}")
+
+  if not config.use_jaxpp:
+    print("Finished train_compile.py successfully!", flush=True)
+    print(f"Cost analysis: {compiled.cost_analysis()}")
+    print(f"Memory analysis: {compiled.memory_analysis()}")
 
   # Dump HLO if requested
   if config.dump_hlo:

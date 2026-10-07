@@ -1,5 +1,5 @@
 # Copyright 2023–2025 Google LLC
-# Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1196,16 +1196,25 @@ def setup_initial_state(
       init_state_partial = functools.partial(init_initial_state, model, tx, config, is_training)
       init_state_partial.__name__ = "initialize_state"
 
+      if config.use_jaxpp:
+        state_spmd_shardings = jax.tree.map_with_path(
+          functools.partial(sharding.add_stage_to_sharding, mesh),
+          unboxed_abstract_state,
+          state_mesh_shardings,
+        )
+      else:
+        state_spmd_shardings = state_mesh_shardings
+
       # pylint: disable=not-callable
       state = jax.jit(
           init_state_partial,
           in_shardings=None,
-          out_shardings=state_mesh_shardings,
+          out_shardings=state_spmd_shardings,
       )(rng)
       if raw_params:  # If we loaded a partial state, we need to merge it.
         state = state.replace(params=raw_params)
 
-      state = max_utils.unbox_logicallypartioned(state)
+  state = max_utils.unbox_logicallypartioned(state)
 
   return state, state_mesh_annotations, state_mesh_shardings, data_iterator
 

@@ -2,16 +2,17 @@
 
 This repository is a fork of [MaxText](https://github.com/AI-Hypercomputer/maxtext) created for training with [JaxPP](https://github.com/NVIDIA/jaxpp).
 
+
 # Notable changes
 
 The changes between this repo and the upstream MaxText is kept minimal in general.
 Some of the notable changes are listed below.
 
-* The `__call__` method of the `Decoder` class in [src/MaxText/layers/decoders.py](src/MaxText/layers/decoders.py)
+* The `__call__` method of the `Decoder` class in [src/maxtext/layers/decoders.py](src/maxtext/layers/decoders.py)
   calls `jaxpp.pipeline_enter_stage` to mark stage boundaries for pipeline parallelism.
-* The `maybe_initialize_jax_distributed_system` function in [src/MaxText/max_utils.py](src/MaxText/max_utils.py)
+* The `maybe_initialize_jax_distributed_system` function in [src/maxtext/utils/max_utils.py](src/maxtext/utils/max_utils.py)
   creates `RemoteMpmdMesh` to be used by JaxPP.
-* [src/MaxText/train.py](src/MaxText/train.py) contains changes to
+* [src/maxtext/trainers/pre_train/train.py](src/maxtext/trainers/pre_train/train.py) contains changes to
  * Enable pipeline parallelism for the train step, and
  * Mark the pipeline loop in the train step with `jaxpp.treduce`.
 

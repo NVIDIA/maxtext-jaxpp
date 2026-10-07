@@ -60,7 +60,7 @@ class Profiler:
           "e2e_enable_fw_thermal_event": config.xprof_e2e_enable_fw_thermal_event,
       }
 
-  def maybe_activate_profiler(self, step, state):
+  def maybe_activate_profiler(self, step, state, maybe_mpmd_mesh=None, profiling_process_ids=None):
     """Conditionally activates the profiler based on the current step.
     This method checks if the current training step matches the step designated
     for starting an initial profile, or if it meets the criteria for
