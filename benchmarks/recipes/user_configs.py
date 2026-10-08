@@ -27,10 +27,10 @@ import sys
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
-from .. import maxtext_trillium_model_configs as v6e_model_configs
-from .. import maxtext_v5e_model_configs as v5e_model_configs
-from .. import maxtext_v5p_model_configs as v5p_model_configs
-from .pw_utils import build_user_models, get_cluster_config, get_pathways_config
+from benchmarks import maxtext_trillium_model_configs as v6e_model_configs
+from benchmarks import maxtext_v5e_model_configs as v5e_model_configs
+from benchmarks import maxtext_v5p_model_configs as v5p_model_configs
+from benchmarks.recipes.pw_utils import build_user_models, get_cluster_config, get_pathways_config
 
 
 AVAILABLE_MODELS_FRAMEWORKS = ["mcjax", "pathways"]
@@ -53,10 +53,11 @@ class UserConfig:
   zone: str = "us-east5-b"
   device_type: str = "v6e-256"
   priority: str = "medium"
+  base_output_directory: str = None
 
   # Images for env
-  server_image: str = "us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server"
-  proxy_image: str = "us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server"
+  server_image: str = "us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server"
+  proxy_image: str = "us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server"
   runner: str = "us-docker.pkg.dev/path/to/maxtext_runner"
   colocated_python_image: str = None
   worker_flags: str = ""
@@ -77,7 +78,10 @@ class UserConfig:
 
   # other configuration
   xpk_path: str = "~/xpk"
+  delete: bool = False
   max_restarts: int = 0
+  temp_key: str = None
+  workload_id: str = None
 
   def __post_init__(self):
     """Automatically generate derived attributes after the object is created."""
@@ -95,7 +99,7 @@ class UserConfig:
         self.worker_flags,
     )
     self.headless_workload_name = f"{self.user[:3]}-headless"
-    self.base_output_directory = f"gs://{self.user}-{self.region}/{self.user}-"
+    self.base_output_directory = self.base_output_directory or f"gs://{self.user}-{self.region}/{self.user}-"
 
     device_base_type = self.device_type.split("-", maxsplit=1)[0]
     self.models = build_user_models(
@@ -122,4 +126,7 @@ USER_CONFIG = UserConfig(
     selected_model_framework=["pathways"],
     selected_model_names=["llama3_1_8b_8192"],
     priority="medium",
+    base_output_directory=None,  # GCS Bucket path
+    # Optional parameters, useful for single controller data loading optimizations
+    # proxy_flags="--sidecar_name=external",
 )

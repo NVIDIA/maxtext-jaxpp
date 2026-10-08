@@ -22,11 +22,13 @@ import datetime
 from etils import epath
 from flax.training import train_state
 import jax
-from MaxText.globals import DEFAULT_OCDBT_TARGET_DATA_FILE_SIZE
-from MaxText.multihost_dataloading import MultiHostDataLoadIterator, RemoteIterator
-from MaxText.input_pipeline.input_pipeline_interface import PlaceHolderDataIterator
+from maxtext.utils.globals import DEFAULT_OCDBT_TARGET_DATA_FILE_SIZE
+from maxtext.input_pipeline.multihost_dataloading import MultiHostDataLoadIterator
+from maxtext.input_pipeline.multihost_dataloading import RemoteIterator
+from maxtext.input_pipeline.synthetic_data_processing import PlaceHolderDataIterator
 from maxtext.utils import exceptions
 from maxtext.utils import max_logging
+from maxtext.utils import gcs_utils
 import numpy as np
 import orbax.checkpoint as ocp
 from orbax.checkpoint import v1 as ocp_v1
@@ -216,6 +218,10 @@ def create_orbax_checkpoint_manager(
     enable_continuous_checkpointing: bool = False,
     max_num_checkpoints_to_keep: int = 10,
     checkpoint_storage_concurrent_gb: int = 96,
+    enable_single_controller: bool = False,
+    colocated_python_checkpointing: bool = False,
+    enable_single_replica_ckpt_restoring: bool = False,
+    enable_autocheckpoint: bool = False,
 ):
   """Returns specified Orbax (async or not) CheckpointManager or None if checkpointing is disabled."""
   if not enable_checkpointing:
@@ -241,14 +247,23 @@ def create_orbax_checkpoint_manager(
     item_handlers["iter"] = GrainCheckpointHandler()
 
   # local storage checkpoint needs parent directory created
-  p = epath.Path(checkpoint_dir)
-  p.mkdir(exist_ok=True, parents=True)
+  p = gcs_utils.mkdir_and_check_permissions(checkpoint_dir)
   if enable_continuous_checkpointing:
+    max_logging.log("Enabling policy for continuous checkpointing.")
     save_decision_policy = save_decision_policy_lib.ContinuousCheckpointingPolicy()
-    preservation_policy = preservation_policy_lib.LatestN(max_num_checkpoints_to_keep)
+  elif enable_autocheckpoint:
+    max_logging.log("Enabling policy for autocheckpoint.")
+    save_decision_policy = save_decision_policy_lib.AnySavePolicy(
+        [
+            save_decision_policy_lib.PreemptionCheckpointingPolicy(),
+            save_decision_policy_lib.FixedIntervalPolicy(save_interval_steps),
+        ]
+    )
   else:
+    max_logging.log("Enabling policy for fixed interval checkpointing.")
     save_decision_policy = save_decision_policy_lib.FixedIntervalPolicy(interval=save_interval_steps)
-    preservation_policy = preservation_policy_lib.LatestN(max_num_checkpoints_to_keep)
+  preservation_policy = preservation_policy_lib.LatestN(max_num_checkpoints_to_keep)
+
   async_options = None
   if enable_continuous_checkpointing:
     async_options = ocp.AsyncOptions(
@@ -268,6 +283,17 @@ def create_orbax_checkpoint_manager(
       logger=orbax_logger,
   )
 
+  # Use Colocated Python checkpointing optimization (Single Controller only).
+  if enable_single_controller and colocated_python_checkpointing:
+    max_logging.log("Registering colocated python array handler")
+    checkpointing_impl = ocp.pathways.CheckpointingImpl.from_options(
+        use_colocated_python=True,
+    )
+    ocp.pathways.register_type_handlers(
+        use_single_replica_array_handler=enable_single_replica_ckpt_restoring,
+        checkpointing_impl=checkpointing_impl,
+    )
+
   max_logging.log("Checkpoint manager created!")
   return manager
 
@@ -285,19 +311,18 @@ def create_orbax_emergency_checkpoint_manager(
   flags.FLAGS.experimental_orbax_use_distributed_process_id = True
   max_logging.log("Creating emergency checkpoint manager...")
 
-  # Only create directories if running on GPUs as the previous
-  # directory structure might be assumed by TPUs
+  # Only create local directories if running on GPUs as the previous directory structure might be assumed by TPUs.
   if global_mesh.devices.flatten()[0].platform == "gpu":
     # pylint: disable=protected-access
     local_checkpoint_dir = f"{local_checkpoint_dir}/{jax._src.distributed.global_state.process_id}"
     local_p = epath.Path(local_checkpoint_dir)
-    persistent_p = epath.Path(persistent_checkpoint_dir)
     local_p.mkdir(exist_ok=True, parents=True)
-    persistent_p.mkdir(exist_ok=True, parents=True)
+
+  persistent_p = gcs_utils.mkdir_and_check_permissions(persistent_checkpoint_dir)
 
   manager = EmergencyCheckpointManager(
       local_checkpoint_dir,
-      epath.Path(persistent_checkpoint_dir),
+      persistent_p,
       global_mesh=global_mesh,
       abstract_state=abstract_state,
       options=emergency_checkpoint_manager.CheckpointManagerOptions(
@@ -736,8 +761,8 @@ def save_checkpoint(checkpoint_manager, step, state, config=None, data_iterator=
     if (
         force
         or (step % config.checkpoint_period == 0 and not config.enable_continuous_checkpointing)
-        or (step % config.checkpoint_period == 0)
         or (config.enable_emergency_checkpoint and step % config.local_checkpoint_period == 0)
+        or (config.enable_autocheckpoint and checkpoint_manager.reached_preemption(step))
     ):
       blocking_until_ready_start = time.time()
       max_logging.log(f"Waiting for step {step} to finish before checkpoint...")

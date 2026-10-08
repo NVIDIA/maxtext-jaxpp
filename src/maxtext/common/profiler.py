@@ -51,7 +51,16 @@ class Profiler:
       ManagedMLDiagnostics(config)  # Initialize the MLRun instance.
     self.use_jaxpp = config.use_jaxpp
 
-  def maybe_activate_profiler(self, step, state, maybe_mpmd_mesh=None, profiling_process_ids=None):
+    self.profiling_options = jax.profiler.ProfileOptions()
+    if self.mode == "xplane" and not self.managed_mldiagnostics and config.profile_power_events:
+      self.profiling_options.advanced_configuration = {
+          "tpu_power_trace_level": config.xprof_tpu_power_trace_level,
+          "e2e_enable_fw_throttle_event": config.xprof_e2e_enable_fw_throttle_event,
+          "e2e_enable_fw_power_level_event": config.xprof_e2e_enable_fw_power_level_event,
+          "e2e_enable_fw_thermal_event": config.xprof_e2e_enable_fw_thermal_event,
+      }
+
+  def maybe_activate_profiler(self, step, state):
     """Conditionally activates the profiler based on the current step.
     This method checks if the current training step matches the step designated
     for starting an initial profile, or if it meets the criteria for
@@ -95,7 +104,7 @@ class Profiler:
         return
       self.libcudart.cudaProfilerStart()
     elif self.mode == "xplane":
-      jax.profiler.start_trace(self.output_path)
+      jax.profiler.start_trace(self.output_path, profiler_options=self.profiling_options)
 
   def maybe_deactivate_profiler(self, step, state, profiling_process_ids=None):
     """Conditionally deactivates the profiler based on the current step.
@@ -128,10 +137,10 @@ class Profiler:
         max_logging.log("WARNING: library for nsys was not loaded \n" "profiler has no effect")
         return
       # Popen() instead of run() for non-blocking behavior
-      if shutil.which("gsutil") is not None:
-        subprocess.Popen(["gsutil", "cp", "*nsys-rep", self.output_path])  # pylint: disable=consider-using-with
+      if shutil.which("gcloud") is not None:
+        subprocess.Popen(["gcloud", "storage", "cp", "*nsys-rep", self.output_path])  # pylint: disable=consider-using-with
       else:
-        max_logging.log("WARNING: gsutil is not installed or not found in the system's PATH. Skipping upload...")
+        max_logging.log("WARNING: gcloud is not installed or not found in the system's PATH. Skipping upload...")
     elif self.mode == "xplane":
       jax.profiler.stop_trace()
 

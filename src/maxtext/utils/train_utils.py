@@ -13,21 +13,24 @@
 # limitations under the License.
 
 # pylint: disable=bare-except, consider-using-generator
-""" Utils that are only interesting for training in MaxText. """
+"""Utils that are only interesting for training in MaxText."""
 
 import os
 import jax
-from MaxText import sharding
-from MaxText import optimizers
-from MaxText.rampup_batch import create_rampup_manager
+import functools
+from flax.linen import partitioning as nn_partitioning
 from maxtext.common import checkpointing
 from maxtext.common.data_loader import create_dataloader
 from maxtext.common.goodput import GoodputEvent, maybe_record_goodput
+from maxtext.optimizers import optimizers
 from maxtext.trainers.post_train.dpo.dpo_utils import _merge_dpo_state
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
 from maxtext.utils import model_creation_utils
+from maxtext.utils import sharding
+from maxtext.utils.rampup_batch import create_rampup_manager
+from maxtext.trainers.diloco import diloco
 
 import jaxpp.api as jaxpp
 
@@ -59,7 +62,7 @@ def create_training_tools(config, model, mesh):
     # TODO(b/368121306): Remove this once zarr3 support is plumbed on the backend
     use_ocdbt = config.checkpoint_storage_use_ocdbt
     use_zarr3 = config.checkpoint_storage_use_zarr3
-    if config.enable_single_controller:
+    if config.enable_single_controller and not config.colocated_python_checkpointing:
       use_ocdbt, use_zarr3 = False, False
 
     checkpoint_dir = ""
@@ -77,6 +80,10 @@ def create_training_tools(config, model, mesh):
         config.enable_continuous_checkpointing,
         config.max_num_checkpoints_to_keep,
         config.checkpoint_storage_concurrent_gb,
+        config.enable_single_controller,
+        config.colocated_python_checkpointing,
+        config.enable_single_replica_ckpt_restoring,
+        config.enable_autocheckpoint,
     )
 
   return init_rng, checkpoint_manager, learning_rate_schedule, tx
@@ -84,23 +91,22 @@ def create_training_tools(config, model, mesh):
 
 def jit_train_step(config, model, state, state_mesh_shardings, data_sharding, train_step, params_shardings):
   """Returns a JIT-compiled train step function, which is loaded from a file if specified in the config."""
-
-  mpmd_mesh = None
-  if config.use_jaxpp:
-    mpmd_mesh = jaxpp.MpmdMesh(model.mesh, "stage")
-    model.mesh = mpmd_mesh.lowering_mesh()
-    state_mesh_shardings = jax.tree.map(lambda s: s.update(mesh=model.mesh), state_mesh_shardings)
-    params_shardings = jax.tree.map(lambda s: s.update(mesh=model.mesh), params_shardings)
-
-  (
-      functional_train,
-      in_shardings,
-      out_shardings,
-      static_argnums,
-      donate_argnums,
-  ) = maxtext_utils.get_functional_train_with_signature(
-      train_step, data_sharding, state_mesh_shardings, model, config, params_shardings
-  )
+  if config.enable_diloco:
+    functional_train = train_step
+    in_shardings = (state_mesh_shardings, data_sharding, None)  # State, batch, rng
+    out_shardings = (state_mesh_shardings, None)  # State, metrics
+    static_argnums = ()  # We partial out the static argnums of model and config
+    donate_argnums = 0  # This is the index of the state - we allow the compiler to make use of this memory.
+  else:
+    (
+        functional_train,
+        in_shardings,
+        out_shardings,
+        static_argnums,
+        donate_argnums,
+    ) = maxtext_utils.get_functional_train_with_signature(
+        train_step, data_sharding, state_mesh_shardings, model, config, params_shardings
+    )
 
   # Define the compilation of functional_train, either by loading the compiled version or wrapping a new one in a jit
   if config.compiled_trainstep_file != "":
@@ -176,8 +182,9 @@ def jit_train_and_eval_step(
     params_shardings=None,
 ):
   """Returns a JIT-compiled train and eval step function."""
-  # NOTE(jaxpp): all shardings/model/mesh etc. are the full SPMD mesh here
-
+  if config.enable_diloco:
+    train_step_partial = functools.partial(train_step, model, config, state_mesh_shardings, params_shardings)
+    train_step = diloco.build_diloco_train_step(config, train_step_partial, mesh=mesh)
   data_sharding = sharding.get_input_data_sharding(config, mesh)
   p_train_step = jit_train_step(config, model, state, state_mesh_shardings, data_sharding, train_step, params_shardings)
   p_eval_step = None
@@ -208,7 +215,7 @@ def setup_train_loop(config, recorder, devices=None):
     state: the initialized train state
   """
   # pylint: disable=import-outside-toplevel
-  from MaxText.input_pipeline.input_pipeline_interface import create_data_iterator
+  from maxtext.input_pipeline.input_pipeline_interface import create_data_iterator
 
   with maybe_record_goodput(recorder, GoodputEvent.TPU_INIT):
     model = model_creation_utils.from_config(config, devices)
@@ -221,7 +228,7 @@ def setup_train_loop(config, recorder, devices=None):
     data_iterator, eval_data_iterator = create_data_iterator(config, mesh)
     rampup_manager = create_rampup_manager(config, checkpoint_manager)
     data_loader = create_dataloader(config, mesh, data_iterator, recorder, rampup_manager)
-    context_parallel_size = mesh.shape["context"]
+    context_parallel_size = mesh.shape.get("context", 1)
     # Check if context parallelism is being used with sequence packing
     if context_parallel_size > 1 and config.packing and config.dataset_type != "synthetic":
       raise ValueError(
@@ -244,13 +251,18 @@ def setup_train_loop(config, recorder, devices=None):
         model, data_iterator, tx, config, init_rng, mesh, checkpoint_manager
     )
 
-    def make_line(keypath, array_or_array_ref):
-      sharding = array_or_array_ref.sharding
-      return (f"{jax.tree_util.keystr(keypath):<120}, {str(array_or_array_ref.dtype):<10}, "
-              f"{str(array_or_array_ref.shape):<26}, {sharding._to_xla_hlo_sharding(array_or_array_ref.ndim)}")
+    if config.enable_diloco:
+      with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
+        state, outer_opt_state_sharding = diloco.build_diloco_state(config, lambda: state, mesh=mesh)
 
-    max_logging.log("shardings/weights")
-    max_logging.log("\n".join(make_line(keypath, array_ref) for keypath, array_ref in jax.tree_util.tree_leaves_with_path(state)))
+        # create state_mesh_shardings for the DilocoState
+        inner_state_shardings = diloco.add_diloco_to_sharding(state_mesh_shardings)
+        state_mesh_shardings = diloco.DiLoCoTrainState(
+            inner_state_shardings,
+            state_mesh_shardings.params,
+            outer_opt_state_sharding,
+            jax.sharding.NamedSharding(mesh=state_mesh_shardings.step.mesh, spec=jax.sharding.PartitionSpec()),
+        )
 
     # TODO(aireenmei, hengtaoguo): support sharding in vit for multimodal
     if not config.using_pipeline_parallelism and not config.use_multimodal:

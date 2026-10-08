@@ -85,7 +85,7 @@ jobs:
           source .venv/bin/activate
           maxtext_wheel=$(ls maxtext-*-py3-none-any.whl 2>/dev/null)
           uv pip install ${maxtext_wheel}[tpu] --resolution=lowest
-          uv pip install -r src/install_maxtext_extra_deps/extra_deps_from_github.txt
+          uv pip install -r src/dependencies/github_deps/pre_train_deps.txt
           python3 --version
           python3 -m pip freeze
       - name: Copy test assets files
@@ -100,7 +100,7 @@ jobs:
           export MAXTEXT_REPO_ROOT=$(pwd)
           export MAXTEXT_ASSETS_ROOT=$(pwd)/src/maxtext/assets
           export MAXTEXT_TEST_ASSETS_ROOT=$(pwd)/tests/assets
-          export MAXTEXT_PKG_DIR=$(pwd)/src/MaxText
+          export MAXTEXT_PKG_DIR=$(pwd)/src/maxtext
           # TODO(b/454659463): Enable test_default_hlo_match after volume mount is supported.
           .venv/bin/python3 -m pytest ${{ inputs.pytest_addopts }} -v -m "${FINAL_PYTEST_MARKER}" -k "not AotHloIdenticalTest and not CompileThenLoad" --durations=0
         env:

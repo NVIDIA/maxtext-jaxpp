@@ -25,10 +25,10 @@ import random
 import os
 import os.path
 
-from MaxText.train import main as train_main
-from MaxText.sft_trainer import main as sft_main
-from MaxText.globals import MAXTEXT_ASSETS_ROOT, MAXTEXT_PKG_DIR
 from maxtext.common.gcloud_stub import is_decoupled
+from maxtext.trainers.pre_train.train import main as train_main
+from maxtext.utils.globals import MAXTEXT_ASSETS_ROOT
+from maxtext.trainers.post_train.sft.train_sft_deprecated import main as sft_main
 
 from tests.utils.test_helpers import get_test_config_path, get_test_dataset_path, get_test_base_output_directory
 
@@ -62,13 +62,15 @@ class GradientAccumulationTest(unittest.TestCase):
         get_test_config_path(),
         f"base_output_directory={self.base_output_directory}",
         f"dataset_path={self.dataset_path}",
+        "dataset_type=synthetic",
         "gradient_clipping_threshold=0",  # Ensures we are testing raw scales of gradients (clipping off)
         "enable_checkpointing=False",
         "enable_goodput_recording=False",
+        "decoder_block=simple",
         "base_emb_dim=256",
         "base_num_decoder_layers=4",
         rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}",
-        "steps=20",
+        "steps=2",
     ]
     # Run with gradient accumulation with accumulate_steps=10, per_device_batch=1 --> simulating per_device_batch=10
     train_main(
@@ -151,7 +153,7 @@ class GradientAccumulationTest(unittest.TestCase):
     sft_main(
         [
             None,
-            os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+            get_test_config_path(),
             "base_output_directory=gs://runner-maxtext-logs",
             "dataset_path=gs://maxtext-dataset",
             "gradient_clipping_threshold=0",  # Ensures we are testing raw scales of gradients (clipping off).

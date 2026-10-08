@@ -35,9 +35,9 @@ import time
 import omegaconf
 
 import benchmarks.maxtext_trillium_model_configs as model_configs
+import benchmarks.xla_flags_library as xla_flags
 from benchmarks.globals import MAXTEXT_PKG_DIR
 from benchmarks.command_utils import run_command_with_updates
-import benchmarks.xla_flags_library as xla_flags
 from benchmarks.disruption_management.disruption_handler import DisruptionConfig
 from benchmarks.disruption_management.disruption_manager import DisruptionManager
 from benchmarks.xpk_configs import XpkClusterConfig
@@ -428,7 +428,7 @@ def build_user_command(
   if wl_config.hlo_dump:
     hlo_dump = "XLA_FLAGS='--xla_dump_large_constants --xla_dump_to=/tmp/xla_dump'"
     upload_hlo_dump = (
-        f" && gsutil -m cp -r /tmp/xla_dump  {wl_config.base_output_directory}/{wl_config.run_name}/hlo_dump"
+        f" && gcloud storage cp -r /tmp/xla_dump  {wl_config.base_output_directory}/{wl_config.run_name}/hlo_dump"
     )
   # Construct the command string with proper formatting and line continuations
   command = " ".join(
@@ -439,8 +439,8 @@ def build_user_command(
           "export ENABLE_PATHWAYS_PERSISTENCE=1 &&",
           f"export JAX_PLATFORMS={jax_platforms} &&",
           "export ENABLE_PJRT_COMPATIBILITY=true &&",
-          "export MAXTEXT_ASSETS_ROOT=/deps/src/maxtext/assets MAXTEXT_PKG_DIR=/deps/src/MaxText MAXTEXT_REPO_ROOT=/deps &&"
-          f'{hlo_dump} python3 -m MaxText.train {os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")}',
+          "export MAXTEXT_ASSETS_ROOT=/deps/src/maxtext/assets MAXTEXT_PKG_DIR=/deps/src/maxtext MAXTEXT_REPO_ROOT=/deps &&"
+          f'{hlo_dump} python3 -m maxtext.trainers.pre_train.train {os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")}',
           f"{config_tuning_params}",
           f"steps={wl_config.num_steps}",
           f"model_name={wl_config.model.model_type}",
@@ -586,24 +586,31 @@ def generate_xpk_workload_cmd(
     cluster_config: XpkClusterConfig,
     wl_config: WorkloadConfig,
     workload_name=None,
+    user=None,
+    temp_key=None,
     exp_name=None,
 ):
   """Generates a command to run a maxtext model on XPK."""
 
+  user = user or os.environ.get("USER", "user")
   is_pathways_enabled = wl_config.pathways_config is not None
   is_pathways_headless_enabled = wl_config.pathways_config and wl_config.pathways_config.headless
 
   time.localtime()
   length_of_random_str = 3
-  temp_post_fix = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(length_of_random_str))
+  # Allow DAG to resolve workload name for cleanup, preventing reliance on random IDs
+  if temp_key is not None:
+    temp_post_fix = temp_key
+  else:
+    temp_post_fix = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(length_of_random_str))
 
   truncate_model_name = 10
   truncate_prefix = 3
   post_fix = f"-{wl_config.num_slices}-{time.strftime('%m%d%H', time.localtime())}-{temp_post_fix}"
-  common_prefix = os.environ["USER"]
+  common_prefix = user
   pw_prefix = "pw-"
 
-  if workload_name is None:  # Generate name if not provided
+  if workload_name is None:
     if is_pathways_enabled:
       post_fix = f"-{wl_config.num_slices}-{temp_post_fix}"
       name = f"{pw_prefix}{wl_config.model.model_name.replace('_', '-')[:truncate_model_name - len(pw_prefix)]}"
@@ -713,6 +720,7 @@ def run_xpk_workload(
 def xpk_benchmark_runner(
     cluster_config: XpkClusterConfig,
     workload_configs: list[WorkloadConfig],
+    user=None,
     disruption_manager: DisruptionManager = DisruptionManager(),
     exp_name: str = None,
 ):
@@ -731,10 +739,17 @@ def xpk_benchmark_runner(
   Returns:
     The DisruptionManager instance, potentially updated with new workloads.
   """
+  user = user or os.environ.get("USER", "user")
   xpk_workload_names = []
   xpk_workload_cmds = []
   for wl_config in workload_configs:
-    command, name = generate_xpk_workload_cmd(cluster_config=cluster_config, wl_config=wl_config, exp_name=exp_name)
+    command, name = generate_xpk_workload_cmd(
+        cluster_config=cluster_config,
+        wl_config=wl_config,
+        workload_name=wl_config.run_name,
+        user=user,
+        exp_name=exp_name,
+    )
 
     print(f"Name of the workload is: {name} \n")
     xpk_workload_names.append(name)

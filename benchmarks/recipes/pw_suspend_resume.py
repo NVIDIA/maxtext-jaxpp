@@ -25,11 +25,10 @@ import sys
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
-from . import args_helper as helper
-from . import user_configs
-
 from benchmarks.disruption_management.disruption_handler import DisruptionMethod
-from .runner_utils import generate_and_run_workloads
+from benchmarks.recipes import args_helper as helper
+from benchmarks.recipes import user_configs
+from benchmarks.recipes.runner_utils import generate_and_run_workloads
 
 user_configs.USER_CONFIG.max_restarts = 3
 DISRUPTION_METHOD = DisruptionMethod.SIGTERM
@@ -43,7 +42,7 @@ def main():
   """Main function to run the suspend/resume disruption test."""
   user_configs.USER_CONFIG.headless = False
   should_continue = helper.handle_cmd_args(
-      user_configs.USER_CONFIG.cluster_config, helper.DELETE, xpk_path=user_configs.USER_CONFIG.xpk_path
+      user_configs.USER_CONFIG.cluster_config, user_configs.USER_CONFIG.delete, user_configs.USER_CONFIG.user
   )
 
   if not should_continue:

@@ -50,8 +50,8 @@ export OUTFILE="${OUTDIR}/decode.txt"
 mkdir -p $OUTDIR
 echo
 # Run command
-${cmd} python3 -m maxtext.decode \
-  "${MAXTEXT_PKG_DIR:-${MAXTEXT_REPO_ROOT:-$PWD}/src/MaxText}"/configs/base.yml \
+${cmd} python3 -m maxtext.inference.decode \
+  "${MAXTEXT_CONFIGS_DIR:-${MAXTEXT_REPO_ROOT:-$PWD}/src/maxtext/configs}"/base.yml \
   tokenizer_path=${TOKENIZER_PATH} \
   load_parameters_path=${LOAD_PARAMETERS_PATH} \
   max_prefill_predict_length=${MAX_PREFILL_PREDICT_LENGTH} \
@@ -71,7 +71,5 @@ echo
 echo "Output directed to: ${OUTFILE}"
 echo
 echo "Checkpoint saved at:$SAVE_QUANTIZED_CHECKPOINT_PATH"
-${cmd} gsutil ls -lh $SAVE_QUANTIZED_CHECKPOINT_PATH >> ${OUTFILE}
+${cmd} gcloud storage ls --long --readable-sizes $SAVE_QUANTIZED_CHECKPOINT_PATH >> ${OUTFILE}
 echo
-
-

@@ -42,92 +42,37 @@ rely on the vLLM library.
 
 Let's get started!
 
-## Create virtual environment and Install MaxText dependencies
+## Install MaxText and post-training dependencies
 
-If you have already completed the
-[MaxText installation](../../install_maxtext.md), you can skip to the next
-section for post-training dependencies installations. Otherwise, please install
-`MaxText` using the following commands before proceeding.
-
-```bash
-# 1. Clone the repository
-git clone https://github.com/AI-Hypercomputer/maxtext.git
-cd maxtext
-
-# 2. Create virtual environment
-export VENV_NAME=<your virtual env name> # e.g., maxtext_venv
-pip install uv
-uv venv --python 3.12 --seed $VENV_NAME
-source $VENV_NAME/bin/activate
-
-# 3. Install dependencies in editable mode
-uv pip install -e .[tpu] --resolution=lowest
-install_maxtext_github_deps
-```
-
-## Install Post-Training dependencies
-
-### Option 1: From PyPI releases
-
-> **Caution:** RL in MaxText is currently broken with PyPI releases of
-> post-training dependencies. We are working on fixing this and recommend
-> following [Option 2: From Github](#option-2-from-github) in the meantime.
-
-Next, run the following bash script to get all the necessary installations
-inside the virtual environment (for e.g., `maxtext_venv`). This will take few
-minutes. Follow along the installation logs and look out for any issues!
-
-```
-bash tools/setup/setup_post_training_requirements.sh
-```
-
-Primarily, it installs `Tunix`, and `vllm-tpu` which is
-[vllm](https://github.com/vllm-project/vllm) and
-[tpu-inference](https://github.com/vllm-project/tpu-inference) and thereby
-providing TPU inference for vLLM, with unified JAX and PyTorch support.
-
-### Option 2: From Github
-
-You can also locally git clone [tunix](https://github.com/google/tunix) and
-install using the instructions
-[here](https://github.com/google/tunix?tab=readme-ov-file#installation).
-Similarly install [vllm](https://github.com/vllm-project/vllm) and
-[tpu-inference](https://github.com/vllm-project/tpu-inference) from source
-following the instructions
-[here](https://docs.vllm.ai/projects/tpu/en/latest/getting_started/installation/#install-from-source).
-To get a set of compatible commit IDs for `maxtext`, `tunix`, `tpu-inference`,
-and `vllm`, follow these steps:
-
-1. Navigate to the
-   [MaxText Package Tests](https://github.com/AI-Hypercomputer/maxtext/actions/workflows/build_and_test_maxtext.yml?query=event%3Aschedule)
-   GitHub Actions workflow.
-
-1. Select the latest successful run.
-
-1. Within the workflow run, find and click on the `maxtext_jupyter_notebooks (py312)` job, then expand the `run` job.
-
-1. Locate the `Record Commit IDs` step. The commit SHAs for `maxtext`, `tunix`,
-   `tpu-inference`, and `vllm` that were used in that successful run are listed
-   in the logs of this step.
-
-1. Prior to installation, ensure that the `maxtext`, `tunix`, `vllm`, and `tpu-inference` repositories are synchronized to the specific commits recorded from the CI logs. For each repository, use the following command to switch to the correct commit: `git checkout <commit_id>`.
+For instructions on installing MaxText with post-training dependencies on your VM, please refer to the [official documentation](https://maxtext.readthedocs.io/en/latest/install_maxtext.html) and use the `maxtext[tpu-post-train]` installation path to include all necessary post-training dependencies.
 
 ## Setup environment variables
+
+Login to Hugging Face. Provide your access token when prompted:
+
+```bash
+hf auth login
+```
 
 Setup following environment variables before running GRPO/GSPO:
 
 ```bash
 # -- Model configuration --
-export HF_MODEL=<Hugging Face Model> # e.g. 'llama3.1-8b-Instruct'
-export MODEL=<MaxText Model> # e.g. 'llama3.1-8b'
-export TOKENIZER=<Tokenizer> # e.g. 'meta-llama/Llama-3.1-8B-Instruct'
-export HF_TOKEN=<Hugging Face access token>
+export MODEL=<MaxText Model> # e.g. 'llama3.1-8b-Instruct'
 
 # -- MaxText configuration --
 export BASE_OUTPUT_DIRECTORY=<output directory to store run logs> # e.g., gs://my-bucket/my-output-directory
 
 export RUN_NAME=<name for this run> # e.g., $(date +%Y-%m-%d-%H-%M-%S)
+
+export CHIPS_PER_VM=<the number of chips per VM> # depends on hardware, for v5p this is 4, for v6e this is 8
 ```
+
+For the value of `CHIPS_PER_VM` on different TPU hardware, refer the official document
+
+- [TPU v5e](https://docs.cloud.google.com/tpu/docs/v5e) (single host, chips_per_vm=8)
+- [TPU v5p](https://docs.cloud.google.com/tpu/docs/v5p) (single host, chips_per_vm=4)
+- [TPU v6e](https://docs.cloud.google.com/tpu/docs/v6e) (single host, chips_per_vm=8)
 
 ## Get your model checkpoint
 
@@ -142,7 +87,7 @@ export MAXTEXT_CKPT_PATH=<gcs path for MaxText checkpoint> # e.g., gs://my-bucke
 
 ### Option 2: Converting from a Hugging Face checkpoint
 
-Refer the steps in [Hugging Face to MaxText](../../guides/checkpointing_solutions/convert_checkpoint.md#hugging-face-to-maxtext) to convert a hugging face checkpoint to MaxText. Make sure you have correct checkpoint files converted and saved. Similar as Option 1, you can set the following environment and move on.
+Refer the steps in [Hugging Face to MaxText](https://maxtext.readthedocs.io/en/maxtext-v0.2.1/guides/checkpointing_solutions/convert_checkpoint.html#hugging-face-to-maxtext) to convert a hugging face checkpoint to MaxText. Make sure you have correct checkpoint files converted and saved. Similar as Option 1, you can set the following environment and move on.
 
 ```bash
 export MAXTEXT_CKPT_PATH=<gcs path for MaxText checkpoint> # e.g., gs://my-bucket/my-model-checkpoint/0/items
@@ -153,22 +98,21 @@ export MAXTEXT_CKPT_PATH=<gcs path for MaxText checkpoint> # e.g., gs://my-bucke
 Run the following command for GRPO:
 
 ```
-python3 -m src.MaxText.rl.train_rl src/MaxText/configs/rl.yml \
-  model_name=${MODEL} \
-  tokenizer_path=${TOKENIZER} \
-  load_parameters_path=${MAXTEXT_CKPT_PATH} \
-  run_name=${RUN_NAME} \
-  base_output_directory=${BASE_OUTPUT_DIRECTORY} \
-  hf_access_token=${HF_TOKEN}
+python3 -m maxtext.trainers.post_train.rl.train_rl \
+  model_name=${MODEL?} \
+  load_parameters_path=${MAXTEXT_CKPT_PATH?} \
+  run_name=${RUN_NAME?} \
+  base_output_directory=${BASE_OUTPUT_DIRECTORY?} \
+  chips_per_vm=${CHIPS_PER_VM?}
 ```
 
 The overview of what this run will do is as follows:
 
 1. We load a policy model and a reference model. Both are copies of the model
    checkpoint you specified (e.g., `Llama3.1-8b-Instruct`).
-1. Evaluate the policy model's performance on GSM8K math reasoning benchmark.
-1. Train the policy model using GRPO.
-1. Evaluate the policy model's performance on GSM8K math reasoning benchmark
+2. Evaluate the policy model's performance on GSM8K math reasoning benchmark.
+3. Train the policy model using GRPO.
+4. Evaluate the policy model's performance on GSM8K math reasoning benchmark
    after the post-training with GRPO.
 
 ## Run GSPO
@@ -176,21 +120,20 @@ The overview of what this run will do is as follows:
 Run the following command for GSPO:
 
 ```
-python3 -m src.MaxText.rl.train_rl src/MaxText/configs/rl.yml \
-  model_name=${MODEL} \
-  tokenizer_path=${TOKENIZER} \
-  load_parameters_path=${MAXTEXT_CKPT_PATH} \
-  run_name=${RUN_NAME} \
-  base_output_directory=${BASE_OUTPUT_DIRECTORY} \
-  hf_access_token=${HF_TOKEN} \
-  loss_algo=gspo-token
+python3 -m maxtext.trainers.post_train.rl.train_rl \
+  model_name=${MODEL?} \
+  load_parameters_path=${MAXTEXT_CKPT_PATH?} \
+  run_name=${RUN_NAME?} \
+  base_output_directory=${BASE_OUTPUT_DIRECTORY?} \
+  loss_algo=gspo-token \
+  chips_per_vm=${CHIPS_PER_VM?}
 ```
 
 The overview of what this run will do is as follows:
 
 1. We load a policy model and a reference model. Both are copies of the model
    checkpoint you specified (e.g., `Llama3.1-8b-Instruct`).
-1. Evaluate the policy model's performance on GSM8K math reasoning benchmark.
-1. Train the policy model using GSPO.
-1. Evaluate the policy model's performance on GSM8K math reasoning benchmark
+2. Evaluate the policy model's performance on GSM8K math reasoning benchmark.
+3. Train the policy model using GSPO.
+4. Evaluate the policy model's performance on GSM8K math reasoning benchmark
    after the post-training with GSPO.

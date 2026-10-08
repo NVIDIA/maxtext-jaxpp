@@ -1,14 +1,14 @@
 #!/bin/bash
 
-CONFIG_PATH="${MAXTEXT_PKG_DIR:-${MAXTEXT_REPO_ROOT:-$PWD}/src/MaxText}/configs/base.yml"
+CONFIG_PATH="${MAXTEXT_PKG_DIR:-${MAXTEXT_REPO_ROOT:-$PWD}/src/maxtext}/configs/base.yml"
 if [ "${DECOUPLE_GCLOUD^^}" = "TRUE" ]; then
-  CONFIG_PATH="${MAXTEXT_PKG_DIR:-${MAXTEXT_REPO_ROOT:-$PWD}/src/MaxText}/configs/decoupled_base_test.yml"
+  CONFIG_PATH="${MAXTEXT_PKG_DIR:-${MAXTEXT_REPO_ROOT:-$PWD}/src/maxtext}/configs/decoupled_base_test.yml"
 fi
 
 # Define the arguments in an array
 args=(
   "-m"
-  "maxtext.decode"
+  "maxtext.inference.decode"
   "${CONFIG_PATH}"
   "tokenizer_path="${MAXTEXT_ASSETS_ROOT:-${MAXTEXT_PKG_DIR:-${MAXTEXT_REPO_ROOT:-$PWD}/src/maxtext/assets/tokenizers}}"/tokenizer.llama2"
   "model_name=llama2-7b"

@@ -37,15 +37,15 @@ import optax
 import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_checkpoint_manager
 import orbax.checkpoint.experimental.emergency.replicator_checkpoint_manager as emergency_replicator_checkpoint_manager
 
-from MaxText import sharding
-from MaxText.configs import types
-from MaxText.common_types import DecoderBlockType, MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE
+from maxtext.common.common_types import DecoderBlockType, MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE
+from maxtext.configs import types
 from maxtext.inference.page_manager import PageState
 from maxtext.common import checkpointing
 from maxtext.multimodal import processor as mm_processor
 from maxtext.utils import gcs_utils
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
+from maxtext.utils import sharding
 
 import chex
 from optax._src import base
@@ -133,7 +133,14 @@ def get_reorder_callable(cp_size, shard_mode):
 def get_shaped_batch(config):
   """Return the shape of the batch - this is what eval_shape would return for the
   output of create_data_iterator, but eval_shape doesn't work, see b/306901078."""
-  batch_shape = (config.global_batch_size_to_load, config.max_target_length)
+  if config.enable_diloco:
+    batch_shape = (
+        config.num_diloco_replicas,
+        config.global_batch_size_to_load // config.num_diloco_replicas,
+        config.max_target_length,
+    )
+  else:
+    batch_shape = (config.global_batch_size_to_load, config.max_target_length)
   shaped_batch = {}
   shaped_batch["inputs"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
   shaped_batch["inputs_position"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
@@ -324,7 +331,7 @@ def calculate_llama4_attention_tflops(config):
   return attention_tflops
 
 
-def calculate_indexer_mask_ratio(index_topk, max_target_length):
+def calculate_indexer_mask_ratio(indexer_topk, max_target_length):
   """
   Calculates the sparse-to-dense ratio for Indexer TFLOPs.
 
@@ -365,7 +372,7 @@ def calculate_indexer_mask_ratio(index_topk, max_target_length):
   """
 
   T = float(max_target_length)
-  K = float(index_topk)
+  K = float(indexer_topk)
 
   ratio = K / T
   mask_multiplier = ratio - (0.5 * ratio**2)
@@ -377,20 +384,20 @@ def calculate_indexer_tflops_per_device(config):
   batch_len = config.per_device_batch_size * config.max_target_length
 
   # 1. Calculate projections flops
-  # Query: [batch, seq, q_lora_rank] @ [q_lora_rank, index_n_heads, index_head_dim]
-  q_flops = 2 * batch_len * config.q_lora_rank * config.index_n_heads * config.index_head_dim
-  # Key: [batch, seq, emb_dim] @ [emb_dim, index_head_dim]
-  k_flops = 2 * batch_len * config.emb_dim * config.index_head_dim
-  # Head weight: [batch, seq, emb_dim] @ [emb_dim, index_n_heads]
-  head_weight_flops = 2 * batch_len * config.emb_dim * config.index_n_heads
+  # Query: [batch, seq, q_lora_rank] @ [q_lora_rank, indexer_n_heads, indexer_head_dim]
+  q_flops = 2 * batch_len * config.q_lora_rank * config.indexer_n_heads * config.indexer_head_dim
+  # Key: [batch, seq, emb_dim] @ [emb_dim, indexer_head_dim]
+  k_flops = 2 * batch_len * config.emb_dim * config.indexer_head_dim
+  # Head weight: [batch, seq, emb_dim] @ [emb_dim, indexer_n_heads]
+  head_weight_flops = 2 * batch_len * config.emb_dim * config.indexer_n_heads
   proj_flops = q_flops + k_flops + head_weight_flops
 
   # 2. Calculate index score flops
-  # QK product [batch, seq, index_n_heads, index_head_dim] @ [batch, seq, index_head_dim]
-  # --> [batch, seq, seq, index_n_heads]
-  qk_product_flops = 2 * batch_len * config.max_target_length * config.index_n_heads * config.index_head_dim
-  # Aggregate heads [batch, seq, seq, index_n_heads] @ [batch, seq, index_n_heads]
-  head_reduction_flops = 2 * batch_len * config.max_target_length * config.index_n_heads
+  # QK product [batch, seq, indexer_n_heads, indexer_head_dim] @ [batch, seq, indexer_head_dim]
+  # --> [batch, seq, seq, indexer_n_heads]
+  qk_product_flops = 2 * batch_len * config.max_target_length * config.indexer_n_heads * config.indexer_head_dim
+  # Aggregate heads [batch, seq, seq, indexer_n_heads] @ [batch, seq, indexer_n_heads]
+  head_reduction_flops = 2 * batch_len * config.max_target_length * config.indexer_n_heads
   # Apply causal mask: Divide by 2 to account for triangular interactions
   # The mask restricts the indexer's search space prior to Top-K filtering
   scoring_flops = (qk_product_flops + head_reduction_flops) / 2
@@ -426,14 +433,14 @@ def calculate_mla_tflops_per_device(config):
   qkv_flops = q_flops + kv_flops
 
   # 3. calculate attention
-  if config.use_sparse_indexer and config.max_target_length > config.index_topk:
+  if config.use_indexer and config.max_target_length > config.indexer_topk:
     # get indexer flops
     indexer_proj_flops, indexer_scoring_flops = calculate_indexer_tflops_per_device(config)
     qkv_flops += indexer_proj_flops
 
     # calculate the proportion of the T x T causal matrix that the Indexer actually explores
-    # this follows the area: (TK - 0.5*K^2) / T^2 (T: max_target_length, K: index_topk)
-    multiplier = calculate_indexer_mask_ratio(config.index_topk, config.max_target_length)
+    # this follows the area: (TK - 0.5*K^2) / T^2 (T: max_target_length, K: indexer_topk)
+    multiplier = calculate_indexer_mask_ratio(config.indexer_topk, config.max_target_length)
     attention_flops = (
         2
         * batch_len
@@ -444,7 +451,7 @@ def calculate_mla_tflops_per_device(config):
     )
     attention_flops += indexer_scoring_flops
   else:
-    # standard MLA & max_target_length <= index_topk in sparse indexer
+    # standard MLA & max_target_length <= indexer_topk in sparse indexer
     # in both cases, the indexer is bypassed as the causal mask remains the efficient representation
     attention_flops = (
         2 * batch_len * config.max_target_length * config.num_query_heads * (qk_head_dim_sum + config.v_head_dim)
@@ -501,7 +508,12 @@ def get_dense_moe_layers(config):
 
 
 def calculate_gated_delta_net_flops_per_device(config):
-  """Calculates the FLOPs for a single Gated Delta Net (Linear Attention) layer."""
+  """
+  - Calculates the FLOPs for a single Gated Delta Net (Linear Attention) layer.
+  - Ref: Megatron calculation for the gated delta net:
+    - https://github.com/NVIDIA/Megatron-LM/blob/8f1c2f8ae53b4e3f32c0ae7f397d8b38a675eaa2/megatron/training/training.py#L513
+  - Core complexity is based on the recurrent state update view (4 ops * 2 FLOPs = 8).
+  """
   B = config.per_device_batch_size
   S = config.max_target_length
   E = config.emb_dim
@@ -510,54 +522,33 @@ def calculate_gated_delta_net_flops_per_device(config):
   H_v = config.gdn_num_value_heads
   D_k = config.gdn_key_head_dim
   D_v = config.gdn_value_head_dim
-  C = config.gdn_chunk_size
   K_conv = config.gdn_conv_kernel_dim
 
   K_dim = H_k * D_k
   V_dim = H_v * D_v
 
   # 1. Projections (Learnable Weights)
-  # in_proj_qkvz: E -> 2*K_dim + 2*V_dim
-  flops_qkvz = 2 * B * S * E * (2 * K_dim + 2 * V_dim)
-  # in_proj_ba: E -> 2*H_v
-  flops_ba = 2 * B * S * E * (2 * H_v)
-  # out_proj: V_dim -> E
-  flops_out = 2 * B * S * V_dim * E
+  # Represents: in_proj_qkvz (2*K + 2*V) + in_proj_ba (2*H_v)
+  # We multiply by 2 for FMA (Multiply + Add)
+  flops_qkvz_ba = 2 * B * S * E * (2 * K_dim + 2 * V_dim + 2 * H_v)
 
-  flops_projections = flops_qkvz + flops_ba + flops_out
+  # Represents: out_proj
+  flops_out = 2 * B * S * E * V_dim
+
+  flops_projections = flops_qkvz_ba + flops_out
 
   # 2. Convolution (Learnable Weights)
-  # Depthwise conv on dim (2*K_dim + V_dim)
-  # 2 * B * S * Channels * Kernel
-  flops_conv = 2 * B * S * (2 * K_dim + V_dim) * K_conv
+  # We multiply by 2 for FMA
+  flops_conv = 2 * B * S * K_conv * (2 * K_dim + V_dim)
 
-  # 3. Core Gated Delta Net (Attention-like operations)
-  # Assumptions:
-  # H = H_v (broadcasting K to V heads if H_v > H_k)
-  # N = num_chunks & N * C ~ S
-  #
-  # Query (Q): [B, S, H_v, D_k]
-  # Keys (K): [B, S, H_v, D_k]
-  # Values (V): [B, S, H_v, D_v]
-  # Intra-Chunk Attention (A): [B, N, H_v, C, C]
-  # Recurrent State (S): [B, N, H_v, D_k, D_v]
-
-  # - Intra-chunk terms (per chunk C):
-  #   - attn (K*K): 2 * B * S * H_v * C * D_k
-  #   - val_intra (A*V): 2 * B * S * H_v * C * D_v
-  #   - k_cum (A*K): 2 * B * S * H_v * C * D_k
-  #   - inner_attn_body loop (iterative refinement): ≈ (C - 1) * B * H * N * C^2 ≈ B * H * S * C^2
-  flops_intra = 2 * B * S * H_v * C * (2 * D_k + D_v) + (B * H_v * S * C**2)
-
-  # - Inter-chunk terms (Recurrent State D_k * D_v):
-  #   - attn_i (Q*K): 2 * B * S * H_v * C * D_k
-  #   - v_prime (K*S): 2 * B * S * H_v * D_k * D_v
-  #   - attn_inter (Q*S): 2 * B * S * H_v * D_k * D_v
-  #   - core_out (A*V): 2 * B * S * H_v * C * D_v
-  #   - update (K*V): 2 * B * S * H_v * D_k * D_v
-  flops_inter = (2 * B * S * H_v * C * (D_k + D_v)) + (6 * B * S * H_v * D_k * D_v)
-
-  flops_core = flops_intra + flops_inter
+  # 3. Core Gated Delta Net
+  # This counts 4 distinct O(D^2) operations in the recurrent update:
+  #   KK^T, VK^T, S(a(I-bKK^T)), and SQ.
+  # We multiply by 2 for FMA.
+  # Total Core FLOPs = 2 (FMA) * 4 (Ops) * H * D^2 = 8 * H * D^2 per token.
+  # We use D_k * D_v to generalize D^2 for potentially differing head dimensions.
+  flops_core_per_token = H_v * (D_k * D_v) * 8
+  flops_core = B * S * flops_core_per_token
 
   # Weights part: Projections + Conv
   gdn_weight_flops = flops_projections + flops_conv
@@ -683,6 +674,38 @@ def calculate_llama4_vision_layers_tflops_per_device(config):
   return total_tflops, learnable_weight_tflops, total_attn_tflops
 
 
+def calculate_engram_tflops(config):
+  """Calculate engram TFLOPs per device."""
+  B = config.per_device_batch_size
+  S = config.max_target_length
+  G = config.mhc_expansion_rate  # Multi-manifold branches
+  D = config.emb_dim  # Hidden dimension
+  k = config.engram_kernel_size  # Conv window
+
+  num_ngram_orders = config.engram_max_ngram_size - 1
+  engram_dim = config.engram_num_heads * config.engram_head_dim * num_ngram_orders
+
+  # 1. Key Projection
+  key_flops = 2 * (B * S) * engram_dim * (G * D)
+  # 2. Value Projection
+  value_flops = 2 * (B * S) * engram_dim * D
+  # 3. QK Attention
+  attention_flops = 2 * (B * S) * G * D
+  # 4. Short Convolution
+  # Standard flops as 2 * kernel_size * input_channels * output_channels / feature_group_count
+  # In Engram, the feature_group_count = input_channels = output_channels
+  # Unlike global attention, convolution work is constant per token (not O(S^2)),
+  # so we do not apply the 0.5 causal scaling factor.
+  total_channels = G * D
+  conv_flops = 2 * (B * S) * k * total_channels
+
+  num_layers = len(config.engram_layers)
+  # account for both the forward (1x) and backward (2x) passes
+  learnable_tflops = num_layers * (key_flops + value_flops + conv_flops) * 3 / 1e12
+  attention_tflops = num_layers * attention_flops * 3 / 1e12
+  return learnable_tflops, attention_tflops
+
+
 def calculate_vision_encoder_tflops(config):
   """Calculate vision encoder TFLOPs per prefill step per device."""
   if config.model_name.startswith("gemma3"):
@@ -800,6 +823,26 @@ def calculate_tflops_training_per_device(config, log=True):
     )
     attention_tflops = causal_attention_flops * config.num_decoder_layers * 3 / 10**12
 
+  # Engram flops
+  if config.engram_layers:
+    engram_learnable_tflops, engram_attention_tflops = calculate_engram_tflops(config)
+    learnable_weight_tflops += engram_learnable_tflops
+    attention_tflops += engram_attention_tflops
+
+  if config.use_multimodal:
+    # Add vision layers TFLOPs for multimodal models
+    mm_total_tflops, mm_learnable_weight_tflops, mm_attention_tflops = calculate_vision_encoder_tflops(config)
+    if log and mm_total_tflops > 0:
+      print(
+          f"{config.model_name} vision layers per train step:\n",
+          f"Total TFLOPs: {mm_total_tflops:.2f} \n",
+          f"split as {100 * mm_learnable_weight_tflops/mm_total_tflops:.2f}% learnable weight flops",
+          f"and {100 * mm_attention_tflops/mm_total_tflops:.2f}% attention flops;\n",
+          f"learnable weight {mm_learnable_weight_tflops:.2f} TFLOPs, attention {mm_attention_tflops:.2f} TFLOPs",
+      )
+    learnable_weight_tflops += mm_learnable_weight_tflops
+    attention_tflops += mm_attention_tflops
+
   learnable_weight_tflops = learnable_weight_tflops * config.gradient_accumulation_steps
   attention_tflops = attention_tflops * config.gradient_accumulation_steps
 
@@ -812,21 +855,6 @@ def calculate_tflops_training_per_device(config, log=True):
     reference_model_tflops = 0
 
   total_tflops = learnable_weight_tflops + attention_tflops + reference_model_tflops
-
-  if config.use_multimodal:
-    # Add vision layers TFLOPs for multimodal models
-    mm_total_tflops, mm_learnable_weight_tflops, mm_attention_tflops = calculate_vision_encoder_tflops(config)
-    if log:
-      print(
-          f"{config.model_name} vision layers per train step:\n",
-          f"Total TFLOPs: {mm_total_tflops:.2f} \n",
-          f"split as {100 * mm_learnable_weight_tflops/mm_total_tflops:.2f}% learnable weight flops",
-          f"and {100 * mm_attention_tflops/mm_total_tflops:.2f}% attention flops;\n",
-          f"learnable weight {mm_learnable_weight_tflops:.2f} TFLOPs, attention {mm_attention_tflops:.2f} TFLOPs",
-      )
-    total_tflops += mm_total_tflops
-    learnable_weight_tflops += mm_learnable_weight_tflops
-    attention_tflops += mm_attention_tflops
 
   if log:
     print(
@@ -926,6 +954,34 @@ def get_nested_value(dictionary, nested_key, default=None):
       return default
     current_level = current_level[key]
   return current_level
+
+
+def get_intermediate_value(model, nested_key, default=None, clear=False):
+  """
+  Retrieves an intermediate value from an NNX model. This functions has context about
+  where the intermediate value is located.
+
+  Args:
+    model: The NNX model.
+    nested_key: A string representing the nested key, e.g., hidden_states_norm_out
+    default: The value to return if the nested key is not found.
+    clear: Clears the intermediate value from the model.
+
+  Returns:
+    The value associated with the nested key, or the default value if not found.
+  """
+  intermediate_value = default
+  match nested_key:
+    case "out_projection_activations":
+      if nested_key in model.decoder.layers["self_attention"]:
+        intermediate_value = model.decoder.layers["self_attention"][nested_key].get_value()[-1]
+        if clear:
+          del model.decoder.layers["self_attention"][nested_key]
+    case _:
+      # Default case to handle any unknown nested keys
+      raise ValueError(f"Incorrect nested_key: {nested_key}")
+
+  return intermediate_value
 
 
 def update_state_param(state, target_path, value):
@@ -1406,7 +1462,7 @@ def create_learning_rate_schedule(config):
   boundaries = []
 
   if warmup_steps > 0:
-    warmup_schedule = optax.linear_schedule(init_value=0.0, end_value=lr, transition_steps=warmup_steps - 1)
+    warmup_schedule = optax.linear_schedule(init_value=0.0, end_value=lr, transition_steps=warmup_steps)
     pieces.append(warmup_schedule)
     boundaries.append(warmup_steps)
 

@@ -25,7 +25,7 @@ BASE_OUTPUT_PATH=${BASE_OUTPUT_PATH%/}
 echo using BASE_OUTPUT_PATH = ${BASE_OUTPUT_PATH}
 
 # Step 1: Checkpoint conversion
-# You can use the HuggingFace checkpoint at https://huggingface.co/deepseek-ai/DeepSeek-V3, and dequantize it to bf16
+# You can use the HuggingFace checkpoint at https://huggingface.co/deepseek-ai/DeepSeek-V3 (fp8), and dequantize it to bf16
 # Assume HF checkpoints are uploaded to GCS bucket at CKPT_BUCKET 
 # Non-Googlers please remember to point `CKPT_BUCKET` to GCS buckets that you own
 # Copying the HF checkpoint into a local directory `/tmp` -- you are free to use a different directory
@@ -36,7 +36,7 @@ if [ -z "${CKPT_DISK_LOCATION}" ]; then
 fi
 
 # 1.1 Convert checkpoint to `scanned` format, more suitable for training 
-JAX_PLATFORMS=cpu python3 -m MaxText.utils.ckpt_scripts.convert_deepseek_family_ckpt --base_model_path ${CKPT_DISK_LOCATION} --maxtext_model_path ${BASE_OUTPUT_PATH}/scanned --model_size ${MODEL_NAME}
+JAX_PLATFORMS=cpu python3 -m maxtext.checkpoint_conversion.standalone_scripts.convert_deepseek_family_ckpt --base_model_path ${CKPT_DISK_LOCATION} --maxtext_model_path ${BASE_OUTPUT_PATH}/scanned --model_size ${MODEL_NAME}
 
 # 1.2 Convert checkpoint to `unscanned` format, more suitable for decoding
-JAX_PLATFORMS=cpu python3 -m MaxText.utils.ckpt_scripts.convert_deepseek_family_unscanned_ckpt --base_model_path ${CKPT_DISK_LOCATION} --maxtext_model_path ${BASE_OUTPUT_PATH}/unscanned --model_size ${MODEL_NAME}
+JAX_PLATFORMS=cpu python3 -m maxtext.checkpoint_conversion.standalone_scripts.convert_deepseek_family_unscanned_ckpt --base_model_path ${CKPT_DISK_LOCATION} --maxtext_model_path ${BASE_OUTPUT_PATH}/unscanned --model_size ${MODEL_NAME}

@@ -21,7 +21,7 @@ by a subsequent training run using a different input pipeline (e.g., 'tfds').
 The tests confirm restoration by checking the starting step of the resumed runs.
 
 Note: Make sure to run
-  `bash tools/setup/setup_gcsfuse.sh DATASET_GCS_BUCKET=gs://maxtext-dataset MOUNT_PATH=/tmp/gcsfuse/`
+  `bash src/dependencies/scripts/setup_gcsfuse.sh DATASET_GCS_BUCKET=gs://maxtext-dataset MOUNT_PATH=/tmp/gcsfuse/`
 before running tests locally.
 """
 
@@ -29,8 +29,8 @@ from datetime import datetime
 import json
 import os
 import pytest
-from MaxText.train import main as train_main
-from MaxText.globals import MAXTEXT_REPO_ROOT
+from maxtext.trainers.pre_train.train import main as train_main
+from maxtext.utils.globals import MAXTEXT_REPO_ROOT
 from tests.integration.checkpointing_test import get_checkpointing_command
 
 

@@ -18,6 +18,7 @@
 
 import json
 import os
+import sys
 import queue
 import enum
 
@@ -25,7 +26,7 @@ import numpy as np
 
 import jax
 
-from MaxText.globals import EPS
+from maxtext.utils.globals import EPS
 from maxtext.common.gcloud_stub import mldiagnostics_modules
 from maxtext.common.gcloud_stub import workload_monitor
 from maxtext.common.managed_mldiagnostics import ManagedMLDiagnostics
@@ -124,6 +125,9 @@ class MetricLogger:
       if self.config.managed_mldiagnostics:
         self.write_metrics_to_managed_mldiagnostics(metrics, step)
 
+      if is_training:
+        self._maybe_abort_after_write_metrics(metrics)
+
   def log_metrics(self, metrics, step, is_training):
     """Logs metrics via max_logging."""
     if is_training:
@@ -214,6 +218,16 @@ class MetricLogger:
         skip_steps + profiler_steps + 1,
     }
     return step in boundary_steps
+
+  def _maybe_abort_after_write_metrics(self, metrics):
+    """This function checks whether we have nan or inf values in training"""
+    loss = metrics["scalar"].get("learning/loss")
+    if self.config.abort_on_nan_loss and np.isnan(loss):
+      max_logging.log("Aborting training due to NaN loss.")
+      sys.exit(1)
+    if self.config.abort_on_inf_loss and np.isinf(loss):
+      max_logging.log("Aborting training due to Inf loss.")
+      sys.exit(1)
 
   def write_metrics_locally(self, metrics, step):
     """Writes metrics locally for testing."""
@@ -339,7 +353,10 @@ class MetricLogger:
       self.cumulative_eval_metrics["scalar"]["eval/moe_lb_loss"] += float(
           max_utils.maybe_unwrap(metrics["scalar"].get("evaluation/moe_lb_loss", 0.0))
       )
-      self.cumulative_eval_metrics["scalar"]["eval/mtp_loss"] += float(max_utils.maybe_unwrap(metrics["scalar"].get("evaluation/mtp_loss", 0.0)))
+      self.cumulative_eval_metrics["scalar"]["eval/indexer_loss"] += float(
+          metrics["scalar"].get("evaluation/indexer_loss", 0.0)
+      )
+      self.cumulative_eval_metrics["scalar"]["eval/mtp_loss"] += float(metrics["scalar"].get("evaluation/mtp_loss", 0.0))
       self.cumulative_eval_metrics["scalar"]["eval/mtp_acceptance_rate_percent"] += float(
           max_utils.maybe_unwrap(metrics["scalar"].get("evaluation/mtp_acceptance_rate_percent", 0.0))
       )
@@ -355,6 +372,9 @@ class MetricLogger:
       self.cumulative_eval_metrics["scalar"]["eval/avg_loss"] = eval_loss
       self.cumulative_eval_metrics["scalar"]["eval/avg_moe_lb_loss"] = (
           self.cumulative_eval_metrics["scalar"]["eval/moe_lb_loss"] / eval_step_count
+      )
+      self.cumulative_eval_metrics["scalar"]["eval/avg_indexer_loss"] = (
+          self.cumulative_eval_metrics["scalar"]["eval/indexer_loss"] / eval_step_count
       )
       self.cumulative_eval_metrics["scalar"]["eval/avg_mtp_loss"] = (
           self.cumulative_eval_metrics["scalar"]["eval/mtp_loss"] / eval_step_count
