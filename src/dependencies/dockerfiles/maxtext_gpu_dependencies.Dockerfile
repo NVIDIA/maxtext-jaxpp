@@ -21,13 +21,13 @@ RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.
 RUN curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key --keyring /usr/share/keyrings/cloud.google.gpg add -
 
 # Install the Google Cloud SDK
-RUN apt-get update && apt-get install -y google-cloud-sdk
+RUN apt-get update && apt-get install -y google-cloud-cli && rm -rf /var/lib/apt/lists/*
 
 # Set environment variables for Google Cloud SDK
 ENV PATH="/usr/local/google-cloud-sdk/bin:${PATH}"
 
 # Upgrade libcusprase to work with Jax
-RUN apt-get update && apt-get install -y libcusparse-12-6
+RUN apt-get update && apt-get install -y libcusparse-13-2
 
 ARG MODE
 ENV ENV_MODE=$MODE
@@ -37,6 +37,10 @@ ENV ENV_JAX_VERSION=$JAX_VERSION
 
 ARG DEVICE
 ENV ENV_DEVICE=$DEVICE
+
+# TODO: remove default once separate TF and TF-free nightly image workflows are established
+ARG TF=true
+ENV ENV_TF=$TF
 
 ARG PACKAGE_DIR
 ENV PACKAGE_DIR=$PACKAGE_DIR
@@ -50,22 +54,24 @@ ENV MAXTEXT_REPO_ROOT=/deps
 WORKDIR /deps
 
 # Copy setup files and dependency files separately for better caching
-COPY ${PACKAGE_DIR}/dependencies/github_deps/ src/dependencies/github_deps/
+COPY ${PACKAGE_DIR}/dependencies/extra_deps/ src/dependencies/extra_deps/
 COPY ${PACKAGE_DIR}/dependencies/requirements/ src/dependencies/requirements/
 COPY ${PACKAGE_DIR}/dependencies/scripts/ src/dependencies/scripts/
 COPY ${PACKAGE_DIR}/maxtext/integration/vllm/ src/maxtext/integration/vllm/
 
 # Install dependencies - these steps are cached unless the copied files change
-RUN echo "Running command: bash setup.sh MODE=$ENV_MODE JAX_VERSION=$ENV_JAX_VERSION DEVICE=${ENV_DEVICE}"
+RUN echo "Running command: bash setup.sh MODE=$ENV_MODE JAX_VERSION=$ENV_JAX_VERSION DEVICE=${ENV_DEVICE} TF=${ENV_TF}"
 RUN --mount=type=cache,target=/root/.cache/uv \
     export UV_LINK_MODE=copy && \
-    bash /deps/src/dependencies/scripts/setup.sh MODE=${ENV_MODE} JAX_VERSION=${ENV_JAX_VERSION} DEVICE=${ENV_DEVICE}
+    bash /deps/src/dependencies/scripts/setup.sh MODE=${ENV_MODE} JAX_VERSION=${ENV_JAX_VERSION} DEVICE=${ENV_DEVICE} TF=${ENV_TF}
 
 # Now copy the remaining code (source files that may change frequently)
 COPY ${PACKAGE_DIR}/maxtext/ src/maxtext/
-COPY ${PACKAGE_DIR}/MaxText/ src/MaxText/
+# Now copy resource needed for pytest:
 COPY tests*/ tests/
+COPY pytest.ini* pytest.ini
 COPY benchmarks*/ benchmarks/
+
 
 # Download test assets from GCS if building image with test assets
 ARG INCLUDE_TEST_ASSETS=false
@@ -76,4 +82,4 @@ RUN if [ "$INCLUDE_TEST_ASSETS" = "true" ]; then \
         fi; \
     fi
 
-ENV PYTHONPATH="/deps/src:${PYTHONPATH}"
+ENV PYTHONPATH="/deps/src${PYTHONPATH:+:${PYTHONPATH}}"

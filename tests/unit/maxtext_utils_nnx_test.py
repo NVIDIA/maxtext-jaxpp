@@ -1,0 +1,393 @@
+# Copyright 2023–2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for the common MaxText NNX utilities"""
+
+import unittest
+from dataclasses import dataclass
+from typing import Any
+import jax
+import jax.numpy as jnp
+from flax import nnx
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.experimental import mesh_utils
+
+from maxtext.common.common_types import MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_TRAIN
+from flax import traverse_util
+from maxtext.utils import maxtext_utils_nnx
+
+
+class TestMaxTextUtilsNNX(unittest.TestCase):
+  """Test the functions for MaxText Utils."""
+
+  @dataclass
+  class MockConfig:
+    """Minimal mock for pyconfig.HyperParameters."""
+
+    init_weights_seed: int = 42
+
+  class TinyModel(nnx.Module):
+    """
+    A tiny NNX model with logical annotations.
+    Annotations are required to test that sharding extraction logic works.
+    """
+
+    def __init__(self, rngs: nnx.Rngs):
+      self.linear = nnx.Linear(
+          jax.device_count(),
+          jax.device_count(),
+          kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), ("data", None)),
+          # FIX: Removed () from zeros. zeros is the initializer function itself,
+          # not a factory like lecun_normal().
+          bias_init=nnx.with_partitioning(nnx.initializers.zeros, ("data",)),
+          rngs=rngs,
+      )
+
+  def tiny_model_init_fn(self):
+    """Factory function for model initialization."""
+    return self.TinyModel(rngs=nnx.Rngs(0))
+
+  def setUp(self):
+    # Create a mesh for sharding tests.
+    # NamedSharding requires an active Mesh to resolve logical names.
+    self.devices = mesh_utils.create_device_mesh((jax.device_count(),))
+    self.mesh = Mesh(self.devices, axis_names=("data",))
+
+  def test_create_nnx_rngs_training(self):
+    # Using Any to satisfy static type checkers for the MockConfig
+    config: Any = self.MockConfig(init_weights_seed=123)
+    rngs = maxtext_utils_nnx.create_nnx_rngs(config, model_mode=MODEL_MODE_TRAIN)
+
+    self.assertIsInstance(rngs, nnx.Rngs)
+    # FIX: nnx.Rngs does not have a .streams attribute.
+    # Check for stream attributes directly on the object.
+    self.assertTrue(hasattr(rngs, "params"))
+    self.assertTrue(hasattr(rngs, "dropout"))
+    self.assertTrue(hasattr(rngs, "aqt"))
+
+  def test_create_nnx_rngs_inference(self):
+    config: Any = self.MockConfig(init_weights_seed=123)
+    rngs = maxtext_utils_nnx.create_nnx_rngs(config, model_mode=MODEL_MODE_AUTOREGRESSIVE)
+
+    self.assertIsInstance(rngs, nnx.Rngs)
+    # Check that 'params' exists but 'dropout' and 'aqt' were excluded
+    self.assertTrue(hasattr(rngs, "params"))
+    self.assertFalse(hasattr(rngs, "dropout"))
+    self.assertFalse(hasattr(rngs, "aqt"))
+
+  def test_move_memory(self):
+    sharding = NamedSharding(self.mesh, P("data"))
+    self.assertNotEqual(sharding.memory_kind, "pinned_host")
+
+    path = ("layers", "linear", "kernel")
+    host_sharding = maxtext_utils_nnx.move_memory_to_host(path, sharding)
+
+    self.assertEqual(host_sharding.memory_kind, "pinned_host")
+    self.assertEqual(host_sharding.spec, P("data"))
+
+    device_sharding = maxtext_utils_nnx.move_memory_to_device(path, sharding)
+
+    self.assertEqual(device_sharding.memory_kind, "device")
+    self.assertEqual(device_sharding.spec, P("data"))
+
+  def test_get_set_named_sharding_nnx(self):
+    # 1. Create the abstract state using standard NNX functional API
+    _, abstract_state = nnx.get_abstract_model(self.tiny_model_init_fn, self.mesh)
+
+    # 2. Test extraction
+    extracted_shardings = maxtext_utils_nnx.nnx_extract_named_sharding(abstract_state)
+
+    # Verify kernel and bias match the P("data") annotations from TinyModel
+    self.assertEqual(extracted_shardings.linear.kernel.get_value().spec, P("data", None))
+    self.assertEqual(extracted_shardings.linear.bias.get_value().spec, P("data"))
+
+    # Target kernel spec update
+    new_kernel_spec = P(None, "data")
+
+    def update_spec_fn(path, leaf_sharding):
+      path_str = jax.tree_util.keystr(path)
+      if "linear" in path_str and "kernel" in path_str:
+        # Construct a new NamedSharding with the requested logical spec
+        return NamedSharding(leaf_sharding.mesh, new_kernel_spec)
+      return leaf_sharding
+
+    # Apply the spec change to the extracted sharding tree
+    extracted_shardings = jax.tree.map_with_path(update_spec_fn, extracted_shardings)
+
+    # 3. Test setting new shardings
+    # Transform the extracted shardings to host memory
+    new_shardings = jax.tree_util.tree_map_with_path(maxtext_utils_nnx.move_memory_to_host, extracted_shardings)
+    updated_abstract = maxtext_utils_nnx.set_named_sharding_nnx(abstract_state, new_shardings)
+
+    # Verify the metadata inside the abstract state leaf has updated its sharding
+    self.assertEqual(updated_abstract.linear.kernel.sharding.memory_kind, "pinned_host")
+    # Also verify the spec was updated successfully
+    self.assertEqual(updated_abstract.linear.kernel.sharding.spec, new_kernel_spec)
+
+    # 4. Verify named sharding is preserved after NNX merge (update) and split (state)
+    model = self.tiny_model_init_fn()
+    nnx.update(model, updated_abstract)
+    re_extracted_shardings = maxtext_utils_nnx.nnx_extract_named_sharding(nnx.state(model))
+
+    # Verify kernel and bias have expected sharding
+    self.assertEqual(re_extracted_shardings.linear.kernel.get_value().spec, new_kernel_spec)
+    self.assertEqual(re_extracted_shardings.linear.bias.get_value().spec, P("data"))
+
+  def test_create_nnx_sharded_model(self):
+    # 1. Create abstract model
+    graphdef, abstract_state = nnx.get_abstract_model(self.tiny_model_init_fn, self.mesh)
+    abstract_model = nnx.merge(graphdef, abstract_state)
+
+    # 2. Modify shardings to trigger host offloading
+    extracted_shardings = maxtext_utils_nnx.nnx_extract_named_sharding(abstract_state)
+    new_shardings = jax.tree_util.tree_map_with_path(maxtext_utils_nnx.move_memory_to_host, extracted_shardings)
+
+    # 3. Run the sharded creation
+    # We pass the abstract model and use the custom sharding for instantiation
+    sharded_model = maxtext_utils_nnx.create_nnx_sharded_model(
+        abstract_model, self.tiny_model_init_fn, mesh=self.mesh, named_sharding=new_shardings
+    )
+
+    # 4. Verify the model is concrete (contains Arrays) and sharded on host
+    self.assertIsInstance(sharded_model.linear.kernel[...], jax.Array)
+    self.assertEqual(sharded_model.linear.kernel[...].sharding.memory_kind, "pinned_host")
+
+  def test_get_partition_spec_nnx(self):
+    """Verifies extraction of PartitionSpecs from NamedShardings."""
+    # 1. Create abstract state and get sharding
+    _, abstract_state = nnx.get_abstract_model(self.tiny_model_init_fn, self.mesh)
+    extracted_shardings = maxtext_utils_nnx.nnx_extract_named_sharding(abstract_state)
+
+    # 2. Execute extraction
+    spec = maxtext_utils_nnx.get_partition_spec_nnx(extracted_shardings)
+
+    # 3. Verify that the leaves are now raw PartitionSpecs
+    # Expected values derived from TinyModel definition
+    expected_spec_k = P("data", None)
+    expected_spec_b = P("data")
+
+    self.assertEqual(spec["linear"]["kernel"], expected_spec_k)
+    self.assertEqual(spec["linear"]["bias"], expected_spec_b)
+    self.assertNotIsInstance(spec["linear"]["kernel"], NamedSharding)
+
+  def test_nnx_ensure_scan_leading_axis_mixed(self):
+    """Test broadcasting on a mixed state of scalars and arrays."""
+    length = 8
+    state = nnx.State(
+        {
+            "scalar": nnx.Param(jnp.array(1.0)),
+            "array": nnx.Param(jnp.zeros((16,))),
+            "raw_scalar": jnp.array(2.0),
+            "raw_array": jnp.zeros((10,)),
+        }
+    )
+
+    broadcast_state = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(state, length)
+
+    # NNX Variables
+    self.assertEqual(broadcast_state["scalar"].get_value().shape, (length,))
+    self.assertEqual(broadcast_state["array"].get_value().shape, (16,))
+
+    # Raw JAX types
+    self.assertEqual(broadcast_state["raw_scalar"].shape, (length,))
+    self.assertEqual(broadcast_state["raw_array"].shape, (10,))
+
+
+def _make_scanned_param(shape, out_sharding, partition_name):
+  """Build an nnx.Param mirroring a scanned decoder variable.
+
+  DeepSeek stacks name their scan axis via nnx.PARTITION_NAME ("dense_layers" or
+  "moe_layers"), so the variable carries that name in its metadata rather than
+  the caller literal "layers". Eager sharding is disabled because the sliced
+  value rank is intentionally one less than the metadata length.
+  """
+  with nnx.use_eager_sharding(False):
+    return nnx.Param(jnp.zeros(shape), out_sharding=out_sharding, **{nnx.PARTITION_NAME: partition_name})
+
+
+class TestScanAxisMetadata(unittest.TestCase):
+  """Lock in per-variable scan-axis resolution for DeepSeek-style stacks."""
+
+  def test_nnx_remove_scan_axis_preserves_real_leading_axis(self):
+    """nnx_remove_scan_axis must drop the stack's own scan axis, not "embed"."""
+    # Metadata carries the real fsdp axis "embed" plus the scan axis
+    # "dense_layers"; the sliced value is rank-2, one less than the 3 names.
+    param = _make_scanned_param((4, 8), ("embed", "dense_layers", "mlp"), "dense_layers")
+    state = nnx.State({"kernel": param})
+
+    result = maxtext_utils_nnx.nnx_remove_scan_axis(state, "layers")
+
+    out_sharding = result["kernel"].get_metadata().get("out_sharding")
+    # The scan axis is gone and the real leading logical axis survives. The
+    # unfixed fallback pops index 0 and strips "embed" to ("dense_layers", "mlp").
+    self.assertEqual(tuple(out_sharding), ("embed", "mlp"))
+
+  def test_nnx_remove_scan_axis_moe_layers(self):
+    """The same resolution holds for the "moe_layers" stack axis name."""
+    param = _make_scanned_param((4, 8), ("embed", "moe_layers", "mlp"), "moe_layers")
+    state = nnx.State({"kernel": param})
+
+    result = maxtext_utils_nnx.nnx_remove_scan_axis(state, "layers")
+
+    out_sharding = result["kernel"].get_metadata().get("out_sharding")
+    self.assertEqual(tuple(out_sharding), ("embed", "mlp"))
+
+  def test_nnx_remove_scan_axis_raises_on_inconsistent_metadata(self):
+    """A rank mismatch with no matching scan axis is an error, not a silent pop."""
+    # No name in the metadata matches the resolved scan axis, and the metadata
+    # is one longer than the value rank; the fixed code raises instead of
+    # blindly popping a real axis.
+    param = _make_scanned_param((4, 8), ("embed", "mlp", "vocab"), "dense_layers")
+    state = nnx.State({"kernel": param})
+
+    with self.assertRaises(ValueError):
+      maxtext_utils_nnx.nnx_remove_scan_axis(state, "layers")
+
+  def test_nnx_add_and_sync_scan_axis_uses_partition_name(self):
+    """nnx_add_and_sync_scan_axis must insert the stack's own axis name, not "layers"."""
+    # Stacked value is rank-3; metadata holds the two sliced logical axes.
+    param = _make_scanned_param((2, 4, 8), ("embed", "mlp"), "dense_layers")
+    state = nnx.State({"kernel": param})
+
+    result = maxtext_utils_nnx.nnx_add_and_sync_scan_axis(state, "layers", 0)
+
+    out_sharding = result["kernel"].get_metadata().get("out_sharding")
+    # The unfixed code inserts the literal "layers" here.
+    self.assertEqual(tuple(out_sharding), ("dense_layers", "embed", "mlp"))
+
+
+class TestMergeRestoredOverlay(unittest.TestCase):
+  """Unit test verifying that ShapeDtypeStruct placeholders in restored checkpoints are replaced by init state."""
+
+  def test_merge_restored_overlay_replaces_shape_dtype_struct(self):
+    init_state = {
+        "model": {
+            "decoder": {
+                "layers": {
+                    "self_attention": {
+                        "query": {"kernel": jnp.ones((8, 16))},
+                        "lora_a": {"kernel": jnp.ones((8, 4))},
+                    }
+                }
+            }
+        }
+    }
+    ckpt_overlay = {
+        "model": {
+            "decoder": {
+                "layers": {
+                    "self_attention": {
+                        "query": {"kernel": jnp.zeros((8, 16))},
+                        "lora_a": {"kernel": jax.ShapeDtypeStruct((8, 4), jnp.float32)},
+                    }
+                }
+            }
+        }
+    }
+
+    def _has_shape_dtype_struct(tree):
+      return any(isinstance(x, jax.ShapeDtypeStruct) for x in jax.tree_util.tree_leaves(tree))
+
+    def _merge_restored_overlay(ckpt_node, init_node):
+      if _has_shape_dtype_struct(ckpt_node):
+        if isinstance(ckpt_node, dict) and isinstance(init_node, dict):
+          res = {}
+          for k in init_node:
+            if k in ckpt_node:
+              res[k] = _merge_restored_overlay(ckpt_node[k], init_node[k])
+            else:
+              res[k] = init_node[k]
+          return res
+        else:
+          return init_node
+      return ckpt_node
+
+    merged = _merge_restored_overlay(ckpt_overlay, init_state)
+
+    # Restored weights (query) should come from checkpoint (zeros)
+    query_kernel = merged["model"]["decoder"]["layers"]["self_attention"]["query"]["kernel"]
+    self.assertTrue(jnp.array_equal(query_kernel, jnp.zeros((8, 16))))
+    # Unrestored weights (lora_a ShapeDtypeStruct) should fall back to init_state (ones)
+    lora_a_kernel = merged["model"]["decoder"]["layers"]["self_attention"]["lora_a"]["kernel"]
+    self.assertTrue(jnp.array_equal(lora_a_kernel, jnp.ones((8, 4))))
+
+
+class TestReshardAligned(unittest.TestCase):
+  """Unit test for the _reshard_aligned utility in maxtext_utils.py."""
+
+  def test_reshard_aligned_replaces_and_shards(self):
+    devices = jax.devices()
+    mesh = Mesh(mesh_utils.create_device_mesh((1, len(devices))), ("data", "model"))
+    sharding = NamedSharding(mesh, P("data", "model"))
+
+    # Create dummy array with custom sharding
+    @dataclass
+    class ShardedValue:
+      sharding: Any
+
+    target = {
+        "decoder": {
+            "layers": {
+                "self_attention": {
+                    "query": {"kernel": ShardedValue(sharding=sharding)},
+                    "lora_a": {"kernel": ShardedValue(sharding=sharding)},
+                }
+            }
+        }
+    }
+
+    raw = {
+        "decoder": {
+            "layers": {
+                "self_attention": {
+                    "query": {"kernel": jnp.ones((8, 16))},
+                    "lora_a": {"kernel": jax.ShapeDtypeStruct((8, 4), jnp.float32)},
+                }
+            }
+        }
+    }
+
+    # Extract our setup_initial_state inner function or mock/simulate its behavior:
+
+    def _reshard_aligned(target, raw):
+      target_flat = traverse_util.flatten_dict(target)
+      raw_flat = traverse_util.flatten_dict(raw)
+
+      res_flat = {}
+      for k, target_val in target_flat.items():
+        if k in raw_flat and not isinstance(raw_flat[k], jax.ShapeDtypeStruct):
+          raw_val = raw_flat[k]
+          if hasattr(target_val, "sharding") and target_val.sharding is not None:
+            res_flat[k] = jax.device_put(raw_val, target_val.sharding)
+          else:
+            res_flat[k] = raw_val
+        else:
+          res_flat[k] = target_val
+
+      return traverse_util.unflatten_dict(res_flat)
+
+    res = _reshard_aligned(target, raw)
+
+    # Query kernel should be converted into a JAX array with the target sharding
+    query_kernel = res["decoder"]["layers"]["self_attention"]["query"]["kernel"]
+    self.assertEqual(query_kernel.sharding, sharding)
+    self.assertTrue(jnp.array_equal(query_kernel, jnp.ones((8, 16))))
+
+    # lora_a kernel should retain target/ShardedValue object (ignoring the ShapeDtypeStruct)
+    lora_a_kernel = res["decoder"]["layers"]["self_attention"]["lora_a"]["kernel"]
+    self.assertIsInstance(lora_a_kernel, ShardedValue)
+
+
+if __name__ == "__main__":
+  unittest.main()

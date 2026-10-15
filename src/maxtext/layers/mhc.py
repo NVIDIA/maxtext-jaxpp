@@ -14,15 +14,33 @@
 
 """DeepSeek Manifold-Constrained Hyper Connections (mHC) Layer."""
 
+import functools
+import itertools
+import math
 from typing import Callable
+
 from flax import nnx
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 from maxtext.common.common_types import Array, Config
 from maxtext.common.common_types import HyperConnectionType
-from maxtext.layers.initializers import default_bias_init, default_scalar_init, nd_dense_init
+from maxtext.kernels.mhc import api as mhc_kernel
+from maxtext.layers import nnx_wrappers
+from maxtext.layers.initializers import default_bias_init, default_scalar_init, nd_dense_init, variable_to_logically_partitioned
 from maxtext.layers.normalizations import RMSNorm
+
+
+@functools.lru_cache(maxsize=None)
+def get_permutation_matrices(k: int) -> Array:
+  """Generates all permutation matrices of size k.
+
+  Reference: mHC-lite: https://openreview.net/pdf?id=5IJX6kvOif
+  Shape: (k!, k, k)
+  """
+  perms = list(itertools.permutations(range(k)))
+  perms_array = jnp.array(perms)
+  return jnp.eye(k)[perms_array]
 
 
 def get_functions(expansion_rate: int):
@@ -33,9 +51,7 @@ def get_functions(expansion_rate: int):
 
   def expand(x: Array):
     # (batch, length, dim) -> (batch, length, streams, dim)
-    return jnp.repeat(
-        jnp.expand_dims(x, axis=2), expansion_rate, axis=2
-    ).astype(x.dtype)
+    return jnp.repeat(jnp.expand_dims(x, axis=2), expansion_rate, axis=2).astype(x.dtype)
 
   def reduce(x: Array):
     # (batch, length, streams, dim) -> (batch, length, dim)
@@ -49,21 +65,15 @@ def sinkhorn(t, iters=20):
   # Use float32 precision for numerical stability during normalization
   initial_dtype = t.dtype
   t = t.astype(jnp.float32)
+  eps = 1e-6
 
-  # Column-wise normalization (axis=-2) - positive and sum up to 1 across columns
-  # Equivalent to t = exp(t) / jnp.sum(jnp.exp(t), axis=-2)
-  t = jax.nn.softmax(t, axis=-2)
+  t = jax.nn.softmax(t, axis=-1) + eps
+  t = t / (jnp.sum(t, axis=-2, keepdims=True) + eps)
 
-  def body_fun(i, val):
-    # L1 Normalization: val / sum(val) with clipping of denominator
-    # Normalize rows (axis -1)
-    val = val / jnp.clip(jnp.sum(val, axis=-1, keepdims=True), min=1e-12)
-    # Normalize columns (axis -2)
-    val = val / jnp.clip(jnp.sum(val, axis=-2, keepdims=True), min=1e-12)
-    return val
+  for _ in range(iters - 1):
+    t = t / (jnp.sum(t, axis=-1, keepdims=True) + eps)
+    t = t / (jnp.sum(t, axis=-2, keepdims=True) + eps)
 
-  # Use lax.fori_loop for an efficient, JIT-friendly loop
-  t = jax.lax.fori_loop(0, iters, body_fun, t)
   return t.astype(initial_dtype)
 
 
@@ -96,6 +106,9 @@ class ManifoldConstrainedHyperConnections(nnx.Module):
     self.weight_dtype = self.config.weight_dtype
     self.matmul_precision = jax.lax.Precision(self.config.matmul_precision)
 
+    if getattr(self.config, "use_mhc_pallas_kernel", False) and not self.config.enable_mhc_lite:
+      raise ValueError("use_mhc_pallas_kernel=True requires enable_mhc_lite=True.")
+
     # Norm layer
     self.mhc_norm = RMSNorm(
         num_features=self.k * self.dim,
@@ -109,16 +122,26 @@ class ManifoldConstrainedHyperConnections(nnx.Module):
     # Scalars
     self.res_alpha_scale = nnx.Param(
         default_scalar_init(self.rngs.params(), (1,), self.weight_dtype),
-        sharding=(None,),
+        out_sharding=(None,),
     )
     self.pre_alpha_scale = nnx.Param(
         default_scalar_init(self.rngs.params(), (1,), self.weight_dtype),
-        sharding=(None,),
+        out_sharding=(None,),
     )
     self.post_alpha_scale = nnx.Param(
         default_scalar_init(self.rngs.params(), (1,), self.weight_dtype),
-        sharding=(None,),
+        out_sharding=(None,),
     )
+
+    if self.config.enable_mhc_lite:
+      num_perms = math.factorial(self.k)
+      res_out_dim = num_perms
+      res_beta_shape = (num_perms,)
+      res_beta_sharding = (None,)
+    else:
+      res_out_dim = self.k * self.k
+      res_beta_shape = (self.k, self.k)
+      res_beta_sharding = (None, None)
 
     # Weight matrices
     scale_init = nd_dense_init(1.0, "fan_in", "normal")
@@ -128,12 +151,12 @@ class ManifoldConstrainedHyperConnections(nnx.Module):
     self.res_alpha = nnx.Param(
         scale_init(
             self.rngs.params(),
-            (self.k * self.dim, self.k * self.k),
+            (self.k * self.dim, res_out_dim),
             self.weight_dtype,
             in_axis=in_axis,
             out_axis=out_axis,
         ),
-        sharding=weight_sharding_axis_name,
+        out_sharding=weight_sharding_axis_name,
     )
     self.pre_alpha = nnx.Param(
         scale_init(
@@ -143,7 +166,7 @@ class ManifoldConstrainedHyperConnections(nnx.Module):
             in_axis=in_axis,
             out_axis=out_axis,
         ),
-        sharding=weight_sharding_axis_name,
+        out_sharding=weight_sharding_axis_name,
     )
     self.post_alpha = nnx.Param(
         scale_init(
@@ -153,53 +176,71 @@ class ManifoldConstrainedHyperConnections(nnx.Module):
             in_axis=in_axis,
             out_axis=out_axis,
         ),
-        sharding=weight_sharding_axis_name,
+        out_sharding=weight_sharding_axis_name,
     )
 
     # Biases
     self.res_beta = nnx.Param(
-        default_bias_init(
-            self.rngs.params(), (self.k, self.k), self.weight_dtype
-        ),
-        sharding=(None, None),
+        default_bias_init(self.rngs.params(), res_beta_shape, self.weight_dtype),
+        out_sharding=res_beta_sharding,
     )
     self.pre_beta = nnx.Param(
         default_bias_init(self.rngs.params(), (self.k,), self.weight_dtype),
-        sharding=(None,),
+        out_sharding=(None,),
     )
     self.post_beta = nnx.Param(
         default_bias_init(self.rngs.params(), (self.k,), self.weight_dtype),
-        sharding=(None,),
+        out_sharding=(None,),
     )
 
-  def res_mapping(self, x: Array):
-    """Helper function for residual mapping."""
+  def _get_mhc_weights(self) -> mhc_kernel.MhcWeights:
+    """Collects layer parameters into a structured MhcWeights PyTree."""
+    return mhc_kernel.MhcWeights(
+        norm_scale=jnp.asarray(self.mhc_norm.scale[...], self.dtype),
+        pre_alpha=jnp.asarray(self.pre_alpha[...], self.dtype),
+        pre_bias=jnp.asarray(self.pre_beta[...], self.dtype),
+        pre_scale=jnp.asarray(self.pre_alpha_scale[...], self.dtype),
+        post_alpha=jnp.asarray(self.post_alpha[...], self.dtype),
+        post_bias=jnp.asarray(self.post_beta[...], self.dtype),
+        post_scale=jnp.asarray(self.post_alpha_scale[...], self.dtype),
+        res_alpha=jnp.asarray(self.res_alpha[...], self.dtype),
+        res_bias=jnp.asarray(self.res_beta[...], self.dtype),
+        res_scale=jnp.asarray(self.res_alpha_scale[...], self.dtype),
+    )
+
+  def res_mapping(self, h_res: Array):
+    """Helper function for residual mapping after matmul."""
     # In MaxText, we match weight precision to activations before Matmul
-    res_alpha = jnp.asarray(self.res_alpha[...], self.dtype)
     res_beta = jnp.asarray(self.res_beta[...], self.dtype)
     res_alpha_scale = jnp.asarray(self.res_alpha_scale[...], self.dtype)
-    # Apply projection: (b, s, k*d) @ (k*d, k*k) -> (b, s, k*k)
-    h_res = jnp.einsum(
-        "bsm,mn -> bsn", x, res_alpha, precision=self.matmul_precision
-    )
-    b, s, _ = h_res.shape
-    h_res = jnp.reshape(h_res, (b, s, self.k, self.k))
-    intermediate = res_alpha_scale * h_res + res_beta[None, None, :, :]
-    output = sinkhorn(intermediate, self.sinkhorn_iterations)
-    return output
 
-  def mapping(
-      self, x: Array, alpha_scale: Array, alpha: Array, beta: Array, scale: int
-  ):
-    """Helper function for both pre and post mappings."""
+    if self.config.enable_mhc_lite:
+      intermediate = res_alpha_scale * h_res + res_beta[None, None, :]
+      # Use float32 for numerical stability during softmax
+      weights = jax.nn.softmax(intermediate.astype(jnp.float32), axis=-1).astype(self.dtype)
+      # Sum the permutation matrices with the weights
+      permutation_matrices = get_permutation_matrices(self.k).astype(self.dtype)
+      output = jnp.einsum(
+          "bsn,nkm -> bskm",
+          weights,
+          permutation_matrices,
+          precision=self.matmul_precision,
+      )
+      return output
+    else:
+      b, s, _ = h_res.shape
+      h_res = jnp.reshape(h_res, (b, s, self.k, self.k))
+      intermediate = res_alpha_scale * h_res + res_beta[None, None, :, :]
+      output = sinkhorn(intermediate, self.sinkhorn_iterations)
+      return output
+
+  def mapping(self, h: Array, alpha_scale: Array, beta: Array, scale: float, eps: float = 0.0):
+    """Helper function for both pre and post mappings after matmul."""
     # In MaxText, we match weight precision to activations before Matmul
-    alpha = jnp.asarray(alpha, self.dtype)
     beta = jnp.asarray(beta, self.dtype)
     alpha_scale = jnp.asarray(alpha_scale, self.dtype)
-    # Apply projection: (b, s, k*d) @ (k*d, k) -> (b, s, k)
-    h = jnp.einsum("bsm,mk -> bsk", x, alpha, precision=self.matmul_precision)
     intermediate = alpha_scale * h + beta[None, None, :]
-    output = scale * jax.nn.sigmoid(intermediate)
+    output = scale * jax.nn.sigmoid(intermediate) + eps
     return output
 
   def __call__(
@@ -225,20 +266,60 @@ class ManifoldConstrainedHyperConnections(nnx.Module):
     # x shape: [batch, seq, expansion_rate, emb]
     b, s, k, d = x.shape
 
-    # 1. Flatten the tensor, and RMS normalization
-    norm_x = self.mhc_norm(jnp.reshape(x, (b, s, k * d)))
+    h_post = None
+    h_res = None
+    context = None
+    use_kernel = self.config.enable_mhc_lite and getattr(self.config, "use_mhc_pallas_kernel", False)
+    if use_kernel:
+      fwd_block_size = getattr(self.config, "mhc_pallas_kernel_fwd_block_size", 256)
+      bwd_block_size = getattr(self.config, "mhc_pallas_kernel_bwd_block_size", 128)
+      bwd_feature_block_size = getattr(self.config, "mhc_pallas_kernel_bwd_feature_block_size", 1024)
+      kernel_config = mhc_kernel.MhcKernelConfig(
+          block_size=fwd_block_size,
+          bwd_block_size=bwd_block_size,
+          bwd_feature_block_size=bwd_feature_block_size,
+          rms_epsilon=self.config.normalization_layer_epsilon,
+      )
+      weights = self._get_mhc_weights()
+      layer_input, context = mhc_kernel.pre(
+          x,
+          weights,
+          jnp.asarray(get_permutation_matrices(self.k), self.dtype),
+          config=kernel_config,
+      )
+    else:
+      with jax.named_scope("mhc_norm"):
+        # 1. Flatten the tensor, and RMS normalization
+        norm_x = self.mhc_norm(jnp.reshape(x, (b, s, k * d)))
 
-    # 2. Pre mapping
-    pre_mapping = self.mapping(
-        norm_x,
-        self.pre_alpha_scale[...],
-        self.pre_alpha[...],
-        self.pre_beta[...],
-        1.0,
-    )
-    layer_input = jnp.einsum(
-        "bskd,bsk -> bsd", x, pre_mapping, precision=self.matmul_precision
-    )
+      # Fused Projections
+      pre_alpha = jnp.asarray(self.pre_alpha[...], self.dtype)
+      post_alpha = jnp.asarray(self.post_alpha[...], self.dtype)
+      res_alpha = jnp.asarray(self.res_alpha[...], self.dtype)
+
+      alpha_concat = jnp.concatenate([pre_alpha, post_alpha, res_alpha], axis=-1)
+
+      # MatMul on normalized input
+      h_concat = jnp.einsum("bsm,mn -> bsn", norm_x, alpha_concat, precision=self.matmul_precision)
+      h_pre = h_concat[..., : self.k]
+      h_post = h_concat[..., self.k : 2 * self.k]
+      h_res = h_concat[..., 2 * self.k :]
+
+      # 2. Pre mapping
+      pre_mapping = self.mapping(
+          h_pre,
+          self.pre_alpha_scale[...],
+          self.pre_beta[...],
+          1.0,
+          eps=1e-6,
+      )
+      # bskd, bsk -> bsd (fused contracted GEMM)
+      layer_input = jnp.einsum(
+          "bsk,bskd->bsd",
+          pre_mapping,
+          x,
+          precision=self.matmul_precision,
+      )
 
     # 3. Pre-norm
     layer_input = norm_fn(layer_input)
@@ -246,38 +327,119 @@ class ManifoldConstrainedHyperConnections(nnx.Module):
     # 4. Attention or MLP
     metadata = {}
     if mhc_type == HyperConnectionType.ATTENTION:
-      layer_out, _ = branch_fn(
-          inputs_q=layer_input, inputs_kv=layer_input, **kwargs
-      )
+      layer_out, _ = branch_fn(inputs_q=layer_input, inputs_kv=layer_input, **kwargs)
     elif mhc_type == HyperConnectionType.MLP_DENSE:
       layer_out = branch_fn(inputs=layer_input, **kwargs)
     elif mhc_type == HyperConnectionType.MLP_MOE:
-      layer_out, load_balance_loss, moe_bias_updates = branch_fn(
-          inputs=layer_input, **kwargs
-      )
+      layer_out, load_balance_loss, moe_bias_updates = branch_fn(inputs=layer_input, **kwargs)
       metadata["load_balance_loss"] = load_balance_loss
       metadata["moe_bias_updates"] = moe_bias_updates
     else:
       raise ValueError(f"Unsupported type: {mhc_type}")
 
+    if use_kernel:
+      fwd_block_size = getattr(self.config, "mhc_pallas_kernel_fwd_block_size", 256)
+      bwd_block_size = getattr(self.config, "mhc_pallas_kernel_bwd_block_size", 128)
+      bwd_feature_block_size = getattr(self.config, "mhc_pallas_kernel_bwd_feature_block_size", 1024)
+      kernel_config = mhc_kernel.MhcKernelConfig(
+          block_size=fwd_block_size,
+          bwd_block_size=bwd_block_size,
+          bwd_feature_block_size=bwd_feature_block_size,
+      )
+      output = mhc_kernel.post(
+          layer_out,
+          context,
+          config=kernel_config,
+      )
+      return output, metadata
+
     # 5. Post mapping
     post_mapping = self.mapping(
-        norm_x,
+        h_post,
         self.post_alpha_scale[...],
-        self.post_alpha[...],
         self.post_beta[...],
         2.0,
     )
-    post_out = jnp.einsum(
-        "bsd,bsk -> bskd",
-        layer_out,
-        post_mapping,
-        precision=self.matmul_precision,
-    )
+    # Moving away from einsum seems to allow XLA to perform better fusions
+    # bsd,bsk -> bskd
+    post_out = jnp.expand_dims(layer_out, axis=2) * jnp.expand_dims(post_mapping, axis=3)
 
     # 6. Residual mapping, res_out shape as [batch, seq, expansion_rate, emb]
-    res_mapping = self.res_mapping(norm_x)
+    res_mapping = self.res_mapping(h_res)
+
+    # bskm,bskd -> bsmd (fused contracted GEMM)
     res_out = jnp.einsum(
-        "bskd,bskm -> bsmd", x, res_mapping, precision=self.matmul_precision
+        "bskm,bskd->bsmd",
+        res_mapping,
+        x,
+        precision=self.matmul_precision,
     )
     return res_out + post_out, metadata
+
+
+class DeepSeek4HyperHead(nnx.Module):
+  """Final HC-stream collapse; used by DeepSeek V4 before the shared RMSNorm."""
+
+  def __init__(
+      self,
+      config: Config,
+      mesh: Mesh,
+      rngs: nnx.Rngs,
+  ):
+    self.config = config
+    self.mesh = mesh
+    self.rngs = rngs
+    self.dtype = config.dtype
+    self.weight_dtype = config.weight_dtype
+    self.mhc_expansion_rate = config.mhc_expansion_rate
+    self.emb_dim = config.emb_dim
+    self.eps = 1e-6
+
+    # Weight matrices
+    weight_init = nd_dense_init(1.0, "fan_in", "normal")
+    self.hc_fn = nnx.Param(
+        weight_init(
+            rngs.params(),
+            (self.mhc_expansion_rate * self.emb_dim, self.mhc_expansion_rate),
+            self.weight_dtype,
+            in_axis=0,
+            out_axis=1,
+        ),
+        out_sharding=("activation_embed", None),
+    )
+    self.hc_base = nnx.Param(
+        default_bias_init(rngs.params(), (self.mhc_expansion_rate,), self.weight_dtype),
+        out_sharding=(None,),
+    )
+    self.hc_scale = nnx.Param(
+        default_scalar_init(rngs.params(), (1,), self.weight_dtype),
+        out_sharding=(None,),
+    )
+
+  def __call__(self, x: Array) -> Array:
+    # x shape: [batch, length, k, d]
+    b, s, k, d = x.shape
+    assert k == self.mhc_expansion_rate
+    assert d == self.emb_dim
+
+    flat = jnp.reshape(x, (b, s, k * d))
+    flat_f32 = flat.astype(jnp.float32)
+    variance = jnp.mean(jnp.square(flat_f32), axis=-1, keepdims=True)
+    flat_norm = flat_f32 * jax.lax.rsqrt(variance + self.eps)
+
+    hc_fn = jnp.asarray(self.hc_fn[...], jnp.float32)
+    hc_base = jnp.asarray(self.hc_base[...], jnp.float32)
+    hc_scale = jnp.asarray(self.hc_scale[...], jnp.float32)
+
+    mixes = jnp.einsum("bsm,mk->bsk", flat_norm, hc_fn, precision=jax.lax.Precision(self.config.matmul_precision))
+    pre = jax.nn.sigmoid(mixes * hc_scale[None, None, :] + hc_base[None, None, :]) + self.eps
+
+    x_f32 = x.astype(jnp.float32)
+    out = jnp.sum(pre[:, :, :, None] * x_f32, axis=2)
+    return out.astype(self.dtype)
+
+
+DeepSeek4HyperHeadToLinen = nnx_wrappers.to_linen_class(
+    DeepSeek4HyperHead,
+    base_metadata_fn=variable_to_logically_partitioned,
+)

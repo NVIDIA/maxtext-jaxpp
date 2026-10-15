@@ -16,49 +16,56 @@
 
 # Core concepts
 
-::::\{grid} 1 2 2 2
+::::{grid} 1 2 2 2
 :gutter: 2
 
-:::\{grid-item-card} 💾 Checkpoints
+:::{grid-item-card} 💾 Checkpoints
 :link: core_concepts/checkpoints
 :link-type: doc
 
 Understanding checkpoint formats and strategies.
 :::
 
-:::\{grid-item-card} ⚖️ Alternatives
+:::{grid-item-card} ⚖️ Alternatives
 :link: core_concepts/alternatives
 :link-type: doc
 
 Comparison with other frameworks like Megatron-LM.
 :::
 
-:::\{grid-item-card} 📉 Quantization
+:::{grid-item-card} 📉 Quantization
 :link: core_concepts/quantization
 :link-type: doc
 
 Techniques for reducing model size and improving performance.
 :::
 
-:::\{grid-item-card} 🧱 Tiling
+:::{grid-item-card} 🧱 Tiling
 :link: core_concepts/tiling
 :link-type: doc
 
 Understanding tiling strategies for partitioning logic.
 :::
 
-:::\{grid-item-card} ⚡ JAX/XLA/Pallas
+:::{grid-item-card} ⚡ JAX/XLA/Pallas
 :link: core_concepts/jax_xla_and_pallas
 :link-type: doc
 
 How MaxText leverages JAX, XLA, and Pallas for efficiency.
 :::
 
-:::\{grid-item-card} 🧠 MoE Configuration
+:::{grid-item-card} 🧠 MoE Configuration
 :link: core_concepts/moe_configuration
 :link-type: doc
 
 Configuring Mixture of Experts (MoE) models.
+:::
+
+:::{grid-item-card} 🌐 DiLoCo & Streaming DiLoCo Theory
+:link: core_concepts/diloco
+:link-type: doc
+
+Bi-level optimization theory, arithmetic intensity analysis, and pipelined communication overlapping.
 :::
 ::::
 
@@ -74,4 +81,5 @@ core_concepts/quantization.md
 core_concepts/tiling.md
 core_concepts/jax_xla_and_pallas.md
 core_concepts/moe_configuration.md
+core_concepts/diloco.md
 ```

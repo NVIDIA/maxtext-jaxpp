@@ -1,4 +1,5 @@
 # Copyright 2026 Google LLC
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,38 +19,46 @@
 
 import functools
 import inspect
-import warnings
+import re
 from typing import Any
+import warnings
 
-import jax
-import jax.numpy as jnp
 from flax import linen as nn
 from flax import nnx
-from flax.nnx import wrappers as nnx_wrappers
+import jax
 from jax.ad_checkpoint import checkpoint_name
+import jax.numpy as jnp
 from jax.sharding import Mesh
-
+import jaxpp.api as jaxpp
 from maxtext.common.common_types import (
-    EP_AS_CONTEXT,
+    Config,
+    DecoderBlockType,
     MODEL_MODE_AUTOREGRESSIVE,
     MODEL_MODE_PREFILL,
     MODEL_MODE_TRAIN,
-    Config,
-    DecoderBlockType,
+    MultimodalInput,
     ShardMode,
+    get_weight_dtype,
 )
-from maxtext.inference import page_manager
-from maxtext.layers import initializers, linears, mhc, normalizations, quantizations
+from maxtext.configs.types import check_forced_routing_support
+from maxtext.layers import linears, mhc, moe, normalizations, quantizations
+from maxtext.layers import nnx_scan, nnx_wrappers
 from maxtext.layers.attentions import Attention
 from maxtext.layers.embeddings import Embed, PositionalEmbedding, attend_on_embedding
 from maxtext.layers.normalizations import RMSNorm
+from maxtext.layers.pipeline import create_nnx_pipeline
 from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.models import (
     deepseek,
+    deepseek4,
     deepseek_batchsplit,
+    deepseek_batchsplit_fp8,
+    envy,
     gemma,
     gemma2,
     gemma3,
+    gemma4,
+    gemma4_small,
     gpt3,
     gpt_oss,
     llama2,
@@ -57,11 +66,20 @@ from maxtext.models import (
     mistral,
     mixtral,
     olmo3,
+    qwen2,
     qwen3,
+    qwen3_5,
+    qwen3_custom,
     simple_layer,
 )
+
+try:
+  # lineage_adapter is Google-internal and excluded from the open-source export.
+  from maxtext.experimental.lineage import lineage_adapter
+except ImportError:
+  lineage_adapter = None
 from maxtext.multimodal import utils as mm_utils
-from maxtext.utils import max_logging, max_utils, maxtext_utils, sharding
+from maxtext.utils import max_logging, max_utils, maxtext_utils, maxtext_utils_nnx, sharding
 from maxtext.utils.sharding import create_sharding
 
 # ------------------------------------------------------------------------------
@@ -71,7 +89,7 @@ from maxtext.utils.sharding import create_sharding
 
 class NNXDecoderLayer(nnx.Module):
   """
-  Transformer decoder layer converted to NNX.
+  Transformer decoder layer converted to NNX
   """
 
   def __init__(
@@ -154,7 +172,6 @@ class NNXDecoderLayer(nnx.Module):
       model_mode,
       previous_chunk=None,
       slot: None | int = None,
-      page_state: None | page_manager.PageState = None,
       kv_cache: jax.Array | None = None,
       attention_metadata: dict[str, Any] | None = None,
   ):
@@ -168,11 +185,17 @@ class NNXDecoderLayer(nnx.Module):
     )
 
     if self.model_mode == MODEL_MODE_PREFILL:
-      logical_axis_names = ("activation_batch", "prefill_activation_length", "activation_embed")
-    elif self.config.expert_shard_attention_option == EP_AS_CONTEXT and self.model_mode == MODEL_MODE_TRAIN:
-      logical_axis_names = ("activation_batch_no_exp", "activation_length", "activation_embed")
+      logical_axis_names = (
+          "activation_batch",
+          "prefill_activation_length",
+          "activation_embed",
+      )
     else:
-      logical_axis_names = ("activation_batch", "activation_length_no_exp", "activation_embed")
+      logical_axis_names = (
+          "activation_batch",
+          "activation_length",
+          "activation_embed",
+      )
 
     inputs = _maybe_shard_with_logical(inputs, logical_axis_names)
     inputs = checkpoint_name(inputs, "decoder_layer_input")
@@ -201,7 +224,7 @@ class NNXDecoderLayer(nnx.Module):
     layer_output = next_layer_addition_dropped_out + inputs
     layer_output = _maybe_shard_with_logical(layer_output, logical_axis_names)
 
-    if cfg.record_internal_nn_metrics:
+    if getattr(cfg, "record_internal_nn_metrics", False):
       self.sow(nnx.Intermediate, "activation_mean", jnp.mean(layer_output))
       self.sow(nnx.Intermediate, "activation_stdev", jnp.std(layer_output))
       self.sow(
@@ -214,6 +237,47 @@ class NNXDecoderLayer(nnx.Module):
       return layer_output, None
     else:
       return layer_output, kv_cache
+
+
+def reshape_forced_routed_experts_for_scan(
+    forced_routed_experts: jax.Array,
+    num_layers: int,
+    scan_length: int,
+    layers_per_cycle: int,
+) -> jax.Array:
+  """Reshapes a batch's forced_routed_experts into jax.lax.scan's xs layout.
+
+  The outer scan runs `scan_length` iterations, each covering a cycle of
+  `layers_per_cycle` decoder layers. Every supported architecture is
+  homogeneous-MoE, so the layer axis is simply the decoder layer index.
+
+  Args:
+    forced_routed_experts: `[batch, seq, num_layers, top_k]` (per-layer) or
+      `[batch, seq, top_k]` (broadcast to every layer).
+    num_layers: Total decoder layers (`scan_length * layers_per_cycle`).
+    scan_length: Number of outer scan iterations.
+    layers_per_cycle: Decoder layers per cycle.
+
+  Returns:
+    Array shaped `[scan_length, layers_per_cycle, batch, seq, top_k]`.
+
+  Raises:
+    ValueError: If forced_routed_experts is not 3D or 4D.
+  """
+  fre = forced_routed_experts
+  if fre.ndim not in (3, 4):
+    raise ValueError(
+        "forced_routed_experts must be [batch, seq, top_k] (3D, broadcast to"
+        " every layer) or [batch, seq, num_layers, top_k] (4D, per-layer); got"
+        f" ndim={fre.ndim} with shape {fre.shape}."
+    )
+  if fre.ndim == 4:
+    # [batch, seq, num_layers, top_k] -> [num_layers, batch, seq, top_k]
+    fre = jnp.moveaxis(fre, 2, 0)
+  else:
+    # [batch, seq, top_k]: same forced routing for every layer.
+    fre = jnp.broadcast_to(fre[None], (num_layers,) + fre.shape)
+  return jnp.reshape(fre, (scan_length, layers_per_cycle) + fre.shape[1:])
 
 
 def deepstack_process(hidden_states, bidirectional_mask, visual_embeds):
@@ -241,6 +305,132 @@ def deepstack_process(hidden_states, bidirectional_mask, visual_embeds):
   return hidden_states
 
 
+class NNXSequentialPipelineStage(nnx.Module):
+  """Sequential unscanned series of decoder layers formatted for a single pipeline stage."""
+
+  def __init__(
+      self,
+      layer_cls,
+      num_layers: int,
+      config: Config,
+      mesh: Mesh,
+      quant: Quant,
+      model_mode: str,
+      *,
+      rngs: nnx.Rngs,
+  ):
+    self.config = config
+    self.scan_layers = config.scan_layers
+    self.num_layers = num_layers
+    # Dynamically assign layers with explicit string names to ensure correct PyTree paths (layers_0)
+    for i in range(num_layers):
+      layer = layer_cls(config=config, mesh=mesh, quant=quant, model_mode=model_mode, rngs=rngs)
+      setattr(self, f"layers_{i}", layer)
+
+  def __call__(
+      self,
+      inputs,
+      decoder_segment_ids,
+      decoder_positions,
+      deterministic,
+      model_mode,
+      **kwargs,
+  ):
+    for i in range(self.num_layers):
+      layer = getattr(self, f"layers_{i}")
+      out = layer(
+          inputs,
+          decoder_segment_ids,
+          decoder_positions,
+          deterministic,
+          model_mode,
+          **kwargs,
+      )
+      inputs = out[0] if isinstance(out, tuple) else out
+    if self.scan_layers:
+      return inputs, None
+    return inputs
+
+
+class NNXScannedPipelineStage(nnx.Module):
+  """Scanned block of decoder layers formatted for a single pipeline stage."""
+
+  def __init__(
+      self,
+      layer_cls,
+      num_layers: int,
+      config: Config,
+      mesh: Mesh,
+      quant: Quant,
+      model_mode: str,
+      *,
+      rngs: nnx.Rngs,
+  ):
+    self.config = config
+
+    def create_layer_fn(rng):
+      return layer_cls(config=config, mesh=mesh, quant=quant, model_mode=model_mode, rngs=rng)
+
+    forked_rngs = rngs.fork(split=num_layers)
+
+    out_axes = nnx.StateAxes({nnx.Param: config.param_scan_axis, ...: 0})
+    self.scanned_layers = nnx.vmap(
+        create_layer_fn,
+        in_axes=0,
+        out_axes=out_axes,
+        axis_name="layers_per_stage",
+        transform_metadata={nnx.PARTITION_NAME: "layers_per_stage"},
+    )(forked_rngs)
+
+  def __call__(
+      self,
+      inputs,
+      decoder_segment_ids,
+      decoder_positions,
+      deterministic,
+      model_mode,
+      **kwargs,
+  ):
+    graphdef, params, state = nnx.split(self.scanned_layers, nnx.Param, ...)
+
+    scan_axis = self.config.param_scan_axis
+    if scan_axis != 0:
+      params = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0) if x.ndim > scan_axis else x, params)
+
+    def layer_fn(carry, scanned_vars):
+      current_params, current_state = scanned_vars
+      layer = nnx.merge(graphdef, current_params, current_state)
+      layer_out = layer(
+          carry,
+          decoder_segment_ids,
+          decoder_positions,
+          deterministic,
+          model_mode,
+          **kwargs,
+      )
+      new_carry = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+      # Avoid returning and stacking read-only parameters inside the scan body.
+      # This prevents huge unnecessary memory allocation.
+      _, _, updated_state = nnx.split(layer, nnx.Param, ...)
+      return new_carry, updated_state
+
+    final_carry, scanned_state = jax.lax.scan(layer_fn, inputs, (params, state))
+
+    if scan_axis != 0:
+      scanned_params, scanned_other = scanned_state.split(nnx.Param, ...)
+      if scanned_params:
+        scanned_params = jax.tree.map(
+            lambda x: jnp.moveaxis(x, 0, scan_axis) if x.ndim > scan_axis else x, scanned_params
+        )
+      scanned_state = nnx.State.merge(scanned_params, scanned_other)
+
+    nnx.update(self.scanned_layers, scanned_state)
+
+    if self.config.scan_layers:
+      return final_carry, None
+    return final_carry
+
+
 class NNXDecoder(nnx.Module):
   """A stack of decoder layers as a part of an encoder-decoder architecture, using NNX."""
 
@@ -261,14 +451,6 @@ class NNXDecoder(nnx.Module):
 
     decoder_block_classes = self.get_decoder_layers()
 
-    self.decoder_norm = self.get_norm_layer(num_features=config.emb_dim, rngs=rngs)(
-        dtype=config.dtype,
-        weight_dtype=config.weight_dtype,
-        epsilon=config.normalization_layer_epsilon,
-        kernel_axes=("norm",),
-        parameter_memory_host_offload=config.parameter_memory_host_offload,
-    )
-
     if config.trainable_position_size > 0:
       self.position_embedder = Embed(
           num_embeddings=config.trainable_position_size,
@@ -281,139 +463,543 @@ class NNXDecoder(nnx.Module):
       )
 
     self.dropout = linears.Dropout(rate=config.dropout_rate, rngs=rngs, broadcast_dims=(-2,))
-
     self.positional_embedding = PositionalEmbedding(embedding_dims=config.base_emb_dim)
 
+    self.decoder_norm = self.get_norm_layer(num_features=config.emb_dim, rngs=rngs)(
+        dtype=config.dtype,
+        weight_dtype=config.weight_dtype,
+        epsilon=config.normalization_layer_epsilon,
+        kernel_axes=("norm",),
+        parameter_memory_host_offload=config.parameter_memory_host_offload,
+    )
     if not config.logits_via_embedding:
       self.logits_dense = linears.DenseGeneral(
           in_features_shape=config.emb_dim,
           out_features_shape=config.vocab_size,
-          weight_dtype=config.weight_dtype,
+          weight_dtype=get_weight_dtype(config, "logits_dense"),
           dtype=jnp.float32 if config.logits_dot_in_fp32 else config.dtype,
-          kernel_axes=("embed", "vocab"),
+          kernel_axes=("embed_vocab", "vocab"),
           shard_mode=config.shard_mode,
           matmul_precision=self.config.matmul_precision,
           parameter_memory_host_offload=config.parameter_memory_host_offload,
+          weight_quant=quantizations.get_weight_quant_config(config, "logits_dense"),
           rngs=rngs,
       )
 
     self.scanned_layers = None
     self.is_deepseek = self.config.decoder_block == DecoderBlockType.DEEPSEEK
+    self.is_deepseek4 = self.config.decoder_block == DecoderBlockType.DEEPSEEK4
     self.is_gemma3 = self.config.decoder_block == DecoderBlockType.GEMMA3
+    self.is_gemma4 = self.config.decoder_block == DecoderBlockType.GEMMA4
+    self.is_gemma4_small = self.config.decoder_block == DecoderBlockType.GEMMA4_SMALL
+    self.is_qwen3_next = self.config.decoder_block == DecoderBlockType.QWEN3_NEXT
+    self.is_qwen3_5 = self.config.decoder_block == DecoderBlockType.QWEN3_5
 
-    if self.config.scan_layers:
-      if self.is_deepseek:
-        assert len(decoder_block_classes) == 2
-        dense_cls, moe_cls = decoder_block_classes
+    if config.mhc_expansion_rate > 1 and config.decoder_block == DecoderBlockType.DEEPSEEK4:
+      self.hc_head = mhc.DeepSeek4HyperHead(
+          config=config,
+          mesh=self.mesh,
+          rngs=self.rngs,
+      )
 
-        num_dense = config.first_num_dense_layers
-        self.dense_layers = self._create_scanned_layers(dense_cls, length=num_dense, rngs=rngs)
+    self._init_decoder_layers(decoder_block_classes, rngs, mesh)
 
-        num_moe = config.num_decoder_layers - config.first_num_dense_layers
+  def _init_decoder_layers(self, decoder_block_classes, rngs, mesh):
+    """Routes layer construction through three main paths: pipeline, scanned non-pipeline, sequential."""
+    config = self.config
 
-        self.moe_layer = self._create_scanned_layers(moe_cls, length=num_moe, rngs=rngs)
-      elif self.is_gemma3:
-        attention_pattern_length = len(gemma3.GEMMA3_ATTENTION_PATTERN)
-        scan_length = config.num_decoder_layers // attention_pattern_length
-        num_remaining_layers = config.num_decoder_layers % attention_pattern_length
-        layer_kwargs = {"num_of_layers": attention_pattern_length}
-
-        rem_layer_kwargs = {"num_of_layers": num_remaining_layers}
-
-        RemattedGemma3Block = gemma3.Gemma3ScannableBlock
-
-        if scan_length > 0:
-          self.layers = self._create_scanned_layers(RemattedGemma3Block, length=scan_length, rngs=rngs, **layer_kwargs)
-        self.layers_remainder = RemattedGemma3Block(
-            config=self.config, mesh=mesh, quant=self.quant, model_mode=self.model_mode, **rem_layer_kwargs, rngs=rngs
-        )  # pytype: disable=wrong-keyword-args
-      else:
-        layer_cls = decoder_block_classes[0]
-        num_layers = int(config.num_decoder_layers / config.inhomogeneous_layer_cycle_interval)
-        layer_kwargs = {}
-        if config.decoder_block == DecoderBlockType.LLAMA4:
-          layer_kwargs = {
-              "nope_layer_interval": self.config.nope_layer_interval,
-              "interleave_moe_layer_step": self.config.interleave_moe_layer_step,
-          }
-
-        self.layers = self._create_scanned_layers(layer_cls, length=num_layers, rngs=rngs, **layer_kwargs)
+    if self.is_gemma4_small:
+      # Gemma4 E2B/E4B: per-layer-index KV-share donor threading and a distinct attention_type
+      # per layer are not expressible inside nn.scan; pipeline parallelism is also unsupported.
+      if getattr(config, "using_pipeline_parallelism", False) or getattr(config, "scan_layers", False):
+        raise ValueError("gemma4_small (Gemma4 E2B/E4B) does not support pipeline parallelism or scan_layers.")
+      self._init_gemma4_small_layers(rngs)
+    elif getattr(config, "using_pipeline_parallelism", False) and not config.use_jaxpp:
+      self._init_pipeline_layers(decoder_block_classes, rngs, mesh)
+    elif getattr(config, "scan_layers", False):
+      self._init_scanned_layers(decoder_block_classes, rngs, mesh)
     else:
-      self.layers = nnx.List([])
+      self._init_sequential_layers(decoder_block_classes, rngs)
 
-      if self.is_deepseek:
-        dense_cls, moe_cls = decoder_block_classes
-        for i in range(config.first_num_dense_layers):
-          self._create_and_register_layer(dense_cls, rngs, "dense_layer", i)
-        for i in range(config.num_decoder_layers - config.first_num_dense_layers):
-          self._create_and_register_layer(moe_cls, rngs, "moe_layer", i)
+  def _init_pipeline_layers(self, decoder_block_classes, rngs, mesh):
+    """Initializes decoder layers with pipeline parallelism."""
+    config = self.config
+    assert not (config.engram_layers and self.is_deepseek), (
+        "engram_layers + DeepSeek + pipeline_parallelism is not supported. "
+        "engram interleaving is currently only implemented in the non-pipeline path."
+    )
+
+    def build_pipeline_stage_layers(rngs):
+      return self._get_pipeline_stage_module(decoder_block_classes, rngs)
+
+    self.pipeline_module = create_nnx_pipeline(
+        config=config,
+        stage_factory=build_pipeline_stage_layers,
+        mesh=mesh,
+        remat_policy=self.get_remat_policy(),
+        rngs=rngs,
+    )
+
+    if self.is_deepseek:
+      self._init_pipeline_deepseek(decoder_block_classes, rngs)
+    else:
+      self._init_pipeline_generic(decoder_block_classes, rngs)
+
+  def _init_pipeline_deepseek(self, decoder_block_classes, rngs):
+    """Initializes DeepSeek dense and MoE layers outside pipeline."""
+    config = self.config
+    assert len(decoder_block_classes) == 2
+    dense_cls, moe_cls = decoder_block_classes
+    if config.scan_layers:
+      self.dense_layers = self._create_scanned_layers(
+          dense_cls,
+          length=config.first_num_dense_layers,
+          metadata_axis_name="dense_layers",
+          rngs=rngs,
+      )
+      num_moe_outside = (config.num_decoder_layers - config.first_num_dense_layers) - config.pipeline_parallel_layers
+      if num_moe_outside > 0:
+        self.moe_layers_outside_pipeline = self._create_scanned_layers(
+            moe_cls,
+            length=num_moe_outside,
+            metadata_axis_name="moe_layers",
+            rngs=rngs,
+        )
+    else:
+      self.num_dense_layers = config.first_num_dense_layers
+      for i in range(self.num_dense_layers):
+        self._create_and_register_layer(dense_cls, rngs, "dense_layers", i)
+      self.num_moe_outside_pipeline = (
+          config.num_decoder_layers - config.first_num_dense_layers
+      ) - config.pipeline_parallel_layers
+      if self.num_moe_outside_pipeline > 0:
+        for i in range(self.num_moe_outside_pipeline):
+          self._create_and_register_layer(moe_cls, rngs, "moe_layers_outside_pipeline", i)
+
+  def _init_pipeline_generic(self, decoder_block_classes, rngs):
+    """Initializes generic decoder layers outside pipeline."""
+    config = self.config
+    remaining_layers = config.num_decoder_layers - config.pipeline_parallel_layers
+    if remaining_layers > 0:
+      base_cls = decoder_block_classes[0]
+      if config.scan_layers:
+        self.layers_outside_pipeline = self._create_scanned_layers(
+            base_cls,
+            length=remaining_layers,
+            metadata_axis_name="layers_outside_pipeline",
+            rngs=rngs,
+        )
       else:
-        layer_cls = decoder_block_classes[0]
+        self.num_layers_outside_pipeline = remaining_layers
+        for i in range(self.num_layers_outside_pipeline):
+          self._create_and_register_layer(base_cls, rngs, "layers_outside_pipeline", i)
 
-        for lyr in range(config.num_decoder_layers):
-          layer_kwargs = {}
-          if config.decoder_block == DecoderBlockType.GEMMA3:
-            layer_kwargs = {"attention_type": gemma3.get_attention_type(layer_id=lyr)}
-          elif config.decoder_block == DecoderBlockType.LLAMA4:
-            layer_kwargs = {
-                "is_nope_layer": llama4.determine_is_nope_layer(lyr, self.config.nope_layer_interval),
-                "is_moe_layer": llama4.determine_is_moe_layer(lyr, self.config.interleave_moe_layer_step),
-            }
-          elif config.decoder_block == DecoderBlockType.QWEN3_NEXT:
-            layer_kwargs = {"layer_idx": lyr}
-          elif config.decoder_block == DecoderBlockType.GPT_OSS:
-            layer_kwargs = {"attention_type": gpt_oss.get_attention_type(layer_id=lyr)}
-          elif config.decoder_block == DecoderBlockType.OLMO3:
-            layer_kwargs = {"attention_type": olmo3.get_attention_type(layer_id=lyr)}
+  def _init_scanned_layers(self, decoder_block_classes, rngs, mesh):
+    """Initializes decoder layers with scanning (non-pipeline)."""
+    if self.is_deepseek:
+      self._init_scanned_deepseek(decoder_block_classes, rngs)
+    elif self.is_deepseek4:
+      self._init_scanned_deepseek4(rngs)
+    elif self.is_gemma3:
+      self._init_scanned_gemma3(decoder_block_classes, rngs, mesh)
+    elif self.is_gemma4:
+      self._init_scanned_gemma4(decoder_block_classes, rngs, mesh)
+    elif self.is_qwen3_next:
+      self._init_scanned_qwen3_next(rngs, mesh)
+    else:
+      self._init_scanned_generic(decoder_block_classes, rngs)
 
-          self._create_and_register_layer(layer_cls, rngs, "layers", lyr, **layer_kwargs)
+  def _init_scanned_deepseek4(self, rngs):
+    """Initializes DeepSeek V4 scanned layers: unrolls prefix hash layers and scans remaining full blocks."""
+    config = self.config
+    num_hash_layers = config.first_num_hash_layers
+    for layer_idx in range(num_hash_layers):
+      self._create_and_register_layer(
+          deepseek4.DeepSeek4DecoderLayer,
+          rngs,
+          "layers",
+          layer_idx,
+          layer_idx=layer_idx,
+      )
+
+    num_remaining_layers = config.num_decoder_layers - num_hash_layers
+    num_full_blocks = num_remaining_layers // 2
+    if num_full_blocks > 0:
+      self.scanned_blocks = self._create_scanned_layers(
+          deepseek4.DeepSeek4ScannableBlock,
+          length=num_full_blocks,
+          metadata_axis_name="scanned_blocks",
+          rngs=rngs,
+      )
+
+  def _init_scanned_deepseek(self, decoder_block_classes, rngs):
+    """Initializes scanned DeepSeek layers with optional Engram support."""
+    config = self.config
+    assert len(decoder_block_classes) == 2
+    dense_cls, moe_cls = decoder_block_classes
+
+    if config.engram_layers:
+      self._init_scanned_deepseek_engram(dense_cls, moe_cls, rngs)
+    else:
+      self._init_scanned_deepseek_standard(dense_cls, moe_cls, rngs)
+
+  def _init_scanned_deepseek_engram(self, dense_cls, moe_cls, rngs):
+    """Initializes scanned DeepSeek layers with Engram interleaving."""
+    config = self.config
+    # 1. Create Dense Chunks (Direct setattr, NO nnx.Dict)
+    current_idx = 0
+    while current_idx < config.first_num_dense_layers:
+      if current_idx in config.engram_layers:
+        layer_name = f"dense_layers_engram_{current_idx}"
+        setattr(
+            self,
+            layer_name,
+            self._create_single_layer(dense_cls, rngs, layer_idx=current_idx),
+        )
+        current_idx += 1
+      else:
+        next_boundary = self._find_next_boundary(current_idx, config.first_num_dense_layers, config.engram_layers)
+        chunk_name = f"dense_layers_{current_idx}_{next_boundary - 1}"
+        setattr(
+            self,
+            chunk_name,
+            self._create_scanned_layers(
+                dense_cls,
+                length=(next_boundary - current_idx),
+                metadata_axis_name=chunk_name,
+                rngs=rngs,
+            ),
+        )
+        current_idx = next_boundary
+
+    # 2. Create MoE Chunks (Direct setattr, NO nnx.Dict)
+    current_idx = config.first_num_dense_layers
+    while current_idx < config.num_decoder_layers:
+      if current_idx in config.engram_layers:
+        layer_name = f"moe_layers_engram_{current_idx}"
+        setattr(
+            self,
+            layer_name,
+            self._create_single_layer(moe_cls, rngs, layer_idx=current_idx),
+        )
+        current_idx += 1
+      else:
+        next_boundary = self._find_next_boundary(current_idx, config.num_decoder_layers, config.engram_layers)
+        chunk_name = f"moe_layers_{current_idx}_{next_boundary - 1}"
+        setattr(
+            self,
+            chunk_name,
+            self._create_scanned_layers(
+                moe_cls,
+                length=(next_boundary - current_idx),
+                metadata_axis_name=chunk_name,
+                rngs=rngs,
+            ),
+        )
+        current_idx = next_boundary
+
+  def _init_scanned_deepseek_standard(self, dense_cls, moe_cls, rngs):
+    """Initializes scanned DeepSeek layers without Engram interleaving."""
+    config = self.config
+    num_dense = config.first_num_dense_layers
+    self.dense_layers = self._create_scanned_layers(
+        dense_cls, length=num_dense, metadata_axis_name="dense_layers", rngs=rngs
+    )
+    num_moe = config.num_decoder_layers - config.first_num_dense_layers
+    self.moe_layers = self._create_scanned_layers(moe_cls, length=num_moe, metadata_axis_name="moe_layers", rngs=rngs)
+
+  def _init_scanned_gemma3(self, decoder_block_classes, rngs, mesh):
+    """Initializes scanned Gemma3 layers."""
+    config = self.config
+    attention_pattern_length = len(gemma3.GEMMA3_ATTENTION_PATTERN)
+    scan_length = config.num_decoder_layers // attention_pattern_length
+    num_remaining_layers = config.num_decoder_layers % attention_pattern_length
+    layer_kwargs = {"num_of_layers": attention_pattern_length}
+
+    rem_layer_kwargs = {"num_of_layers": num_remaining_layers}
+
+    RemattedGemma3Block = gemma3.Gemma3ScannableBlock
+
+    if scan_length > 0:
+      self.layers = self._create_scanned_layers(
+          RemattedGemma3Block,
+          length=scan_length,
+          metadata_axis_name="layers",
+          rngs=rngs,
+          **layer_kwargs,
+      )
+    self.layers_remainder = RemattedGemma3Block(
+        config=self.config,
+        mesh=mesh,
+        quant=self.quant,
+        model_mode=self.model_mode,
+        **rem_layer_kwargs,
+        rngs=rngs,
+    )  # pytype: disable=wrong-keyword-args
+
+  def _init_scanned_gemma4(self, decoder_block_classes, rngs, mesh):
+    """Initializes scanned Gemma4 layers."""
+    config = self.config
+    attention_pattern_length = len(gemma4.GEMMA4_ATTENTION_PATTERN)
+    scan_length = config.num_decoder_layers // attention_pattern_length
+    num_remaining_layers = config.num_decoder_layers % attention_pattern_length
+    policy = self.get_remat_policy()
+    # The pure-NNX decoder skips block-level remat (skip_block_remat=True below),
+    # so the block rematerializes its own local/global layers instead.
+    layer_kwargs = {
+        "num_of_layers": attention_pattern_length,
+        "remat_policy_fn": policy,
+        "apply_internal_remat": True,
+    }
+    rem_layer_kwargs = {
+        "num_of_layers": num_remaining_layers,
+        "remat_policy_fn": policy,
+        "apply_internal_remat": True,
+    }
+
+    RemattedGemma4Block = gemma4.Gemma4ScannableBlock
+
+    if scan_length > 0:
+      self.scanned_blocks = self._create_scanned_layers(
+          RemattedGemma4Block,
+          length=scan_length,
+          metadata_axis_name="layers",
+          rngs=rngs,
+          **layer_kwargs,
+      )
+    self.layers_remainder = RemattedGemma4Block(
+        config=self.config,
+        mesh=mesh,
+        quant=self.quant,
+        model_mode=self.model_mode,
+        **rem_layer_kwargs,
+        rngs=rngs,
+    )
+
+  def _init_scanned_qwen3_next(self, rngs, mesh):
+    """Initializes scanned Qwen3-Next blocks with per-layer (rather than per-block) remat.
+
+    Mirrors _init_scanned_gemma4: each block covers one period of the hybrid
+    attention pattern and rematerializes its own sub-layers, so the outer apply
+    skips block-level remat. Layers past the last whole period go into a short
+    remainder block, named the same as the Linen `Decoder`'s so both decoders
+    keep producing the same parameter tree.
+    """
+    config = self.config
+    block_length = config.inhomogeneous_layer_cycle_interval
+    scan_length = config.num_decoder_layers // block_length
+    num_remaining_layers = config.num_decoder_layers % block_length
+    policy = self.get_remat_policy()
+    if scan_length > 0:
+      self.layers = self._create_scanned_layers(
+          qwen3.Qwen3NextScannableBlock,
+          length=scan_length,
+          metadata_axis_name="layers",
+          rngs=rngs,
+          num_of_layers=block_length,
+          remat_policy_fn=policy,
+          apply_internal_remat=True,
+      )
+    if num_remaining_layers > 0:
+      # The remainder starts on a period boundary, so it holds only the leading
+      # linear-attention layers of a period -- the full-attention layer is last.
+      self.layers_remainder = qwen3.Qwen3NextScannableBlock(
+          config=config,
+          mesh=mesh,
+          quant=self.quant,
+          model_mode=self.model_mode,
+          num_of_layers=num_remaining_layers,
+          layer_idx_offset=scan_length * block_length,
+          remat_policy_fn=policy,
+          # _apply_remainder_block already wraps the call in jax.checkpoint, and
+          # the remainder is shorter than one period and runs once, so there is
+          # nothing to gain from a second, finer remat boundary inside it.
+          apply_internal_remat=False,
+          rngs=rngs,
+      )
+
+  def _init_scanned_generic(self, decoder_block_classes, rngs):
+    """Initializes scanned generic decoder layers."""
+    config = self.config
+    layer_cls = decoder_block_classes[0]
+    num_layers = int(config.num_decoder_layers / config.inhomogeneous_layer_cycle_interval)
+    layer_kwargs = {}
+    if config.decoder_block == DecoderBlockType.LLAMA4:
+      layer_kwargs = {
+          "nope_layer_interval": self.config.nope_layer_interval,
+          "interleave_moe_layer_step": self.config.interleave_moe_layer_step,
+      }
+    if config.decoder_block == DecoderBlockType.ENVY:
+      layer_kwargs = {
+          "interleave_moe_layer_step": self.config.interleave_moe_layer_step,
+      }
+
+    if num_layers > 0:
+      self.layers = self._create_scanned_layers(
+          layer_cls,
+          length=num_layers,
+          metadata_axis_name="layers",
+          rngs=rngs,
+          **layer_kwargs,
+      )
+
+  def _init_sequential_layers(self, decoder_block_classes, rngs):
+    """Initializes decoder layers sequentially (no scanning)."""
+
+    if self.is_deepseek:
+      self._init_sequential_deepseek(decoder_block_classes, rngs)
+    else:
+      self._init_sequential_generic(decoder_block_classes, rngs)
+
+  def _init_sequential_deepseek(self, decoder_block_classes, rngs):
+    """Initializes sequential DeepSeek dense and MoE layers."""
+    config = self.config
+    dense_cls, moe_cls = decoder_block_classes
+    for i in range(config.first_num_dense_layers):
+      self._create_and_register_layer(dense_cls, rngs, "dense_layers", i)
+    for i in range(config.num_decoder_layers - config.first_num_dense_layers):
+      self._create_and_register_layer(moe_cls, rngs, "moe_layers", i)
+
+  def _init_sequential_generic(self, decoder_block_classes, rngs):
+    """Initializes sequential generic decoder layers with per-architecture layer_kwargs."""
+    config = self.config
+    layer_cls = decoder_block_classes[0]
+
+    for lyr in range(config.num_decoder_layers):
+      layer_kwargs = {}
+      if config.decoder_block == DecoderBlockType.GEMMA3:
+        layer_kwargs = {"attention_type": gemma3.get_attention_type(layer_id=lyr)}
+      elif config.decoder_block == DecoderBlockType.GEMMA4:
+        layer_kwargs = {"attention_type": gemma4.get_attention_type(layer_id=lyr)}
+      elif config.decoder_block == DecoderBlockType.LLAMA4:
+        layer_kwargs = {
+            "is_nope_layer": llama4.determine_is_nope_layer(lyr, self.config.nope_layer_interval),
+            "is_moe_layer": llama4.determine_is_moe_layer(lyr, self.config.interleave_moe_layer_step),
+        }
+      elif config.decoder_block == DecoderBlockType.ENVY:
+        layer_kwargs = {
+            "is_moe_layer": (lyr + 1) % self.config.interleave_moe_layer_step == 0,
+        }
+
+      elif config.decoder_block in {
+          DecoderBlockType.QWEN3_NEXT,
+          DecoderBlockType.QWEN3_5,
+          DecoderBlockType.DEEPSEEK4,
+      }:
+        layer_kwargs = {"layer_idx": lyr}
+      elif config.decoder_block == DecoderBlockType.GPT_OSS:
+        layer_kwargs = {"attention_type": gpt_oss.get_attention_type(layer_id=lyr)}
+      elif config.decoder_block == DecoderBlockType.OLMO3:
+        layer_kwargs = {"attention_type": olmo3.get_attention_type(layer_id=lyr)}
+
+      self._create_and_register_layer(layer_cls, rngs, "layers", lyr, **layer_kwargs)
+
+  def _init_gemma4_small_layers(self, rngs):
+    """Eagerly builds the Gemma4-small (E2B/E4B) per-layer-input embedder and one DISTINCT
+    decoder layer per index.
+
+    Each layer bakes its own attention_type + layer_idx at construction (these select head_dim,
+    RoPE base, and KV-share role), so the layers are heterogeneous and cannot be folded into a
+    scanned stack. Layers are registered both as named attrs (``layers_{i}``, matching the Linen
+    checkpoint keys) and appended to ``self.layers`` for iteration, mirroring
+    ``_create_and_register_layer``.
+    """
+    cfg = self.config
+    # Only register the PLE submodule when it exists (mirrors the optional position_embedder
+    # pattern); assigning None first would make nnx treat the attribute as static.
+    if cfg.hidden_size_per_layer_input > 0 and cfg.vocab_size_per_layer_input > 0:
+      self.per_layer_embedder = gemma4_small.Gemma4SmallPLE(config=cfg, mesh=self.mesh, rngs=rngs)
+
+    layer_types = gemma4_small.build_layer_types(cfg.num_decoder_layers, cfg.model_name)
+    for lyr in range(cfg.num_decoder_layers):
+      layer = gemma4_small.Gemma4SmallDecoderLayer(
+          config=cfg,
+          mesh=self.mesh,
+          quant=self.quant,
+          model_mode=self.model_mode,
+          attention_type=layer_types[lyr],
+          layer_idx=lyr,
+          rngs=rngs,
+      )
+      setattr(self, f"layers_{lyr}", layer)
+
+  def _get_pipeline_stage_module(self, decoder_blocks, rngs):
+    """Retrieves the wrapper module formatted for single pipeline stage execution."""
+    cfg = self.config
+    base_stage_cls = decoder_blocks[1] if self.is_deepseek else decoder_blocks[0]
+
+    if cfg.num_layers_per_pipeline_stage == 1:
+      return self._create_single_layer(base_stage_cls, rngs)
+    elif cfg.scan_layers_per_stage:
+      return NNXScannedPipelineStage(
+          base_stage_cls,
+          cfg.num_layers_per_pipeline_stage,
+          cfg,
+          self.mesh,
+          self.quant,
+          self.model_mode,
+          rngs=rngs,
+      )
+    return NNXSequentialPipelineStage(
+        base_stage_cls,
+        cfg.num_layers_per_pipeline_stage,
+        cfg,
+        self.mesh,
+        self.quant,
+        self.model_mode,
+        rngs=rngs,
+    )
 
   def _create_and_register_layer(self, layer_cls, rngs, base_name, i, **layer_kwargs):
+    """Creates a layer registered ONLY via named attribute."""
     attr_name = f"{base_name}_{i}"
     layer = self._create_single_layer(layer_cls, rngs, **layer_kwargs)
     setattr(self, attr_name, layer)
-    self.layers.append(layer)
 
   def _create_single_layer(self, decoder_layer_class, rngs, **kwargs):
     """Helper to create a single layer (Linen or NNX)."""
     if issubclass(decoder_layer_class, nnx.Module):
       return decoder_layer_class(
-          config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, rngs=rngs, **kwargs
+          config=self.config,
+          mesh=self.mesh,
+          quant=self.quant,
+          model_mode=self.model_mode,
+          rngs=rngs,
+          **kwargs,
       )
     else:
       layer_linen = decoder_layer_class(
-          config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, **kwargs
+          config=self.config,
+          mesh=self.mesh,
+          quant=self.quant,
+          model_mode=self.model_mode,
+          **kwargs,
       )
       return nnx_wrappers.ToNNX(layer_linen, rngs=rngs)
 
-  def _create_scanned_layers(self, decoder_layer_class, length: int, rngs: nnx.Rngs, **layer_kwargs):
-    """Creates a VMapped stack of layers, forcing parameter init for Compact modules."""
-
-    def create_layer_fn(rng):
-      layer = decoder_layer_class(
-          config=self.config, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode, rngs=rng, **layer_kwargs
-      )
-
-      return layer
-
-    # Workaround for Deepseek MTP test failure.
-    # TODO: Handle this properly.
-    try:
-      forked_rngs = rngs.fork(split=length)
-
-    except:  # pylint: disable=bare-except
-      pass
-
-    out_axes = nnx.StateAxes({nnx.Param: self.config.param_scan_axis, ...: 0})
-    layers_vmapped = nnx.vmap(
-        create_layer_fn,
-        in_axes=0,
-        out_axes=out_axes,
-        axis_name="layers",
-        transform_metadata={nnx.PARTITION_NAME: "layers"},
-    )(forked_rngs)
-
-    return layers_vmapped
+  def _create_scanned_layers(
+      self,
+      decoder_layer_class,
+      length: int,
+      metadata_axis_name: str,
+      rngs: nnx.Rngs,
+      **layer_kwargs,
+  ):
+    """Creates a scanned stack of layers using jax.lax.scan for memory-efficient initialization."""
+    return nnx_scan.create_scanned_layers(
+        lambda layer_rngs: decoder_layer_class(
+            config=self.config,
+            mesh=self.mesh,
+            model_mode=self.model_mode,
+            quant=self.quant,
+            rngs=layer_rngs,
+            **layer_kwargs,
+        ),
+        length=length,
+        param_scan_axis=self.config.param_scan_axis,
+        metadata_axis_name=metadata_axis_name,
+        rngs=rngs,
+    )
 
   def _apply_layer_with_remat(self, layer: nnx.Module, y: jax.Array, policy: Any, prevent_cse: bool, **kwargs):
     """Helper to cleanly apply jax.checkpoint to a single unscanned layer or block."""
@@ -431,58 +1017,203 @@ class NNXDecoder(nnx.Module):
 
     return out
 
-  def _apply_layers_sequentially(self, layers, x_in, *args, length: int, **kwargs):
-    """Runs the layer stack using nnx.scan."""
+  def _apply_layers_sequentially(
+      self,
+      layers,
+      x_in,
+      *args,
+      length: int,
+      kv_caches_stacked=None,
+      skip_block_remat: bool = False,
+      unroll: int = 1,
+      metadata_axis_name: str = "layers",
+      forced_routed_experts_scanned=None,
+      **kwargs,
+  ):
+    """Runs the layer stack using nnx.scan.
+
+    This is the fuller of the two NNX scan appliers: it also threads external
+    (vLLM) KV caches via a static unroll and re-applies scan-axis metadata.
+    ``nnx_scan.apply_scanned_layers`` is a leaner, model-agnostic alternative
+    (currently used only by Gemma4); unifying the two is a follow-up cleanup.
+
+    Args:
+      layers: The stacked NNX module whose params are scanned over.
+      x_in: The carry (hidden state) fed into the first layer.
+      *args: Positional args broadcast to every layer call.
+      length: Number of scan iterations (= number of layers).
+      kv_caches_stacked: Optional pytree whose leaves have shape [num_layers,
+        ...]. When provided, the i-th slice is passed as `kv_cache=` to layer i
+        and the updated caches are returned as a third element of the tuple.
+      skip_block_remat: When True, do not wrap the scanned body in
+        jax.checkpoint. Used when the scanned module already applies its own
+        (finer-grained, e.g. per-layer) remat internally, to avoid double
+        rematerialization.
+      unroll: Number of scan iterations to unroll into straight-line code
+        (forwarded to jax.lax.scan). unroll >= length fully unrolls the loop.
+      metadata_axis_name: The name of the scan axis used during layer
+        initialization. This must perfectly match the string passed to
+        `_create_scanned_layers` (e.g., "layers", "scanned_blocks") to prevent
+        strict JAX `pjit` PyTree metadata mismatch errors when using custom
+        `nnx.Variable` types (like `MoEBiasVar`).
+      forced_routed_experts_scanned: Optional `[length, ...]` array, one slice
+        per scan iteration, threaded through jax.lax.scan's xs alongside
+        params/state and passed to each layer as `forced_routed_experts=`.
+      **kwargs: Keyword args forwarded to the layer (filtered by the layer
+        signature).
+
+    Returns:
+      (final_carry, updated_layers) when kv_caches_stacked is None.
+      (final_carry, updated_layers, returned_kv_stacked) otherwise.
+    """
+    if length == 0:
+      return (
+          x_in,
+          layers,
+          kv_caches_stacked if kv_caches_stacked is not None else None,
+      )
     policy = self.get_remat_policy()
     prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
-    graphdef, params, state = nnx.split(
-        layers, nnx.Param, ...
-    )  # state: the mutable state we carry (KV cache, RNGs, etc.)
+    graphdef, params, state = nnx.split(layers, nnx.Param, ...)
 
     scan_axis = self.config.param_scan_axis
     if scan_axis != 0:
-      # Move scan_axis to 0 so scan can iterate over it
-      params = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0), params)
+      params = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0) if x.ndim > scan_axis else x, params)
 
     layer_cls = layers.__class__
     sig = inspect.signature(layer_cls.__call__)
     valid_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters or "kwargs" in sig.parameters}
 
-    layer_cls = layers.__class__  # Access the underlying class
-    sig = inspect.signature(layer_cls.__call__)
-    # Filter kwargs to only include keys that exist in the layer's signature
-    valid_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters or "kwargs" in sig.parameters}
+    def _extract_matching_state(template, full):
+      if isinstance(template, nnx.State):
+        return nnx.State({k: _extract_matching_state(v, full[k]) for k, v in template.items()})
+      elif isinstance(template, dict):
+        return {k: _extract_matching_state(v, full[k]) for k, v in template.items()}
+      return full
+
+    dynamic_graph_init = bool(getattr(self, "disable_quant_stats_update", False))
+    updated_graphdef = [graphdef]
+
+    use_kv = kv_caches_stacked is not None
+    use_forced_routing = forced_routed_experts_scanned is not None
 
     def layer_fn(carry, scanned_vars):
+      # Ensure metadata rank matches the sliced values
+      scanned_vars = maxtext_utils_nnx.nnx_remove_scan_axis(scanned_vars, "layers")
+
       # Unpack the sliced variables for THIS layer
-      current_params, current_state = scanned_vars
+      if use_kv:
+        current_params, current_state, kv_cache_layer = scanned_vars
+        forced_routed_experts_layer = None
+      elif use_forced_routing:
+        current_params, current_state, forced_routed_experts_layer = scanned_vars
+        kv_cache_layer = None
+      else:
+        current_params, current_state = scanned_vars
+        kv_cache_layer = None
+        forced_routed_experts_layer = None
 
       if self.config.parameter_memory_host_offload:
-        current_params = jax.tree.map(lambda x: jax.device_put(x, max_utils.device_space()), current_params)
+        current_params = jax.tree.map(
+            lambda x: jax.device_put(x, max_utils.device_space()),
+            current_params,
+        )
 
-      # Merge using the SLICED state
       layer = nnx.merge(graphdef, current_params, current_state)
 
-      # Run the layer (Filter kwargs if using the solution from previous turn)
-      layer_out = layer(carry, *args, **valid_kwargs)
+      # Build call kwargs, injecting per-layer kv_cache / forced routing when available
+      call_kwargs = dict(valid_kwargs)
+      if kv_cache_layer is not None:
+        call_kwargs["kv_cache"] = kv_cache_layer
+      if use_forced_routing:
+        call_kwargs["forced_routed_experts"] = forced_routed_experts_layer
 
-      new_carry = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+      layer_out = layer(carry, *args, **call_kwargs)
+
+      if isinstance(layer_out, tuple):
+        new_carry = layer_out[0]
+        updated_kv = layer_out[1] if len(layer_out) > 1 else None
+      else:
+        new_carry = layer_out
+        updated_kv = None
 
       # Extract the updated state to return it
-      # _, new_current_state = nnx.split(layer, nnx.Param, ...)
-      new_current_state = nnx.state(layer)
+      if dynamic_graph_init:
+        new_graphdef, updated_params, updated_state = nnx.split(layer, nnx.Param, ...)
+        updated_graphdef[0] = new_graphdef
+        returned_params = updated_params
+        new_current_state = nnx.State.merge(returned_params, updated_state)
+      else:
+        # Avoid returning and stacking read-only parameters inside the scan body.
+        # This prevents huge unnecessary memory allocation.
+        _, _, updated_state = nnx.split(layer, nnx.Param, ...)
+        new_current_state = updated_state
+
+      if use_kv:
+        return new_carry, (new_current_state, updated_kv)
       return new_carry, new_current_state
 
-    layer_fn = jax.checkpoint(layer_fn, policy=policy, prevent_cse=prevent_cse)
+    if skip_block_remat:
+      # The scanned module applies its own remat internally; wrapping the whole
+      # body again would double-remat and recompute the entire block.
+      layer_fn_wrapped = layer_fn
+    else:
+      layer_fn_wrapped = jax.checkpoint(layer_fn, policy=policy, prevent_cse=prevent_cse)
 
-    final_carry, scanned_state = jax.lax.scan(layer_fn, x_in, (params, state))
+    if use_kv:
+      # If kv_caches is provided (e.g., from vLLM), we CANNOT use jax.lax.scan
+      # because scanning requires stacking the kv_caches list, which creates a copy
+      # and breaks the in-place memory updates required by vLLM's PagedAttention.
+      # Therefore, we must unroll the loop statically when kv_caches is provided.
 
-    if scan_axis != 0:
-      scanned_params, scanned_other = scanned_state.split(nnx.Param, ...)
-      scanned_params = jax.tree.map(lambda x: jnp.moveaxis(x, 0, scan_axis), scanned_params)
-      scanned_state = nnx.State.merge(scanned_params, scanned_other)
+      # kv_caches_stacked is actually the original kv_caches list in this new flow
+      kv_caches_list = kv_caches_stacked
+      current_carry = x_in
 
-    return final_carry, nnx.merge(graphdef, scanned_state)
+      for i in range(length):
+        # Statically slice the parameters and state for this layer
+        current_params = jax.tree.map(lambda x, i=i: x[i], params)
+        current_state = jax.tree.map(lambda x, i=i: x[i], state)
+
+        # Call the layer
+        current_carry, (_, updated_kv) = layer_fn_wrapped(
+            current_carry, (current_params, current_state, kv_caches_list[i])
+        )
+
+        # Update the list in-place (mutates the list passed by reference)
+        kv_caches_list[i] = updated_kv
+
+      # We don't need to rebuild scanned_state or return it because during
+      # inference with vLLM, parameters do not change and we don't need intermediates.
+      return current_carry, layers, None
+    else:
+      params = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(params, length)
+      state = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(state, length)
+
+      if use_forced_routing:
+        scan_xs = (params, state, forced_routed_experts_scanned)
+      else:
+        scan_xs = (params, state)
+      final_carry, scanned_state = jax.lax.scan(layer_fn_wrapped, x_in, scan_xs, unroll=unroll)
+      returned_kv_stacked = None
+
+      # Move the scan axis to each variable's param_scan_axis and restore its name
+      # in the sharding metadata. jax.lax.scan emits it at position 0.
+      scanned_state = maxtext_utils_nnx.nnx_add_and_sync_scan_axis(scanned_state, metadata_axis_name)
+
+      returned_kv_stacked = None
+
+    if dynamic_graph_init:
+      # If graph changed, we need to merge with the new graphdef.
+      # Note: scanned_state here is the full state (Params + rest).
+      new_params, new_rest = scanned_state.split(nnx.Param, ...)
+      out_layers = nnx.merge(updated_graphdef[0], new_params, new_rest)
+    else:
+      clean_state = nnx.filter_state(scanned_state, nnx.Not(nnx.RngState))
+      nnx.update(layers, clean_state)
+      out_layers = layers
+
+    return final_carry, out_layers, returned_kv_stacked if use_kv else None
 
   def get_decoder_layers(self):
     """Retrieves decoder layer classes based on config using a dictionary lookup."""
@@ -492,8 +1223,6 @@ class NNXDecoder(nnx.Module):
       return [scannable_cls] if cfg.scan_layers else [normal_cls]
 
     def get_deepseek():
-      if cfg.use_batch_split_schedule:
-        return [deepseek_batchsplit.DeepSeekDenseLayer, deepseek_batchsplit.DeepSeekMoELayer]
       return [deepseek.DeepSeekDenseLayer, deepseek.DeepSeekMoELayer]
 
     layer_map = {
@@ -504,16 +1233,23 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.GEMMA: [gemma.GemmaDecoderLayer],
         DecoderBlockType.GEMMA2: [gemma2.Gemma2DecoderLayer],
         DecoderBlockType.GEMMA3: [gemma3.Gemma3DecoderLayer],
+        DecoderBlockType.GEMMA4: get_scannable(gemma4.Gemma4DecoderLayer, gemma4.Gemma4ScannableBlock),
+        DecoderBlockType.GEMMA4_SMALL: [gemma4_small.Gemma4SmallDecoderLayer],
         DecoderBlockType.GPT3: [gpt3.Gpt3DecoderLayer],
+        DecoderBlockType.QWEN2: [qwen2.Qwen2DecoderLayer],
         DecoderBlockType.QWEN3: [qwen3.Qwen3DecoderLayer],
         DecoderBlockType.QWEN3_MOE: [qwen3.Qwen3MoeDecoderLayer],
+        DecoderBlockType.QWEN3_CUSTOM_MOE: [qwen3_custom.Qwen3CustomMoeDecoderLayer],
         DecoderBlockType.SIMPLE: [simple_layer.SimpleDecoderLayer],
         DecoderBlockType.SIMPLE_MLP: [simple_layer.SimpleMlpDecoderLayer],
         DecoderBlockType.DEEPSEEK: get_deepseek(),
+        DecoderBlockType.DEEPSEEK4: get_scannable(deepseek4.DeepSeek4DecoderLayer, deepseek4.DeepSeek4ScannableBlock),
         DecoderBlockType.GPT_OSS: get_scannable(gpt_oss.GptOssDecoderLayer, gpt_oss.GptOssScannableBlock),
         DecoderBlockType.QWEN3_NEXT: get_scannable(qwen3.Qwen3NextDecoderLayer, qwen3.Qwen3NextScannableBlock),
+        DecoderBlockType.QWEN3_5: get_scannable(qwen3_5.Qwen3_5DecoderLayer, qwen3_5.Qwen3_5ScannableBlock),
         DecoderBlockType.LLAMA4: get_scannable(llama4.Llama4DecoderLayer, llama4.Llama4ScannableBlock),
         DecoderBlockType.OLMO3: get_scannable(olmo3.Olmo3DecoderLayer, olmo3.Olmo3ScannableBlock),
+        DecoderBlockType.ENVY: get_scannable(envy.EnvyDecoderLayer, envy.EnvyScannableBlock),
     }
 
     if cfg.decoder_block not in layer_map:
@@ -527,6 +1263,7 @@ class NNXDecoder(nnx.Module):
         "query_proj",
         "value_proj",
         "key_proj",
+        "kv_proj",
         "qkv_proj",
         "out_proj",
         "mlpwi_0",
@@ -544,16 +1281,17 @@ class NNXDecoder(nnx.Module):
     """Get remat policy for jax.checkpoint."""
     policy = None
     cfg = self.config
-    if cfg.remat_policy != "none":
-      if cfg.remat_policy in ("minimal_with_context", "minimal_flash"):
-        # save all
-        if cfg.remat_policy == "minimal_flash":
+    remat_policy = getattr(self, "remat_policy_override", None) or cfg.remat_policy
+    if remat_policy and remat_policy != "none":
+      if remat_policy in {"minimal_with_context", "minimal_flash"}:
+        if remat_policy == "minimal_flash":
           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
         policy = self.minimal_policy(with_context=True)
-      elif cfg.remat_policy == "minimal":
-        # save all except context
+      elif remat_policy == "minimal":
         policy = self.minimal_policy()
-      elif cfg.remat_policy == "minimal_with_quantization":
+      elif remat_policy == "save_dot_only":
+        policy = jax.checkpoint_policies.checkpoint_dots
+      elif remat_policy == "minimal_with_quantization":
         if cfg.scan_layers:
           warnings.warn(
               "Scan layers can introduce overhead to checkpointed values that in some configurations is slower"
@@ -562,7 +1300,7 @@ class NNXDecoder(nnx.Module):
               "beneficial for performance."
           )
         policy = self.minimal_policy(with_context=False, with_quantization=True)
-      elif cfg.remat_policy == "minimal_with_context_and_quantization":
+      elif remat_policy == "minimal_with_context_and_quantization":
         if cfg.scan_layers:
           warnings.warn(
               "Scan layers can introduce overhead to checkpointed values that in some configurations is slower"
@@ -571,54 +1309,63 @@ class NNXDecoder(nnx.Module):
               "beneficial for performance."
           )
         policy = self.minimal_policy(with_context=True, with_quantization=True)
-      elif cfg.remat_policy == "save_dot_with_context_except_mlp":
+      elif remat_policy == "save_dot_with_context_except_mlp":
         policy = jax.checkpoint_policies.save_only_these_names(
             "query_proj",
             "value_proj",
             "key_proj",
+            "kv_proj",
             "qkv_proj",
             "context",
             "out_proj",
         )
-      elif cfg.remat_policy == "save_dot_except_mlpwi":
+      elif remat_policy == "save_dot_except_mlpwi":
         policy = jax.checkpoint_policies.save_only_these_names(
             "query_proj",
             "value_proj",
             "key_proj",
+            "kv_proj",
             "qkv_proj",
             "out_proj",
             "mlpwo",
         )
-      elif cfg.remat_policy == "save_dot_except_mlp":
+      elif remat_policy == "save_dot_except_mlp":
         policy = jax.checkpoint_policies.save_only_these_names(
             "query_proj",
             "value_proj",
             "key_proj",
+            "kv_proj",
             "qkv_proj",
             "out_proj",
         )
-      elif cfg.remat_policy == "save_qkv_proj":
+      elif remat_policy == "save_qkv_proj":
         policy = jax.checkpoint_policies.save_only_these_names(
             "query_proj",
             "value_proj",
             "key_proj",
+            "kv_proj",
             "qkv_proj",
         )
-      elif cfg.remat_policy == "qkv_proj_offloaded":
-        policy = jax.checkpoint_policies.save_and_offload_only_these_names(
-            names_which_can_be_saved=[],
-            names_which_can_be_offloaded=["query_proj", "value_proj", "key_proj"],
-            offload_src="device",
-            offload_dst="pinned_host",
-        )
-      elif cfg.remat_policy == "minimal_offloaded":
-        # offload all except context
+      elif remat_policy == "qkv_proj_offloaded":
         policy = jax.checkpoint_policies.save_and_offload_only_these_names(
             names_which_can_be_saved=[],
             names_which_can_be_offloaded=[
                 "query_proj",
                 "value_proj",
                 "key_proj",
+                "kv_proj",
+            ],
+            offload_src="device",
+            offload_dst="pinned_host",
+        )
+      elif remat_policy == "minimal_offloaded":
+        policy = jax.checkpoint_policies.save_and_offload_only_these_names(
+            names_which_can_be_saved=[],
+            names_which_can_be_offloaded=[
+                "query_proj",
+                "value_proj",
+                "key_proj",
+                "kv_proj",
                 "qkv_proj",
                 "out_proj",
                 "mlpwi_0",
@@ -629,47 +1376,68 @@ class NNXDecoder(nnx.Module):
             offload_src="device",
             offload_dst="pinned_host",
         )
-      elif cfg.remat_policy == "custom":
+      elif remat_policy == "custom":
         policy = jax.checkpoint_policies.save_and_offload_only_these_names(
             names_which_can_be_saved=cfg.tensors_on_device,
             names_which_can_be_offloaded=cfg.tensors_to_offload,
             offload_src="device",
             offload_dst="pinned_host",
         )
-      elif cfg.remat_policy == "save_out_proj":
+      elif remat_policy == "save_out_proj":
         policy = jax.checkpoint_policies.save_only_these_names("out_proj")
       else:
-        assert cfg.remat_policy == "full", "Remat policy needs to be on list of remat policies"
+        assert remat_policy == "full", "Remat policy needs to be on list of remat policies"
         policy = None
     return policy
 
   def get_norm_layer(self, num_features: int, rngs: nnx.Rngs):
     """get normalization layer (return type inherits from nn.Module)"""
-    if self.config.decoder_block in (
+    if self.config.decoder_block in {
         DecoderBlockType.DEFAULT,
         DecoderBlockType.LLAMA2,
         DecoderBlockType.MISTRAL,
         DecoderBlockType.MIXTRAL,
         DecoderBlockType.DEEPSEEK,
+        DecoderBlockType.DEEPSEEK4,
         DecoderBlockType.GEMMA,
         DecoderBlockType.GEMMA2,
         DecoderBlockType.GEMMA3,
+        DecoderBlockType.GEMMA4,
+        DecoderBlockType.GEMMA4_SMALL,
+        DecoderBlockType.QWEN2,
         DecoderBlockType.QWEN3,
         DecoderBlockType.QWEN3_MOE,
+        DecoderBlockType.QWEN3_CUSTOM_MOE,
         DecoderBlockType.GPT_OSS,
         DecoderBlockType.SIMPLE,
         DecoderBlockType.SIMPLE_MLP,
         DecoderBlockType.LLAMA4,
         DecoderBlockType.OLMO3,
-    ):
-      return functools.partial(RMSNorm, num_features=num_features, shard_mode=self.config.shard_mode, rngs=rngs)
+        DecoderBlockType.ENVY,
+    }:
+      return functools.partial(
+          RMSNorm,
+          num_features=num_features,
+          shard_mode=self.config.shard_mode,
+          rngs=rngs,
+      )
     elif self.config.decoder_block == DecoderBlockType.GPT3:
       return functools.partial(
-          gpt3.Gpt3LayerNorm, num_features=num_features, reductions_in_fp32=False, use_bias=True, rngs=rngs
+          gpt3.Gpt3LayerNorm,
+          num_features=num_features,
+          reductions_in_fp32=False,
+          use_bias=True,
+          rngs=rngs,
       )
-    elif self.config.decoder_block == DecoderBlockType.QWEN3_NEXT:
+    elif self.config.decoder_block in {
+        DecoderBlockType.QWEN3_NEXT,
+        DecoderBlockType.QWEN3_5,
+    }:
       return functools.partial(
-          normalizations.Qwen3NextRMSNorm, num_features=num_features, shard_mode=self.config.shard_mode, rngs=rngs
+          normalizations.Qwen3NextRMSNorm,
+          num_features=num_features,
+          shard_mode=self.config.shard_mode,
+          rngs=rngs,
       )
     else:
       raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
@@ -681,47 +1449,100 @@ class NNXDecoder(nnx.Module):
       decoder_positions,
       deterministic,
       model_mode,
-      image_embeddings=None,
-      bidirectional_mask=None,
-      image_masks=None,
-      audio_embeddings=None,
-      audio_masks=None,
+      multimodal_input=None,
+      decoder_input_embeddings=None,
   ):
     """Applies token and positional embeddings to the input tokens."""
+
     cfg = self.config
 
-    y = shared_embedding(decoder_input_tokens.astype("int32"), model_mode=model_mode)
+    # vLLM passes token IDs for text-only requests, but passes complete, premerged
+    # text and multimodal embeddings for multimodal requests. The latter enter
+    # through `decoder_input_embeddings` to avoid embedding and merging them again.
+    y = (
+        decoder_input_embeddings
+        if decoder_input_embeddings is not None
+        else shared_embedding(decoder_input_tokens.astype("int32"), model_mode=model_mode)
+    )
 
-    # Merge the image embeddings with the text embeddings for multimodal models
-    if image_embeddings is not None and cfg.use_multimodal:
-      if cfg.model_name in [
-          "gemma3-4b",
-          "gemma3-12b",
-          "gemma3-27b",
-          "llama4-17b-16e",
-          "llama4-17b-128e",
-          "qwen3-omni-30b-a3b",
-      ]:
-        y = mm_utils.merge_mm_embeddings(
-            text_embeddings=y,
-            multimodal_embeddings=image_embeddings,
-            mask=bidirectional_mask,
-            token_masks=image_masks,
-        )
-      # TODO(hengtaoguo): Add support for other multimodal models such as Llama4, refactor if needed
-      else:
-        raise ValueError(f"Unsupported model_name for multimodal: {cfg.model_name}")
+    # Precomputed embeddings are complete (including any multimodal replacements),
+    # so only merge modality embeddings when token embeddings were created here.
+    if decoder_input_embeddings is None and multimodal_input is not None:
+      image_embeddings = multimodal_input.image_embeddings
+      bidirectional_mask = multimodal_input.bidirectional_mask
+      image_masks = multimodal_input.image_masks
+      video_embeddings = getattr(multimodal_input, "video_embeddings", None)
+      video_masks = getattr(multimodal_input, "video_masks", None)
+      bidirectional_mask_video = getattr(multimodal_input, "bidirectional_mask_video", None)
+      audio_embeddings = multimodal_input.audio_embeddings
+      audio_masks = multimodal_input.audio_masks
 
-    if audio_embeddings is not None and cfg.use_audio:
-      if cfg.model_name in ["qwen3-omni-30b-a3b"]:
-        y = mm_utils.merge_mm_embeddings(
-            text_embeddings=y,
-            multimodal_embeddings=audio_embeddings,
-            mask=audio_masks,
-            token_masks=None,
-        )
-      else:
-        raise ValueError(f"Unsupported model_name for audio: {cfg.model_name}")
+      if image_embeddings is not None and cfg.use_multimodal:
+        if cfg.model_name in {
+            "gemma3-4b",
+            "gemma3-12b",
+            "gemma3-27b",
+            "gemma4-26b",
+            "gemma4-31b",
+            "gemma4-e2b",
+            "gemma4-e4b",
+            "llama4-17b-16e",
+            "llama4-17b-128e",
+            "qwen3-omni-30b-a3b",
+            "qwen3-vl-2b",
+            "qwen3-vl-4b",
+            "qwen3-vl-30b-a3b",
+            "qwen3.5-35b-a3b",
+            "qwen3.5-35b-a3b-fp8",
+            "qwen3.5-35b-fp8",
+            "qwen3.5-397b-a17b",
+            "qwen3.5-397b-a17b-fp8",
+            "maxtext-omni-gemma3-qwen3",
+            "weaver-mini",
+            "weaver-max",
+        }:
+          y = mm_utils.merge_mm_embeddings(
+              text_embeddings=y,
+              multimodal_embeddings=image_embeddings,
+              mask=bidirectional_mask,
+              token_masks=image_masks,
+          )
+        else:
+          raise ValueError(f"Unsupported model_name for multimodal: {cfg.model_name}")
+
+      if video_embeddings is not None and cfg.use_multimodal:
+        if cfg.model_name in {
+            "qwen3-omni-30b-a3b",
+            "qwen3-vl-2b",
+            "qwen3-vl-4b",
+            "qwen3-vl-30b-a3b",
+            "qwen3.5-35b-a3b",
+            "qwen3.5-35b-a3b-fp8",
+            "qwen3.5-35b-fp8",
+            "qwen3.5-397b-a17b",
+            "qwen3.5-397b-a17b-fp8",
+            "weaver-mini",
+            "weaver-max",
+        }:
+          y = mm_utils.merge_mm_embeddings(
+              text_embeddings=y,
+              multimodal_embeddings=video_embeddings,
+              mask=bidirectional_mask_video,
+              token_masks=video_masks,
+          )
+        else:
+          raise ValueError(f"Unsupported model_name for video: {cfg.model_name}")
+
+      if audio_embeddings is not None and cfg.use_audio:
+        if cfg.model_name in {"qwen3-omni-30b-a3b"}:
+          y = mm_utils.merge_mm_embeddings(
+              text_embeddings=y,
+              multimodal_embeddings=audio_embeddings,
+              mask=audio_masks,
+              token_masks=None,
+          )
+        else:
+          raise ValueError(f"Unsupported model_name for audio: {cfg.model_name}")
 
     y = self.dropout(y, deterministic=deterministic)
     y = y.astype(cfg.dtype)
@@ -734,30 +1555,50 @@ class NNXDecoder(nnx.Module):
 
     return y
 
-  def apply_output_head(self, shared_embedding, y, deterministic, model_mode):
-    """Applies final normalization and projects hidden states to logits."""
+  def apply_output_head(self, shared_embedding, y, deterministic, model_mode, normalize_y=True):
+    """Applies final normalization and projects hidden states to logits.
+
+    Args:
+      shared_embedding: Shared token embedding layer for tied logit projection.
+      y: Input hidden state tensor to project to logits.
+      deterministic: Whether dropout is disabled.
+      model_mode: Operational mode (e.g. MODEL_MODE_TRAIN, MODEL_MODE_PREFILL).
+      normalize_y: If True (default), applies the main decoder final normalization
+        (decoder_norm) before projecting to logits. Set to False when called from
+        Multi-Token Prediction (MTP), which applies its own dedicated final norm
+        (mtp_k_final_norm) to avoid double normalization.
+    """
 
     cfg = self.config
-    if cfg.shard_mode == ShardMode.EXPLICIT:
-      norm_out_sharding = create_sharding(self.mesh, ("activation_batch", "activation_length_no_exp", "activation_embed"))
-    else:
-      norm_out_sharding = None
+    if normalize_y:
+      if cfg.shard_mode == ShardMode.EXPLICIT:
+        norm_out_sharding = create_sharding(
+            self.mesh,
+            ("activation_batch", "activation_length", "activation_embed"),
+        )
+      else:
+        norm_out_sharding = None
 
-    y = self.decoder_norm(y, out_sharding=norm_out_sharding)
+      y = self.decoder_norm(y, out_sharding=norm_out_sharding)
     y = self.dropout(y, deterministic=deterministic)  # NNX call
 
-    if model_mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
+    if model_mode in {MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE}:
       out_sharding = create_sharding(self.mesh, (None, None, "activation_vocab"))
     else:
       out_sharding = create_sharding(
-          self.mesh, ("activation_embed_and_logits_batch", "activation_length_no_exp", "activation_vocab")
+          self.mesh,
+          (
+              "activation_embed_and_logits_batch",
+              "activation_length",
+              "activation_vocab",
+          ),
       )
 
     # [batch, length, emb_dim] -> [batch, length, vocab_size]
     if cfg.logits_via_embedding:
       # Use the transpose of embedding matrix for logit transform.
       if isinstance(shared_embedding, nnx.Module):
-        embedding_table = shared_embedding.embedding.value
+        embedding_table = shared_embedding.embedding[...]
       else:
         embedding_table = shared_embedding.variables["params"]["embedding"]
       if isinstance(embedding_table, nn.spmd.LogicallyPartitioned):
@@ -782,41 +1623,26 @@ class NNXDecoder(nnx.Module):
   def _build_linen_params(self, moe_stack: nnx.Module) -> dict:
     """
     Bridges NNX to Linen by creating a dictionary that mimics the exact variable
-    structure expected by `deepseek_batchsplit.fetch_weights`.
+    structure expected by `deepseek_batchsplit.fetch_weights` and `lineage_adapter`.
     """
+    state_dict = nnx.state(moe_stack, (nnx.Param, moe.MoEBiasVar))
+    moe_block = state_dict.get("moe_block", state_dict.get("DeepSeekMoeBlock_0"))
+
+    # When param_scan_axis != 0, nnx.Param variables are stacked at param_scan_axis,
+    # but MoEBiasVar (being non-Param) was stacked at axis 0.
+    # Align MoEBiasVar's layer dimension with param_scan_axis for batchsplit.
+    if self.config.routed_bias and self.config.param_scan_axis != 0 and moe_block is not None:
+      bias_var = moe_block["MoeBlock_0"]["gate"]["bias"]
+      bias_val = getattr(bias_var, "value", bias_var)
+      if hasattr(bias_val, "ndim") and bias_val.ndim >= 2:
+        moe_block["MoeBlock_0"]["gate"]["bias"] = jnp.swapaxes(bias_val, 0, self.config.param_scan_axis)
 
     return {
-        "pre_self_attention_layer_norm": {
-            "scale": moe_stack.pre_self_attention_layer_norm.scale,
-        },
-        "post_self_attention_layer_norm": {
-            "scale": moe_stack.post_self_attention_layer_norm.scale,
-        },
-        "self_attention": {
-            "wq_a": {"kernel": moe_stack.self_attention.wq_a.kernel},
-            "wq_b": {"kernel": moe_stack.self_attention.wq_b.kernel},
-            "q_norm": {"scale": moe_stack.self_attention.q_norm.scale},
-            "wkv_a": {"kernel": moe_stack.self_attention.wkv_a.kernel},
-            "wkv_b": {"kernel": moe_stack.self_attention.wkv_b.kernel},
-            "kv_norm": {"scale": moe_stack.self_attention.kv_norm.scale},
-            "out": {"kernel": moe_stack.self_attention.out.kernel},
-        },
-        "DeepSeekMoeBlock_0": {
-            "MoeBlock_0": {
-                "gate": {
-                    "kernel": moe_stack.DeepSeekMoeBlock_0.MoeBlock_0.gate.kernel,
-                    "bias": moe_stack.DeepSeekMoeBlock_0.MoeBlock_0.gate.bias,
-                },
-                "wi_0": moe_stack.DeepSeekMoeBlock_0.MoeBlock_0.wi_0,
-                "wi_1": moe_stack.DeepSeekMoeBlock_0.MoeBlock_0.wi_1,
-                "wo": moe_stack.DeepSeekMoeBlock_0.MoeBlock_0.wo,
-            },
-            "shared_experts": {
-                "wi_0": {"kernel": moe_stack.DeepSeekMoeBlock_0.shared_experts.wi_0.kernel},
-                "wi_1": {"kernel": moe_stack.DeepSeekMoeBlock_0.shared_experts.wi_1.kernel},
-                "wo": {"kernel": moe_stack.DeepSeekMoeBlock_0.shared_experts.wo.kernel},
-            },
-        },
+        "pre_self_attention_layer_norm": state_dict["pre_self_attention_layer_norm"],
+        "post_self_attention_layer_norm": state_dict["post_self_attention_layer_norm"],
+        "self_attention": state_dict["self_attention"],
+        "DeepSeekMoeBlock_0": moe_block,
+        "mlp": state_dict.get("mlp"),
     }
 
   def _find_next_boundary(self, current_idx, end_idx, engram_indices):
@@ -826,28 +1652,23 @@ class NNXDecoder(nnx.Module):
       return min(end_idx, *next_engrams)
     return end_idx
 
-  def _apply_single_engram_layer(self, y, current_idx, layer_stack, *args, **kwargs):
-    """Applies a single, unscanned Engram layer by dynamically slicing the NNX state."""
-    graphdef, state = nnx.split(layer_stack)
+  def _apply_single_engram_layer(self, y, layer_name, *args, **kwargs):
+    """Applies a single, unscanned Engram layer."""
+    layer = getattr(self, layer_name)
 
-    # Slice the parameters for the current index (assuming scan axis is 0)
-    sliced_state = jax.tree.map(lambda x: x[current_idx], state)
-    single_layer = nnx.merge(graphdef, sliced_state)
+    decoder_input_tokens = kwargs.get("decoder_input_tokens")
+    layer_kwargs = kwargs.get("layer_kwargs", {})
 
-    # Run the single layer
-    out = single_layer(
-        y, *args, decoder_input_tokens=kwargs.get("decoder_input_tokens"), **kwargs.get("layer_kwargs", {})
-    )
-    y = out[0] if isinstance(out, tuple) else out
+    # Create a copy of layer_kwargs and pop decoder_input_tokens if it exists
+    # to avoid passing it twice (once explicitly and once via **layer_kwargs).
+    layer_kwargs = dict(layer_kwargs)
+    layer_kwargs.pop("decoder_input_tokens", None)
 
-    # Re-merge the updated state back into the specific slice of the stack
-    new_single_state = nnx.state(single_layer)
-    updated_state = jax.tree.map(
-        lambda s, new_s: jax.lax.dynamic_update_slice_in_dim(s, jnp.expand_dims(new_s, axis=0), current_idx, axis=0),
-        state,
-        new_single_state,
-    )
-    nnx.update(layer_stack, updated_state)
+    out = layer(y, *args, decoder_input_tokens=decoder_input_tokens, **layer_kwargs)
+    if isinstance(out, tuple):
+      y = out[0]
+    else:
+      y = out
 
     return y
 
@@ -856,35 +1677,69 @@ class NNXDecoder(nnx.Module):
     scan_length = next_boundary - current_idx
     if scan_length > 0:
       graphdef, state = nnx.split(layer_stack)
+      params, rest = state.split(nnx.Param, ...)
+      scan_axis = self.config.param_scan_axis
 
-      # Slice the chunk state
-      chunk_state = jax.tree.map(lambda x: jax.lax.dynamic_slice_in_dim(x, current_idx, scan_length, axis=0), state)
-      chunk_stack = nnx.merge(graphdef, chunk_state)
+      # Slice the chunk state along the correct axes
+      chunk_params = jax.tree.map(
+          lambda x: jax.lax.dynamic_slice_in_dim(x, current_idx, scan_length, axis=scan_axis),
+          params,
+      )
+      chunk_rest = jax.tree.map(
+          lambda x: jax.lax.dynamic_slice_in_dim(x, current_idx, scan_length, axis=0),
+          rest,
+      )
+      chunk_stack = nnx.merge(graphdef, chunk_params, chunk_rest)
 
       # Apply sequentially
-      y, chunk_stack = self._apply_layers_sequentially(
-          chunk_stack, y, *args, length=scan_length, **kwargs.get("layer_kwargs", {})
+      y, chunk_stack, _ = self._apply_layers_sequentially(
+          chunk_stack,
+          y,
+          *args,
+          length=scan_length,
+          **kwargs.get("layer_kwargs", {}),
       )
 
       # Update the original stack state
-      new_chunk_state = nnx.state(chunk_stack)
-      updated_state = jax.tree.map(
-          lambda s, new_s: jax.lax.dynamic_update_slice_in_dim(s, new_s, current_idx, axis=0), state, new_chunk_state
+      new_state = nnx.state(chunk_stack)
+      new_params, new_rest = new_state.split(nnx.Param, ...)
+
+      updated_params = jax.tree.map(
+          lambda s, new_s: jax.lax.dynamic_update_slice_in_dim(s, new_s, current_idx, axis=scan_axis),
+          params,
+          new_params,
       )
-      nnx.update(layer_stack, updated_state)
+      updated_rest = jax.tree.map(
+          lambda s, new_s: jax.lax.dynamic_update_slice_in_dim(s, new_s, current_idx, axis=0),
+          rest,
+          new_rest,
+      )
+
+      nnx.update(layer_stack, updated_params, updated_rest)
 
     return y
 
-  def _apply_interleaved_scanned_layers(self, y, layer_stack, start_idx, end_idx, engram_indices, *args, **kwargs):
+  def _apply_interleaved_scanned_layers(self, y, layer_prefix, start_idx, end_idx, engram_indices, *args, **kwargs):
     """Applies a mix of scanned standard layers and unscanned Engram layers."""
     current_idx = start_idx
     while current_idx < end_idx:
       if current_idx in engram_indices:
-        y = self._apply_single_engram_layer(y, current_idx, layer_stack, *args, **kwargs)
+        layer_name = f"{layer_prefix}_engram_{current_idx}"
+        y = self._apply_single_engram_layer(y, layer_name, *args, **kwargs)
         current_idx += 1
       else:
         next_boundary = self._find_next_boundary(current_idx, end_idx, engram_indices)
-        y = self._apply_scanned_chunk(y, current_idx, next_boundary, layer_stack, *args, **kwargs)
+        chunk_name = f"{layer_prefix}_{current_idx}_{next_boundary - 1}"
+        chunk_stack = getattr(self, chunk_name)
+        scan_length = next_boundary - current_idx
+
+        y, chunk_stack, _ = self._apply_layers_sequentially(
+            chunk_stack,
+            y,
+            *args,
+            length=scan_length,
+            **kwargs.get("layer_kwargs", {}),
+        )
         current_idx = next_boundary
     return y
 
@@ -898,18 +1753,54 @@ class NNXDecoder(nnx.Module):
       model_mode=MODEL_MODE_TRAIN,
       previous_chunk=None,
       slot: None | int = None,
-      page_state: None | page_manager.PageState = None,
-      bidirectional_mask: None | Any = None,
-      image_embeddings: None | jnp.ndarray = None,
-      image_masks: None | jnp.ndarray = None,
       kv_caches: list[jax.Array] | None = None,
       attention_metadata=None,
-      audio_embeddings: None | jnp.ndarray = None,
-      audio_masks: None | jnp.ndarray = None,
       deepstack_visual_embeds: None | list[jnp.ndarray] = None,
+      multimodal_input: None | MultimodalInput = None,
+      forced_routed_experts: jnp.ndarray | None = None,
+      decoder_input_embeddings=None,
   ):
     cfg = self.config
     assert decoder_input_tokens.ndim == 2  # [batch, len]
+    stage_id = 0
+    num_logical_stages = 1
+    cutoffs = []
+    if cfg.use_jaxpp:
+      assert not cfg.scan_layers, "Layer scanning is not supported with JaxPP"
+      num_logical_stages = cfg.dcn_pipeline_parallelism * cfg.ici_pipeline_parallelism * cfg.num_pipeline_repeats
+      layers_per_stage, remainder = divmod(cfg.num_decoder_layers, num_logical_stages)
+      assert layers_per_stage > 0, (cfg.num_decoder_layers, num_logical_stages)
+      cutoff = 0
+      for stage in range(num_logical_stages):
+        cutoff += layers_per_stage + (stage < remainder)
+        cutoffs.append(cutoff - 1)
+
+    if forced_routed_experts is not None:
+      check_forced_routing_support(cfg.decoder_block)
+      if getattr(cfg, "mtp_num_layers", 0) > 0:
+        # The MTP side-car reuses the decoder layer blueprint but is invoked
+        # separately, so it would re-route freely while the main stack replays.
+        raise NotImplementedError(
+            "Forced routing (router replay) is not supported with multi-token"
+            f" prediction; got mtp_num_layers={cfg.mtp_num_layers}."
+        )
+      if getattr(cfg, "using_pipeline_parallelism", False):
+        # The pipeline path forwards layer_kwargs to every layer unchanged, so
+        # forced_routed_experts would be broadcast instead of sliced per layer.
+        raise NotImplementedError(
+            "Forced routing (router replay) is not supported with pipeline"
+            " parallelism; the pipeline path cannot slice forced_routed_experts"
+            " per layer."
+        )
+      if cfg.scan_layers and cfg.decoder_block == DecoderBlockType.GEMMA4:
+        # _apply_gemma4_scanned_blocks is a triple-nested scan that doesn't
+        # thread forced_routed_experts; the kwarg filter would silently strip it.
+        raise NotImplementedError(
+            "Forced routing with scan_layers=True is not yet implemented for"
+            " GEMMA4 (its scanned path is structurally different from the other"
+            " supported architectures); set scan_layers=False to use forced"
+            " routing with Gemma4."
+        )
 
     policy = self.get_remat_policy()
 
@@ -920,165 +1811,619 @@ class NNXDecoder(nnx.Module):
         decoder_positions,
         deterministic,
         model_mode,
-        image_embeddings,
-        bidirectional_mask,
-        image_masks,
-        audio_embeddings,
-        audio_masks,
+        multimodal_input=multimodal_input,
+        decoder_input_embeddings=decoder_input_embeddings,
     )
 
-    mhc_expand, mhc_reduce = mhc.get_functions(cfg.mhc_expansion_rate)
-    if cfg.mhc_expansion_rate > 1:
-      # (batch, length, emb_dim) --> (batch, length, mhc_expansion_rate, emb_dim)
-      y = mhc_expand(y)
+    mhc_reduce = None
+    if hasattr(cfg, "mhc_expansion_rate"):
+      mhc_expand, mhc_reduce = mhc.get_functions(cfg.mhc_expansion_rate)
+      if cfg.mhc_expansion_rate > 1:
+        # (batch, length, emb_dim) --> (batch, length, mhc_expansion_rate, emb_dim)
+        y = mhc_expand(y)
 
     layer_args = (decoder_segment_ids, decoder_positions, deterministic, model_mode)
 
-    layer_kwargs = {}
-    if cfg.decoder_block == DecoderBlockType.GEMMA3:
+    layer_kwargs = {
+        "slot": slot,
+        "previous_chunk": previous_chunk,
+    }
+    # Extract the bidirectional mask locally for layer configurations
+    bidirectional_mask = None
+    if multimodal_input is not None:
+      bidirectional_mask = (
+          multimodal_input.bidirectional_mask
+          if multimodal_input.bidirectional_mask is not None
+          else multimodal_input.bidirectional_mask_video
+      )
+
+    if cfg.decoder_block in {DecoderBlockType.GEMMA3, DecoderBlockType.GEMMA4}:
       layer_kwargs["bidirectional_mask"] = bidirectional_mask
 
     if attention_metadata is not None:
       layer_kwargs["attention_metadata"] = attention_metadata
 
-    if cfg.scan_layers:
+    if cfg.engram_layers and decoder_input_tokens is not None:
+      layer_kwargs["decoder_input_tokens"] = decoder_input_tokens
+
+    if forced_routed_experts is not None:
+      layer_kwargs["forced_routed_experts"] = forced_routed_experts
+
+    if getattr(cfg, "using_pipeline_parallelism", False) and not cfg.use_jaxpp:
+      logical_partition_spec = (
+          self.pipeline_module.get_weight_sharding()
+          if (cfg.pipeline_fsdp_ag_once or cfg.pipeline_fsdp_ag_per_repeat)
+          else None
+      )
+
       if self.is_deepseek:
-        layer_kwargs = {
-            "previous_chunk": previous_chunk,
-            "page_state": page_state,
-            "slot": slot,
-        }
-
-        if cfg.engram_layers:
-          common_kwargs = {
-              "layer_kwargs": layer_kwargs,
-              "decoder_input_tokens": decoder_input_tokens,
-          }
-
-          y = self._apply_interleaved_scanned_layers(
-              y, self.dense_layers, 0, cfg.first_num_dense_layers, cfg.engram_layers, *layer_args, **common_kwargs
-          )
-
-          y = self._apply_interleaved_scanned_layers(
-              y,
-              self.moe_layer,
-              0,
-              (cfg.num_decoder_layers - cfg.first_num_dense_layers),
-              [e - cfg.first_num_dense_layers for e in cfg.engram_layers],
-              *layer_args,
-              **common_kwargs,
-          )
-        else:
-          y, self.dense_layers = self._apply_layers_sequentially(
-              self.dense_layers, y, *layer_args, length=cfg.first_num_dense_layers, **layer_kwargs
-          )
-
-          num_moe = cfg.num_decoder_layers - cfg.first_num_dense_layers
-
-          if cfg.use_batch_split_schedule:
-            policy = self.get_remat_policy()
-
-            mock_params = self._build_linen_params(self.moe_layer)
-
-            y = deepseek_batchsplit.scan_batch_split_layers(
-                y,
-                mock_params,
-                decoder_positions,
-                decoder_segment_ids,
-                model_mode=model_mode,
-                mesh=self.mesh,
-                quant=self.quant,
-                cfg=cfg,
-                policy=policy,
-            )
+        # Pre-pipeline: dense layers + outside-pipeline MoE layers under PP-as-DP axis rules.
+        logical_axis_rules_pp_as_dp = sharding.logical_axis_rules_pp_act_as_dp(cfg.logical_axis_rules)
+        with self.mesh, nn.partitioning.axis_rules(logical_axis_rules_pp_as_dp):
+          if cfg.scan_layers:
+            if getattr(self, "dense_layers", None) is not None and cfg.first_num_dense_layers > 0:
+              y, self.dense_layers, _ = self._apply_layers_sequentially(
+                  self.dense_layers,
+                  y,
+                  *layer_args,
+                  length=cfg.first_num_dense_layers,
+                  **layer_kwargs,
+              )
+            if hasattr(self, "moe_layers_outside_pipeline") and self.moe_layers_outside_pipeline is not None:
+              num_moe_outside = (cfg.num_decoder_layers - cfg.first_num_dense_layers) - cfg.pipeline_parallel_layers
+              y, self.moe_layers_outside_pipeline, _ = self._apply_layers_sequentially(
+                  self.moe_layers_outside_pipeline,
+                  y,
+                  *layer_args,
+                  length=num_moe_outside,
+                  **layer_kwargs,
+              )
           else:
-            y, self.moe_layer = self._apply_layers_sequentially(
-                self.moe_layer, y, *layer_args, length=num_moe, **layer_kwargs
-            )
-      elif self.is_gemma3:
-        y = self._apply_gemma3_scanned_blocks(
+            # Unscanned: iterate registered layers by name.
+            for i in range(getattr(self, "num_dense_layers", 0)):
+              layer = getattr(self, f"dense_layers_{i}")
+              call_kwargs = dict(layer_kwargs)
+              if kv_caches is not None:
+                call_kwargs["kv_cache"] = kv_caches[i]
+              out = layer(y, *layer_args, **call_kwargs)
+              y = out[0] if isinstance(out, tuple) else out
+              if kv_caches is not None and isinstance(out, tuple) and len(out) > 1 and out[1] is not None:
+                kv_caches[i] = out[1]
+            for i in range(getattr(self, "num_moe_outside_pipeline", 0)):
+              layer = getattr(self, f"moe_layers_outside_pipeline_{i}")
+              call_kwargs = dict(layer_kwargs)
+              kv_idx = getattr(self, "num_dense_layers", 0) + i
+              if kv_caches is not None:
+                call_kwargs["kv_cache"] = kv_caches[kv_idx]
+              out = layer(y, *layer_args, **call_kwargs)
+              y = out[0] if isinstance(out, tuple) else out
+              if kv_caches is not None and isinstance(out, tuple) and len(out) > 1 and out[1] is not None:
+                kv_caches[kv_idx] = out[1]
+
+        y = self.pipeline_module(
             y,
             decoder_segment_ids,
             decoder_positions,
             deterministic,
             model_mode,
-            bidirectional_mask,
-            previous_chunk,
-            page_state,
-            slot,
+            logical_partition_spec=logical_partition_spec,
+        )
+      elif self.is_gemma4:
+        y = self._apply_gemma4_scanned_blocks(
+            y,
+            layer_args,
+            layer_kwargs,
+            kv_caches=kv_caches,
         )
       else:
-        scan_length = int(cfg.num_decoder_layers / cfg.inhomogeneous_layer_cycle_interval)
-        y, self.layers = self._apply_layers_sequentially(self.layers, y, *layer_args, length=scan_length, **layer_kwargs)
+        # Standard pipeline run (non-DeepSeek, incl. Gemma4 — matches Linen decoders.py).
+        # Gemma4 routes through the pipeline here; _apply_gemma4_scanned_blocks is
+        # non-pipeline-only (its layers/layers_remainder are not built when
+        # pipeline parallelism is enabled).
+        y = self.pipeline_module(
+            y,
+            decoder_segment_ids,
+            decoder_positions,
+            deterministic,
+            model_mode,
+            logical_partition_spec=logical_partition_spec,
+        )
+
+        # Remaining standard layers (outside the pipeline)
+        if hasattr(self, "layers_outside_pipeline") or hasattr(self, "num_layers_outside_pipeline"):
+          logical_axis_rules_pp_as_dp = sharding.logical_axis_rules_pp_act_as_dp(cfg.logical_axis_rules)
+          with (
+              self.mesh,
+              nn.partitioning.axis_rules(logical_axis_rules_pp_as_dp),
+          ):
+            if cfg.scan_layers and hasattr(self, "layers_outside_pipeline"):
+              remaining = cfg.num_decoder_layers - cfg.pipeline_parallel_layers
+              y, self.layers_outside_pipeline, _ = self._apply_layers_sequentially(
+                  self.layers_outside_pipeline,
+                  y,
+                  *layer_args,
+                  length=remaining,
+                  **layer_kwargs,
+              )
+            elif (not cfg.scan_layers) and hasattr(self, "num_layers_outside_pipeline"):
+              for i in range(self.num_layers_outside_pipeline):
+                layer = getattr(self, f"layers_outside_pipeline_{i}")
+                call_kwargs = dict(layer_kwargs)
+                kv_idx = cfg.pipeline_parallel_layers + i
+                if kv_caches is not None:
+                  call_kwargs["kv_cache"] = kv_caches[kv_idx]
+                out = layer(y, *layer_args, **call_kwargs)
+                y = out[0] if isinstance(out, tuple) else out
+                if kv_caches is not None and isinstance(out, tuple) and len(out) > 1 and out[1] is not None:
+                  kv_caches[kv_idx] = out[1]
+
     else:
-      prevent_cse = maxtext_utils.should_prevent_cse_in_remat(cfg)
+      if self.is_gemma4_small:
+        y, kv_caches = self._apply_gemma4_small_layers(
+            y,
+            decoder_input_tokens,
+            decoder_segment_ids,
+            decoder_positions,
+            deterministic,
+            model_mode,
+            multimodal_input=multimodal_input,
+            kv_caches=kv_caches,
+            attention_metadata=attention_metadata,
+            previous_chunk=previous_chunk,
+            slot=slot,
+        )
+      elif cfg.scan_layers:
+        if self.is_deepseek:
+          if cfg.engram_layers:
+            common_kwargs = {
+                "layer_kwargs": layer_kwargs,
+                "decoder_input_tokens": decoder_input_tokens,
+            }
 
-      # Hoisted function to preserve XLA cache ID
-      def pure_layer_fn(graphdef, state_in, y_in, kv_in):
+            y = self._apply_interleaved_scanned_layers(
+                y,
+                "dense_layers",
+                0,
+                cfg.first_num_dense_layers,
+                cfg.engram_layers,
+                *layer_args,
+                **common_kwargs,
+            )
 
-        if cfg.parameter_memory_host_offload:
-          state_in = jax.tree.map(lambda x: jax.device_put(x, max_utils.device_space()), state_in)
+            y = self._apply_interleaved_scanned_layers(
+                y,
+                "moe_layers",
+                cfg.first_num_dense_layers,
+                cfg.num_decoder_layers,
+                cfg.engram_layers,
+                *layer_args,
+                **common_kwargs,
+            )
+          elif cfg.use_lineage:
+            if lineage_adapter is None:
+              raise ImportError("use_lineage=True requires the Google-internal lineage_adapter.")
+            y, lineage_lb_loss, lineage_bias_updates = lineage_adapter.run_lineage_dsv3(
+                inputs=y,
+                dense_params=self._build_linen_params(self.dense_layers),
+                sparse_params=self._build_linen_params(self.moe_layers),
+                decoder_positions=decoder_positions,
+                mesh=self.mesh,
+                cfg=cfg,
+                decoder_segment_ids=decoder_segment_ids,
+            )
+            if lineage_lb_loss is not None:
+              self.sow(nnx.Intermediate, "moe_lb_loss", lineage_lb_loss)
+            if lineage_bias_updates is not None:
+              self.sow(nnx.Intermediate, "moe_bias_updates", lineage_bias_updates)
+          else:
+            y, self.dense_layers, _ = self._apply_layers_sequentially(
+                self.dense_layers,
+                y,
+                *layer_args,
+                length=cfg.first_num_dense_layers,
+                **layer_kwargs,
+            )
 
-        merged_layer = nnx.merge(graphdef, state_in)
-        out_y, out_kv = merged_layer(y_in, *layer_args, kv_cache=kv_in, **layer_kwargs)
-        return out_y, out_kv, nnx.state(merged_layer)
+            num_moe = cfg.num_decoder_layers - cfg.first_num_dense_layers
 
-      checkpointed_fn = jax.checkpoint(pure_layer_fn, policy=policy, prevent_cse=prevent_cse)
+            if cfg.use_batch_split_schedule:
+              policy = self.get_remat_policy()
+              mock_params = self._build_linen_params(self.moe_layers)
 
-      for lyr, layer in enumerate(self.layers):
-        graphdef, state = nnx.split(layer)
-        kv_cache = kv_caches[lyr] if kv_caches is not None else None
+              if cfg.quantization and cfg.use_qwix_quantization and not cfg.use_manual_quantization:
+                y = deepseek_batchsplit_fp8.scan_batch_split_layers(
+                    y,
+                    mock_params,
+                    decoder_positions,
+                    decoder_segment_ids,
+                    model_mode=model_mode,
+                    mesh=self.mesh,
+                    quant=self.quant,
+                    cfg=cfg,
+                    policy=policy,
+                )
+              else:
+                # bf16 code path
+                y = deepseek_batchsplit.scan_batch_split_layers(
+                    y,
+                    mock_params,
+                    decoder_positions,
+                    mesh=self.mesh,
+                    cfg=cfg,
+                    num_layers=num_moe,
+                )
+            else:
+              y, self.moe_layers, _ = self._apply_layers_sequentially(
+                  self.moe_layers,
+                  y,
+                  *layer_args,
+                  length=num_moe,
+                  **layer_kwargs,
+              )
 
-        input_tokens = decoder_input_tokens if cfg.engram_layers else None
-        if input_tokens is not None:
-          layer_kwargs["decoder_input_tokens"] = input_tokens
+        elif self.is_deepseek4:
+          y = self._apply_deepseek4_scanned_blocks(
+              y,
+              decoder_segment_ids,
+              decoder_positions,
+              deterministic,
+              model_mode,
+              slot,
+              previous_chunk,
+              decoder_input_tokens,
+          )
+        elif self.is_gemma3:
+          y = self._apply_gemma3_scanned_blocks(
+              y,
+              layer_args,
+              layer_kwargs,
+              kv_caches=kv_caches,
+          )
+        elif self.is_gemma4:
+          y = self._apply_gemma4_scanned_blocks(
+              y,
+              layer_args,
+              layer_kwargs,
+              kv_caches=kv_caches,
+          )
+        elif self.is_qwen3_next:
+          y = self._apply_qwen3_next_scanned_blocks(
+              y,
+              layer_args,
+              layer_kwargs,
+              kv_caches=kv_caches,
+          )
+        else:
+          cycle_interval = cfg.inhomogeneous_layer_cycle_interval
+          scan_length = int(cfg.num_decoder_layers / cycle_interval)
+          forced_routed_experts_scanned = None
+          if forced_routed_experts is not None:
+            if kv_caches is not None:
+              # The kv-cache branch below cannot take scan xs, so the routing
+              # would be broadcast whole to every layer instead of sliced.
+              raise NotImplementedError(
+                  "Forced routing is not supported together with"
+                  " externally-managed (vLLM) kv_caches in scanned layers."
+              )
+            # Only the per-layer slices may reach the layers from here on.
+            layer_kwargs.pop("forced_routed_experts", None)
+            forced_routed_experts_scanned = reshape_forced_routed_experts_for_scan(
+                forced_routed_experts,
+                num_layers=cfg.num_decoder_layers,
+                scan_length=scan_length,
+                layers_per_cycle=cycle_interval,
+            )
+            if cfg.decoder_block == DecoderBlockType.MIXTRAL:
+              # Mixtral has no ScannableBlock: one scan iteration is one layer,
+              # so drop the (size-1) per-cycle axis the layer would slice.
+              if cycle_interval != 1:
+                raise NotImplementedError(
+                    "Forced routing with scanned MIXTRAL requires"
+                    " inhomogeneous_layer_cycle_interval == 1; got"
+                    f" {cycle_interval}."
+                )
+              forced_routed_experts_scanned = jnp.squeeze(forced_routed_experts_scanned, axis=1)
+          if kv_caches is not None:
+            # Pass the kv_caches list directly to avoid copying in jnp.stack,
+            # which breaks vLLM PagedAttention in-place memory updates.
+            # The _apply_layers_sequentially function will handle it by statically unrolling.
+            #
+            # Qwen3.5 is the exception: one scan step is a Qwen3_5ScannableBlock
+            # spanning `cycle_interval` decoder layers, while vLLM hands us one
+            # cache per layer. Group them per block before the scan and write the
+            # returned per-block tuples back afterwards, as
+            # _apply_qwen3_next_scanned_blocks does for Qwen3-Next.
+            group_blocks = self.is_qwen3_5 and cycle_interval > 1
+            grouped_kv_caches = (
+                maxtext_utils.prepare_kv_caches_for_scan(kv_caches, scan_length, cycle_interval, stack=False)
+                if group_blocks
+                else kv_caches
+            )
+            y, self.layers, _ = self._apply_layers_sequentially(
+                self.layers,
+                y,
+                *layer_args,
+                length=scan_length,
+                kv_caches_stacked=grouped_kv_caches,
+                **layer_kwargs,
+            )
+            if group_blocks:
+              maxtext_utils.update_kv_caches_after_scan(
+                  kv_caches, grouped_kv_caches, scan_length, cycle_interval, stacked=False
+              )
+            # kv_caches list is updated in-place inside _apply_layers_sequentially
+          else:
+            y, self.layers, _ = self._apply_layers_sequentially(
+                self.layers,
+                y,
+                *layer_args,
+                length=scan_length,
+                forced_routed_experts_scanned=forced_routed_experts_scanned,
+                **layer_kwargs,
+            )
+      else:
+        prevent_cse = maxtext_utils.should_prevent_cse_in_remat(cfg)
+        dynamic_graph_init = bool(getattr(self, "disable_quant_stats_update", False))
 
-        y, kv_cache, new_state = checkpointed_fn(graphdef, state, y, kv_cache)
-        nnx.update(layer, new_state)
+        def pure_layer_fn(graphdef_in, state_in, y_in, kv_in, valid_kwargs):
+          if cfg.parameter_memory_host_offload:
+            state_in = jax.tree.map(
+                lambda x: jax.device_put(x, max_utils.device_space()),
+                state_in,
+            )
+          merged_layer = nnx.merge(graphdef_in, state_in)
+          out_y, out_kv = merged_layer(y_in, *layer_args, kv_cache=kv_in, **valid_kwargs)
+          state_out = nnx.state(merged_layer)
 
-        if kv_caches is not None and kv_cache is not None:
-          kv_caches[lyr] = kv_cache
+          if dynamic_graph_init:
+            new_graphdef, _, _ = nnx.split(merged_layer, nnx.Param, ...)
+            return out_y, out_kv, state_out, new_graphdef
+          else:
+            return out_y, out_kv, state_out, graphdef_in
 
-        if deepstack_visual_embeds is not None and lyr < len(deepstack_visual_embeds):
-          visual_embeds = deepstack_visual_embeds[lyr]
-          if bidirectional_mask is not None and visual_embeds is not None:
-            y = deepstack_process(y, bidirectional_mask, visual_embeds)
+        checkpointed_fn = jax.checkpoint(pure_layer_fn, policy=policy, prevent_cse=prevent_cse)
+
+        for lyr in range(cfg.num_decoder_layers):
+          if self.is_deepseek:
+            if lyr < cfg.first_num_dense_layers:
+              layer = getattr(self, f"dense_layers_{lyr}", None)
+            else:
+              moe_idx = lyr - cfg.first_num_dense_layers
+              layer = getattr(self, f"moe_layers_{moe_idx}", None)
+          else:
+            layer = getattr(self, f"layers_{lyr}", None)
+            if layer is None and hasattr(self, "layers") and self.layers:
+              layer = self.layers[lyr]
+
+          if layer is None:
+            raise AttributeError(f"Could not locate decoder layer at index {lyr} in {self.__class__.__name__}")
+
+          graphdef, state = nnx.split(layer)
+          if kv_caches is not None:
+            if (
+                isinstance(kv_caches, dict)
+                and cfg.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.QWEN3_5)
+                and cfg.attention
+                not in (
+                    "vllm_rpa",
+                    "vllm_batched_rpa",
+                )
+            ):
+              if (lyr + 1) % cfg.inhomogeneous_layer_cycle_interval == 0:
+                kv_cache = (
+                    kv_caches["key_cache"][lyr],
+                    kv_caches["value_cache"][lyr],
+                )
+              else:
+                kv_cache = None
+            elif isinstance(kv_caches, dict):
+              kv_cache = kv_caches.get(lyr, None)
+            else:
+              kv_cache = kv_caches[lyr]
+          else:
+            kv_cache = None
+
+          input_tokens = (
+              decoder_input_tokens if (cfg.engram_layers or cfg.decoder_block == DecoderBlockType.DEEPSEEK4) else None
+          )
+          if input_tokens is not None:
+            layer_kwargs["decoder_input_tokens"] = input_tokens
+
+          current_kwargs = dict(layer_kwargs)
+          if isinstance(attention_metadata, dict):
+            current_kwargs["attention_metadata"] = attention_metadata.get(f"layer.{lyr}", attention_metadata.get(lyr))
+
+          routed_experts = current_kwargs.pop("forced_routed_experts", None)
+          if routed_experts is not None:
+            # Every supported decoder_block is homogeneous-MoE, so the layer
+            # axis is just `lyr`.
+            if routed_experts.ndim not in (3, 4):
+              raise ValueError(
+                  "forced_routed_experts must be [batch, seq, top_k] (3D,"
+                  " broadcast to every layer) or [batch, seq, num_layers,"
+                  f" top_k] (4D, per-layer); got ndim={routed_experts.ndim}"
+                  f" with shape {routed_experts.shape}."
+              )
+            if routed_experts.ndim == 4 and routed_experts.shape[2] != cfg.num_decoder_layers:
+              # jnp clamps an out-of-range static index, so a short layer axis
+              # would silently replay the last slice on every later layer.
+              raise ValueError(
+                  "forced_routed_experts layer axis must equal"
+                  f" num_decoder_layers ({cfg.num_decoder_layers}); got"
+                  f" {routed_experts.shape[2]} from shape"
+                  f" {routed_experts.shape}."
+              )
+            current_kwargs["forced_routed_experts"] = (
+                routed_experts[:, :, lyr, :] if routed_experts.ndim == 4 else routed_experts
+            )
+
+          if cfg.remat_policy != "none" and (not cfg.use_jaxpp or self.is_deepseek or stage_id != num_logical_stages - 1):
+            y, kv_cache, new_state, new_graphdef = checkpointed_fn(graphdef, state, y, kv_cache, current_kwargs)
+          else:
+            y, kv_cache, new_state, new_graphdef = pure_layer_fn(graphdef, state, y, kv_cache, current_kwargs)
+
+          if dynamic_graph_init:
+            new_layer = nnx.merge(new_graphdef, new_state)
+            if self.is_deepseek:
+              if lyr < cfg.first_num_dense_layers:
+                setattr(self, f"dense_layers_{lyr}", new_layer)
+              else:
+                moe_idx = lyr - cfg.first_num_dense_layers
+                setattr(self, f"moe_layers_{moe_idx}", new_layer)
+            else:
+              setattr(self, f"layers_{lyr}", new_layer)
+          else:
+            nnx.update(layer, new_state)
+
+          if kv_caches is not None and kv_cache is not None:
+            if (
+                isinstance(kv_caches, dict)
+                and cfg.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.QWEN3_5)
+                and cfg.attention
+                not in (
+                    "vllm_rpa",
+                    "vllm_batched_rpa",
+                )
+            ):
+              if (lyr + 1) % cfg.inhomogeneous_layer_cycle_interval == 0:
+                kv_caches["key_cache"][lyr] = kv_cache[0]
+                kv_caches["value_cache"][lyr] = kv_cache[1]
+            else:
+              kv_caches[lyr] = kv_cache
+
+          if deepstack_visual_embeds is not None and lyr < len(deepstack_visual_embeds):
+            visual_embeds = deepstack_visual_embeds[lyr]
+            if bidirectional_mask is not None and visual_embeds is not None:
+              y = deepstack_process(y, bidirectional_mask, visual_embeds)
+
+          if cfg.use_jaxpp and lyr != cfg.num_decoder_layers - 1 and lyr == cutoffs[stage_id]:
+            y = jaxpp.pipeline_enter_stage(y, f"stage_{stage_id}")
+            stage_id += 1
 
     assert isinstance(y, jax.Array)
 
     # After the final transformer layer, `y` holds the raw, un-normalized hidden state.
-    if cfg.mhc_expansion_rate > 1:
-      # (batch, length, mhc_expansion_rate, emb_dim) --> (batch, length, emb_dim)
-      hidden_state = mhc_reduce(y)
+    if getattr(cfg, "mhc_expansion_rate", 1) > 1:
+      if cfg.decoder_block == DecoderBlockType.DEEPSEEK4:
+        hidden_state = self.hc_head(y)
+      else:
+        # (batch, length, mhc_expansion_rate, emb_dim) --> (batch, length, emb_dim)
+        hidden_state = mhc_reduce(y)
     else:
       hidden_state = y
 
     # When invoking from vLLM with RPA attention, logit computation is deferred to a later stage.
-    if cfg.attention == "vllm_rpa":
+    if cfg.attention in ("vllm_rpa", "vllm_batched_rpa"):
+      logits = None
+
+    # When in the Indexer Dense Warm-up stage, skip the expensive output head projection
+    # for efficiency, as the main model is frozen and the LM loss is not needed.
+    elif (
+        getattr(cfg, "use_indexer", False)
+        and getattr(cfg, "indexer_loss_scaling_factor", 0.0) > 0.0
+        and not getattr(cfg, "indexer_sparse_training", False)
+    ) and model_mode == MODEL_MODE_TRAIN:
       logits = None
 
     # When vocab tiling is enabled in training mode, full logits won't generate to reduce memory
     # Instead, we keep track on the hidden states, which has smaller size compared to full logits
-    if cfg.num_vocab_tiling > 1 and self.model_mode == MODEL_MODE_TRAIN:
+    elif cfg.num_vocab_tiling > 1 and model_mode == MODEL_MODE_TRAIN:
       logits = None
       self.sow(nnx.Intermediate, "hidden_states", hidden_state)
 
     else:
       logits = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
 
+    if cfg.use_jaxpp:
+      logits = jaxpp.pipeline_enter_stage(logits, f"stage_{stage_id}")
+
+    expert_indices = None
+    try:
+
+      def _path_sort_key(path):
+        key = []
+        for part in path:
+          nums = re.findall(r"\d+", str(part))
+          key.append(int(nums[0]) if nums else str(part))
+        return tuple(key)
+
+      intermediates = nnx.state(self, nnx.Intermediate)
+      flat_items = [
+          (path, val.value if hasattr(val, "value") else val)
+          for path, val in intermediates.flat_state()
+          if path and str(path[-1]) == "selected_experts"
+      ]
+      flat_items.sort(key=lambda item: _path_sort_key(item[0]))
+      expert_indices_list = [v for _, v in flat_items]
+      if expert_indices_list:
+        # Scanned blocks already carry a leading layer axis (3D); sequential
+        # layers are 2D and need that axis added before concatenating.
+        expert_indices_list = [v if v.ndim == 3 else jnp.expand_dims(v, axis=0) for v in expert_indices_list]
+        expert_indices = jnp.concatenate(expert_indices_list, axis=0)
+    except Exception:  # pylint: disable=broad-exception-caught
+      expert_indices = None
+
+    if expert_indices is not None:
+      return logits, hidden_state, kv_caches, expert_indices
     return logits, hidden_state, kv_caches
 
-  def _apply_gemma3_scanned_blocks(
+  def _apply_deepseek4_scanned_blocks(
       self,
       y,
       decoder_segment_ids,
       decoder_positions,
       deterministic,
       model_mode,
-      bidirectional_mask,
-      previous_chunk,
-      page_state,
-      slot,
+      slot=None,
+      previous_chunk=None,
+      decoder_input_tokens=None,
+  ):
+    """Applies DeepSeek V4 scanned decoder blocks: unrolled prefix hash layers followed by scanned full blocks."""
+    cfg = self.config
+    num_hash_layers = cfg.first_num_hash_layers
+
+    layer_call_kwargs = {
+        "previous_chunk": previous_chunk,
+        "slot": slot,
+        "decoder_input_tokens": decoder_input_tokens,
+    }
+
+    # 1. Unrolled prefix layers (0, 1, 2)
+    for layer_idx in range(num_hash_layers):
+      layer = getattr(self, f"layers_{layer_idx}")
+      y, _ = layer(
+          y,
+          decoder_segment_ids,
+          decoder_positions,
+          deterministic,
+          model_mode,
+          **layer_call_kwargs,
+      )
+
+    # 2. Scanned blocks
+    num_remaining_layers = cfg.num_decoder_layers - num_hash_layers
+    num_full_blocks = num_remaining_layers // 2
+    if num_full_blocks > 0 and hasattr(self, "scanned_blocks"):
+      y, self.scanned_blocks, _ = self._apply_layers_sequentially(
+          self.scanned_blocks,
+          y,
+          decoder_segment_ids,
+          decoder_positions,
+          deterministic,
+          model_mode,
+          length=num_full_blocks,
+          metadata_axis_name="scanned_blocks",
+          **layer_call_kwargs,
+      )
+
+    return y
+
+  def _apply_gemma3_scanned_blocks(
+      self,
+      y,
+      layer_args,
+      layer_kwargs,
+      kv_caches=None,
   ):
     """Applies Gemma3 scanned decoder blocks, handling main scan and remainders."""
 
@@ -1088,12 +2433,17 @@ class NNXDecoder(nnx.Module):
     attention_pattern_length = len(gemma3.GEMMA3_ATTENTION_PATTERN)
     scan_length = cfg.num_decoder_layers // attention_pattern_length
 
-    layer_args = (decoder_segment_ids, decoder_positions, deterministic, model_mode)
-    layer_kwargs = {"bidirectional_mask": bidirectional_mask}
-
     # Apply the main scan over the full blocks
     if scan_length > 0:
-      y, self.layers = self._apply_layers_sequentially(self.layers, y, *layer_args, length=scan_length, **layer_kwargs)
+      grouped_kv_caches = maxtext_utils.prepare_kv_caches_for_scan(
+          kv_caches, scan_length, attention_pattern_length, stack=False
+      )
+      y, self.layers, _ = self._apply_layers_sequentially(
+          self.layers, y, *layer_args, length=scan_length, kv_caches_stacked=grouped_kv_caches, **layer_kwargs
+      )
+      maxtext_utils.update_kv_caches_after_scan(
+          kv_caches, grouped_kv_caches, scan_length, attention_pattern_length, stacked=False
+      )
 
     # Apply any remaining layers that did not fit into a full scanned block
     num_remaining_layers = cfg.num_decoder_layers % attention_pattern_length
@@ -1101,39 +2451,364 @@ class NNXDecoder(nnx.Module):
       policy = self.get_remat_policy()
       prevent_cse = maxtext_utils.should_prevent_cse_in_remat(cfg)
 
-      def pure_gemma_fn(graphdef, state_in, y_in):
+      remainder_kv = None
+      if kv_caches is not None:
+        start_idx = scan_length * attention_pattern_length
+        remainder_kv = tuple(kv_caches[start_idx : start_idx + num_remaining_layers])
+
+      def pure_gemma_fn(graphdef, state_in, y_in, kv_in):
         merged_layer = nnx.merge(graphdef, state_in)
-        out_y, _ = merged_layer(
-            y_in, *layer_args, previous_chunk=previous_chunk, page_state=page_state, slot=slot, **layer_kwargs
-        )
-        return out_y, nnx.state(merged_layer)
+        call_kwargs = dict(layer_kwargs)
+        if kv_in is not None:
+          call_kwargs["kv_cache"] = kv_in
+        out_res = merged_layer(y_in, *layer_args, **call_kwargs)
+        if isinstance(out_res, tuple):
+          out_y = out_res[0]
+          out_kv = out_res[1] if len(out_res) > 1 else None
+        else:
+          out_y = out_res
+          out_kv = None
+        return out_y, out_kv, nnx.state(merged_layer)
 
       checkpointed_gemma_fn = jax.checkpoint(pure_gemma_fn, policy=policy, prevent_cse=prevent_cse)
 
       graphdef, state = nnx.split(self.layers_remainder)
-      y, new_state = checkpointed_gemma_fn(graphdef, state, y)
+      y, updated_remainder_kv, new_state = checkpointed_gemma_fn(graphdef, state, y, remainder_kv)
       nnx.update(self.layers_remainder, new_state)
+
+      if kv_caches is not None and updated_remainder_kv is not None:
+        start_idx = scan_length * attention_pattern_length
+        for offset, updated_item in enumerate(updated_remainder_kv):
+          kv_caches[start_idx + offset] = updated_item
 
     return y
 
+  def _apply_qwen3_next_scanned_blocks(self, y, layer_args, layer_kwargs, kv_caches=None):
+    """Applies the Qwen3-Next scanned blocks.
 
-def decoder_as_linen(
-    config: Config,
-    mesh: Mesh,
-    rngs: nnx.Rngs,
-    model_mode: str,
-    quant: None | Quant = None,
-):
-  """Creates a Decoder module."""
-  module = nnx_wrappers.to_linen(
-      NNXDecoder,
-      config=config,
-      mesh=mesh,
-      model_mode=model_mode,
-      rngs=rngs,
-      quant=quant,
-      name="decoder",
-      abstract_init=False,
-      metadata_fn=initializers.variable_to_logically_partitioned,
-  )
-  return module
+    Qwen3NextScannableBlock rematerializes its own sub-layers (a scan over the
+    linear-attention layers plus a trip-count-one scan over the full-attention
+    layer), so block-level remat is skipped here to avoid rematerializing twice.
+    This holds for the external-KV-cache path too, hence the regrouping below
+    rather than falling back to the generic (block-rematerialized) branch.
+
+    External (vLLM) caches arrive as a flat list with one entry per decoder
+    layer, but the scan runs over blocks, so they are grouped into per-block
+    tuples before the scan and written back to the flat list afterwards, as in
+    _apply_gemma4_scanned_blocks.
+
+    Layers past the last whole block are applied afterwards, in a short
+    remainder block, so a layer count that is not a multiple of the cycle keeps
+    all its layers.
+    """
+    cfg = self.config
+    block_length = cfg.inhomogeneous_layer_cycle_interval
+    scan_length = cfg.num_decoder_layers // block_length
+    if scan_length > 0:
+      grouped_kv_caches = maxtext_utils.prepare_kv_caches_for_scan(kv_caches, scan_length, block_length, stack=False)
+      y, self.layers, _ = self._apply_layers_sequentially(
+          self.layers,
+          y,
+          *layer_args,
+          length=scan_length,
+          kv_caches_stacked=grouped_kv_caches,
+          skip_block_remat=True,
+          **layer_kwargs,
+      )
+      maxtext_utils.update_kv_caches_after_scan(kv_caches, grouped_kv_caches, scan_length, block_length, stacked=False)
+
+    num_remaining_layers = cfg.num_decoder_layers % block_length
+    if num_remaining_layers > 0:
+      y = self._apply_remainder_block(
+          self.layers_remainder,
+          y,
+          layer_args,
+          layer_kwargs,
+          kv_caches=kv_caches,
+          start_idx=scan_length * block_length,
+          num_remaining_layers=num_remaining_layers,
+      )
+    return y
+
+  def _apply_gemma4_scanned_blocks(
+      self,
+      y,
+      layer_args,
+      layer_kwargs,
+      kv_caches=None,
+  ):
+    """Applies Gemma4 scanned decoder blocks, handling main scan and remainders."""
+
+    cfg = self.config
+
+    # Define the repeating pattern length and calculate how many full blocks to scan
+    attention_pattern_length = len(gemma4.GEMMA4_ATTENTION_PATTERN)
+    scan_length = cfg.num_decoder_layers // attention_pattern_length
+
+    # Apply the main scan over the full blocks. Gemma4ScannableBlock applies
+    # per-layer remat internally (local scan + global layer), so skip the
+    # block-level remat here to avoid double rematerialization. Unrolling the
+    # block loop (one iteration per repeated block) lets XLA pipeline/free block
+    # activations across iterations (memory + overlap knob).
+    block_unroll = max(1, scan_length)
+    if scan_length > 0:
+      grouped_kv_caches = maxtext_utils.prepare_kv_caches_for_scan(
+          kv_caches, scan_length, attention_pattern_length, stack=False
+      )
+      y, self.scanned_blocks, _ = self._apply_layers_sequentially(
+          self.scanned_blocks,
+          y,
+          *layer_args,
+          length=scan_length,
+          kv_caches_stacked=grouped_kv_caches,
+          skip_block_remat=True,
+          unroll=block_unroll,
+          **layer_kwargs,
+      )
+      maxtext_utils.update_kv_caches_after_scan(
+          kv_caches, grouped_kv_caches, scan_length, attention_pattern_length, stacked=False
+      )
+
+    # Apply any remaining layers that did not fit into a full scanned block
+    num_remaining_layers = cfg.num_decoder_layers % attention_pattern_length
+    if num_remaining_layers > 0:
+      y = self._apply_remainder_block(
+          self.layers_remainder,
+          y,
+          layer_args,
+          layer_kwargs,
+          kv_caches=kv_caches,
+          start_idx=scan_length * attention_pattern_length,
+          num_remaining_layers=num_remaining_layers,
+      )
+
+    return y
+
+  def _apply_remainder_block(
+      self,
+      block,
+      y,
+      layer_args,
+      layer_kwargs,
+      kv_caches,
+      start_idx,
+      num_remaining_layers,
+  ):
+    """Applies the trailing scannable block holding the layers left over by the main scan.
+
+    The outer scan runs over whole blocks, so `num_decoder_layers %
+    block_length` layers are left over. They live in a single short block,
+    applied here behind one block-level remat boundary. The main scan skips
+    block-level remat, because there its blocks rematerialize their own
+    sub-layers; this one runs once, so a coarse boundary costs nothing.
+
+    Args:
+      block: The remainder block module; updated in place with its new state.
+      y: Input activations.
+      layer_args: Positional arguments forwarded to the block.
+      layer_kwargs: Keyword arguments forwarded to the block.
+      kv_caches: Flat per-layer external cache list, mutated in place, or None.
+      start_idx: Index of the first remainder layer in `kv_caches`.
+      num_remaining_layers: How many layers the remainder block covers.
+
+    Returns:
+      The output activations.
+    """
+    cfg = self.config
+    remainder_kv = None
+    if kv_caches is not None:
+      remainder_kv = tuple(kv_caches[start_idx : start_idx + num_remaining_layers])
+
+    def split_output(out_res):
+      if isinstance(out_res, tuple):
+        return out_res[0], (out_res[1] if len(out_res) > 1 else None)
+      return out_res, None
+
+    if cfg.use_qwix_quantization or cfg.lora.lora_weight_qtype:
+      call_kwargs = dict(layer_kwargs)
+      if remainder_kv is not None:
+        call_kwargs["kv_cache"] = remainder_kv
+      y, updated_remainder_kv = split_output(block(y, *layer_args, **call_kwargs))
+    else:
+
+      def pure_block_fn(graphdef, state_in, y_in, kv_in):
+        merged_layer = nnx.merge(graphdef, state_in)
+        call_kwargs = dict(layer_kwargs)
+        if kv_in is not None:
+          call_kwargs["kv_cache"] = kv_in
+        out_y, out_kv = split_output(merged_layer(y_in, *layer_args, **call_kwargs))
+        nnx.pop(merged_layer, (nnx.RngState, nnx.Intermediate))
+        return out_y, out_kv, nnx.state(merged_layer)
+
+      checkpointed_block_fn = jax.checkpoint(
+          pure_block_fn,
+          policy=self.get_remat_policy(),
+          prevent_cse=maxtext_utils.should_prevent_cse_in_remat(cfg),
+      )
+
+      graphdef, state = nnx.split(block)
+      y, updated_remainder_kv, new_state = checkpointed_block_fn(graphdef, state, y, remainder_kv)
+      nnx.update(block, new_state)
+
+    if kv_caches is not None and updated_remainder_kv is not None:
+      for offset, updated_item in enumerate(updated_remainder_kv):
+        kv_caches[start_idx + offset] = updated_item
+
+    return y
+
+  def _apply_gemma4_small_layers(
+      self,
+      y,
+      decoder_input_tokens,
+      decoder_segment_ids,
+      decoder_positions,
+      deterministic,
+      model_mode,
+      multimodal_input=None,
+      kv_caches=None,
+      attention_metadata=None,
+      previous_chunk=None,
+      slot=None,
+  ):
+    """Apply Gemma 4 small (E2B/E4B) decoder layers (pure-NNX)."""
+    cfg = self.config
+    bidirectional_mask_value = multimodal_input.bidirectional_mask if multimodal_input is not None else None
+
+    per_layer_inputs = None
+    if cfg.hidden_size_per_layer_input > 0 and cfg.vocab_size_per_layer_input > 0:
+      per_layer_inputs = self.per_layer_embedder(decoder_input_tokens, y)
+
+    layer_types = gemma4_small.build_layer_types(cfg.num_decoder_layers, cfg.model_name)
+    num_kv_shared = cfg.num_kv_shared_layers
+    shared_kv_states: dict[int, tuple[jax.Array, jax.Array]] = {}
+    # tpu-inference allocates one kv_caches slot per non-shared layer; KV-shared layers reuse the donor's slot.
+    cache_index_of = gemma4_small.kv_cache_slot_map(layer_types, num_kv_shared)
+
+    policy = self.get_remat_policy()
+    prevent_cse = maxtext_utils.should_prevent_cse_in_remat(cfg)
+    for lyr in range(cfg.num_decoder_layers):
+      layer = getattr(self, f"layers_{lyr}")
+      donor_idx = gemma4_small.kv_donor_layer_idx(lyr, layer_types, num_kv_shared)
+      is_donor = gemma4_small.is_kv_donor_layer(lyr, layer_types, num_kv_shared)
+
+      shared_key = None
+      shared_value = None
+      if donor_idx is not None:
+        if donor_idx not in shared_kv_states:
+          raise RuntimeError(
+              f"KV-shared layer {lyr} references donor {donor_idx} but no donor K/V "
+              f"have been recorded yet. This indicates the layer iteration order is wrong."
+          )
+        shared_key, shared_value = shared_kv_states[donor_idx]
+
+      # Donor layers expose their rotated, normed K/V to downstream shared layers, and reuse the
+      # just-computed K/V in their own forward to avoid double-computing the K/V projection.
+      if is_donor:
+        donor_k, donor_v = layer.compute_shared_kv(y, decoder_positions)
+        shared_kv_states[lyr] = (donor_k, donor_v)
+        shared_key, shared_value = donor_k, donor_v
+
+      ple_slice = per_layer_inputs[..., lyr, :] if per_layer_inputs is not None else None
+
+      cache_idx = cache_index_of[lyr]
+      kv_cache = kv_caches[cache_idx] if kv_caches is not None else None
+
+      # When activation rematerialization is enabled (e.g. remat_policy='full' or 'minimal'
+      # during training), wrap each unscanned layer in jax.checkpoint to prevent OOMs. When
+      # remat is disabled (remat_policy='none' or None), call the layer directly.
+      if cfg.remat_policy and cfg.remat_policy != "none":
+        y, kv_cache = self._apply_layer_with_remat(
+            layer,
+            y,
+            policy,
+            prevent_cse,
+            decoder_segment_ids=decoder_segment_ids,
+            decoder_positions=decoder_positions,
+            deterministic=deterministic,
+            model_mode=model_mode,
+            previous_chunk=previous_chunk,
+            slot=slot,
+            bidirectional_mask=bidirectional_mask_value,
+            kv_cache=kv_cache,
+            attention_metadata=attention_metadata,
+            per_layer_input=ple_slice,
+            shared_key=shared_key,
+            shared_value=shared_value,
+        )
+      else:
+        y, kv_cache = layer(
+            y,
+            decoder_segment_ids,
+            decoder_positions,
+            deterministic,
+            model_mode,
+            previous_chunk=previous_chunk,
+            slot=slot,
+            bidirectional_mask=bidirectional_mask_value,
+            kv_cache=kv_cache,
+            attention_metadata=attention_metadata,
+            per_layer_input=ple_slice,
+            shared_key=shared_key,
+            shared_value=shared_value,
+        )
+      if kv_caches is not None and kv_cache is not None:
+        kv_caches[cache_idx] = kv_cache
+
+    return y, kv_caches
+
+  def get_layers(self) -> list[nnx.Module]:
+    """Returns all decoder layer modules/blocks in their forward-pass execution order."""
+    layers = []
+    seen = set()
+
+    def _add(module):
+      if module is not None and id(module) not in seen:
+        seen.add(id(module))
+        layers.append(module)
+
+    def _append_unscanned(prefix):
+      i = 0
+      while hasattr(self, f"{prefix}_{i}"):
+        _add(getattr(self, f"{prefix}_{i}"))
+        i += 1
+
+    def _append_scanned(name):
+      if hasattr(self, name):
+        val = getattr(self, name)
+        if name == "layers_remainder" and getattr(val, "num_of_layers", 0) == 0:
+          return
+        if isinstance(val, (nnx.Module, list)):
+          _add(val)
+
+    if self.is_deepseek:
+      _append_scanned("dense_layers")
+      _append_unscanned("dense_layers")
+
+      _append_scanned("moe_layers")
+      _append_unscanned("moe_layers")
+
+      _append_scanned("moe_layers_outside_pipeline")
+      _append_unscanned("moe_layers_outside_pipeline")
+
+      if hasattr(self, "pipeline_module"):
+        _add(getattr(self.pipeline_module, "layers", None))
+    else:
+      if hasattr(self, "pipeline_module"):
+        _add(getattr(self.pipeline_module, "layers", None))
+
+      _append_scanned("scanned_blocks")  # Gemma 4
+      _append_scanned("layers")
+      _append_unscanned("layers")
+
+      _append_scanned("layers_remainder")  # Gemma 3/4
+
+      _append_scanned("layers_outside_pipeline")
+      _append_unscanned("layers_outside_pipeline")
+
+    # Fallback for dynamic/chunked layer attributes (e.g. Engram dense_layers_0_3)
+    if not layers:
+      for k, m in vars(self).items():
+        if k.startswith(("dense_layers", "moe_layers", "layers", "scanned_blocks")) and isinstance(m, (nnx.Module, list)):
+          _add(m)
+
+    return layers

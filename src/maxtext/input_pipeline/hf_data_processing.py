@@ -1,4 +1,4 @@
-# Copyright 2023–2025 Google LLC
+# Copyright 2023–2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,12 +24,12 @@ import transformers
 
 import grain.python as grain
 
-import numpy as np
-
 from maxtext.input_pipeline import data_processing_utils
+from maxtext.input_pipeline import dpo_utils
 from maxtext.input_pipeline import input_pipeline_utils
 from maxtext.input_pipeline import instruction_data_processing
 from maxtext.input_pipeline import multihost_dataloading
+from maxtext.utils import elastic_utils
 
 
 def _get_pad_id(tokenizer):
@@ -40,6 +40,88 @@ def _get_pad_id(tokenizer):
   else:
     pad_id = -1
   return pad_id
+
+
+def _get_training_objective_transform(
+    config: ml_collections.ConfigDict,
+    *,
+    shift: bool,
+    use_dpo: bool,
+    use_sft: bool,
+    packing: bool,
+    pad_id: int,
+    bos_token_id: int | None,
+) -> input_pipeline_utils.ShiftData | input_pipeline_utils.BlockDiffusionCorruption | None:
+  """Selects target preparation for causal or block-diffusion pre-training.
+
+  Args:
+    config: Training configuration containing the objective-specific settings.
+    shift: Whether causal language-model targets should be shifted by one token.
+    use_dpo: Whether the pipeline is preparing direct-preference data.
+    use_sft: Whether the pipeline is preparing supervised fine-tuning data.
+    packing: Whether multiple examples are packed into each sequence.
+    pad_id: Token ID used to pad causal language-model examples.
+    bos_token_id: Beginning-of-sequence token ID, or None when unavailable.
+
+  Returns:
+    The objective-specific Grain transform, or None when target shifting is disabled.
+
+  Raises:
+    ValueError: If the objective is unsupported or block diffusion is combined with
+      an incompatible post-training or packing mode.
+  """
+  objective = getattr(config, "training_objective", "causal_lm")
+  if objective == "block_diffusion":
+    if use_sft:
+      raise ValueError("This block-diffusion integration currently supports pre-training only.")
+    if use_dpo:
+      raise ValueError("Block-diffusion pre-training is not compatible with DPO.")
+    if packing:
+      raise ValueError("Block-diffusion pre-training requires packing=False.")
+    return input_pipeline_utils.BlockDiffusionCorruption(
+        block_size=config.causal_block_size,
+        mask_id=config.block_diffusion_mask_id,
+        min_noise=config.block_diffusion_min_noise,
+        logit_alignment=config.block_diffusion_logit_alignment,
+        canvas_policy=config.block_diffusion_canvas_policy,
+        axis=1,
+    )
+  if objective != "causal_lm":
+    raise ValueError(f"Unsupported training objective: {objective}")
+  if shift and not use_dpo:
+    return input_pipeline_utils.ShiftData(ignored_ids=[pad_id, bos_token_id], axis=1)
+  return None
+
+
+def add_default_prompt_if_missing(dataset, text_columns, config):
+  """Inject default prompt if prompt column is missing in dataset (e.g. COCO captioning)."""
+  prompt_col = text_columns[0]
+  # Check if features is None (e.g. streaming IterableDataset) or prompt column is absent
+  features = getattr(dataset, "features", None) or getattr(dataset, "column_names", None)
+  # If so, populate each example with default_prompt
+  if features is None or prompt_col not in features:
+    dataset = dataset.map(lambda ex: {**ex, prompt_col: config.default_prompt})
+  return dataset
+
+
+def format_sharegpt(example):
+  """Convert a ShareGPT conversation into query and response fields."""
+  query = ""
+  response = ""
+  conversations = example.get("conversations", [])
+  if not isinstance(conversations, list):
+    raise TypeError(f"Expected 'conversations' to be a list, got {type(conversations).__name__}.")
+  for turn in conversations:
+    if not isinstance(turn, dict):
+      continue
+    if turn.get("from") == "human":
+      query = turn.get("value", "")
+    elif turn.get("from") == "gpt":
+      response = turn.get("value", "")
+      break
+  example["query"] = query
+  example["response"] = [response]
+  return example
 
 
 def vision_sft_preprocessing_pipeline(
@@ -54,13 +136,25 @@ def vision_sft_preprocessing_pipeline(
 ):
   """pipeline for multimodal SFT with HF dataset"""
 
+  if (
+      image_column == "video"
+      and "conversations" in dataset.features
+      and len(text_columns) == 2
+      and text_columns[0] not in dataset.features
+  ):
+    dataset = dataset.map(format_sharegpt)
+
   assert len(text_columns) == 2, f"Need two text_columns for query and response, received {text_columns=}"
   # Tunix GA requires per-micro-batch slicing at the data level,
   # whereas Native GA processes the full batch and splits it internally.
-  if config.use_tunix_gradient_accumulation:
-    batch_size = global_batch_size // jax.process_count() // config.gradient_accumulation_steps
+  if config.elastic_enabled:
+    local_batch_size = elastic_utils.get_local_batch_size(config)
   else:
-    batch_size = global_batch_size // jax.process_count()
+    local_batch_size = global_batch_size // jax.process_count()
+  if config.use_tunix_gradient_accumulation:
+    batch_size = local_batch_size // config.gradient_accumulation_steps
+  else:
+    batch_size = local_batch_size
 
   # for multi-epoch with shuffle, shuffle each epoch with different seeds then concat
   import datasets  # pylint: disable=import-outside-toplevel
@@ -85,6 +179,8 @@ def vision_sft_preprocessing_pipeline(
     )
     image_column = "images"
 
+  dataset = add_default_prompt_if_missing(dataset, text_columns, config)
+
   dataset = dataset.select_columns(text_columns + [image_column])
   if image_column != "images":
     dataset = dataset.rename_column(image_column, "images")
@@ -95,6 +191,7 @@ def vision_sft_preprocessing_pipeline(
           "column": text_columns[0],
           "image_placeholder": config.image_placeholder,
           "model_name": config.model_name,
+          "video_placeholder": getattr(config, "video_placeholder", "<|video|>"),
       },
   )
   dataset = dataset.map(
@@ -104,7 +201,7 @@ def vision_sft_preprocessing_pipeline(
 
   dataset = dataset.map(
       input_pipeline_utils.pre_process_image_sft,
-      fn_kwargs={"image_column": "images", "model_name": config.model_name},
+      fn_kwargs={"image_column": "images", "config": config},
   )
 
   tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -113,6 +210,7 @@ def vision_sft_preprocessing_pipeline(
       add_eos_token=False,
       legacy=False,
       token=config.hf_access_token,
+      extra_special_tokens={},
   )
   pad_id = _get_pad_id(tokenizer)
 
@@ -161,6 +259,17 @@ def vision_sft_preprocessing_pipeline(
   operations.append(input_pipeline_utils.ExtractImagesAndMasks())
   operations.append(grain.Batch(batch_size=batch_size, drop_remainder=True))
   operations.append(input_pipeline_utils.FoldImagesIntoBatch(model_name=config.model_name))
+  if config.use_mrope:
+    operations.append(
+        input_pipeline_utils.ComputeQwen3OmniPositions(
+            data_column="inputs",
+            spatial_merge_size=config.spatial_merge_size_for_vit,
+            position_id_per_seconds=config.position_id_per_seconds,
+            use_audio_in_video=getattr(config, "use_audio_in_video", False),
+            config=config,
+            keep_aux_fields=False,  # drop aux to match train shape
+        )
+    )
   operations.append(input_pipeline_utils.ShiftData(ignored_ids=[pad_id], axis=1))
   dummy_index_sampler = grain.IndexSampler(
       num_records=len(dataset),
@@ -176,7 +285,7 @@ def vision_sft_preprocessing_pipeline(
       data_source=dataset,
       operations=operations,
       sampler=dummy_index_sampler,
-      worker_count=1,  # only supports <=1 for now, more workers results in duplicated data
+      worker_count=config.grain_worker_count,
       worker_buffer_size=1,
       read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=batch_size * 4),
   )
@@ -192,6 +301,7 @@ def preprocessing_pipeline(
     dataloading_host_count,
     global_mesh,
     dataset,
+    config,
     data_column_names,
     tokenize,
     tokenizer_path,
@@ -208,7 +318,7 @@ def preprocessing_pipeline(
     num_threads=1,
     drop_remainder=True,
     generate_padding_batch=False,
-    use_dpo=None,
+    use_dpo=False,
     use_sft=None,
     use_tunix_gradient_accumulation=False,
     num_microbatches=1,
@@ -217,6 +327,8 @@ def preprocessing_pipeline(
     max_segments_per_seq=None,
     num_epoch=1,
     chat_template: Optional[str] = None,
+    formatting_func_path: Optional[str] = None,
+    formatting_func_kwargs: Optional[dict] = None,
 ):
   """pipeline for preprocessing HF dataset"""
   import datasets  # pylint: disable=import-outside-toplevel
@@ -224,10 +336,14 @@ def preprocessing_pipeline(
   assert global_batch_size % global_mesh.size == 0, "Batch size should be divisible by number of global devices."
   # Tunix GA requires per-micro-batch slicing at the data level,
   # whereas Native GA processes the full batch and splits it internally.
-  if use_tunix_gradient_accumulation:
-    batch_size = global_batch_size // jax.process_count() // num_microbatches
+  if config.elastic_enabled:
+    local_batch_size = elastic_utils.get_local_batch_size(config)
   else:
-    batch_size = global_batch_size // jax.process_count()
+    local_batch_size = global_batch_size // jax.process_count()
+  if use_tunix_gradient_accumulation:
+    batch_size = local_batch_size // num_microbatches
+  else:
+    batch_size = local_batch_size
 
   # for multi-epoch with shuffle, shuffle each epoch with different seeds then concat
   if shuffle and num_epoch > 1:
@@ -244,18 +360,25 @@ def preprocessing_pipeline(
       add_eos_token=add_eos if not use_sft else False,
       legacy=False,
       token=hf_access_token,
+      extra_special_tokens={},
   )
 
   dataset = dataset.select_columns(data_column_names)
 
   if use_sft:
+    if not chat_template:
+      chat_template = instruction_data_processing.load_chat_template_from_file(chat_template_path)
+
     data_processing_utils.validate_and_configure_sft_columns(data_column_names, tokenizer, chat_template)
 
     # convert instruction dataset to conversational format
-    # currently only works for Q&A datasets
     dataset, data_column_names = instruction_data_processing.convert_to_conversational_format(
-        dataset=dataset, data_columns=data_column_names, chat_template_path=chat_template_path
+        dataset=dataset,
+        data_columns=data_column_names,
+        formatting_func_path=formatting_func_path,
+        formatting_func_kwargs=formatting_func_kwargs,
     )
+
     assert input_pipeline_utils.is_conversational(
         dataset.features, data_column_names
     ), "Dataset is not in conversational format."
@@ -302,7 +425,6 @@ def preprocessing_pipeline(
   )
   operations = []
   if use_sft:
-    input_pipeline_utils.verify_chat_template_generation_prompt_logic(tokenizer)
     operations.append(
         input_pipeline_utils.SFTPromptMasking(
             text_column_name=data_column_names[0],
@@ -312,19 +434,12 @@ def preprocessing_pipeline(
         )
     )
     data_column_names = ("inputs", "targets")
-  elif use_dpo:
-
-    def lists2array(x):
-      """Convert lists/tuples to array"""
-      return jax.tree.map(np.asarray, x, is_leaf=lambda y: isinstance(y, (list, tuple)))
-
-    operations.append(grain.MapOperation(lists2array))
-  else:
+  elif not use_dpo:
     assert len(data_column_names) == 1
     operations.append(input_pipeline_utils.HFNormalizeFeatures(data_column_names[0]))
     data_column_names = ("inputs", "targets")
 
-  if packing and not use_dpo:
+  if packing:
     length_struct = {col: max_target_length for col in data_column_names}
     max_segments = max_segments_per_seq
     if max_segments is not None and max_segments <= 0:
@@ -338,11 +453,25 @@ def preprocessing_pipeline(
     )
     operations.append(input_pipeline_utils.ReformatPacking(data_column_names))
   else:
-    operations.append(input_pipeline_utils.PadOrTrimToMaxLength(max_target_length, pad_id))
+    if use_dpo:
+      # Renames arbitrary DPO columns and performs DPO-aware padding.
+      max_prompt_length = config.dpo.max_prompt_length
+      operations.append(dpo_utils.DPODataFormatting(pad_id, max_target_length, data_column_names, max_prompt_length))
+    else:
+      operations.append(input_pipeline_utils.PadOrTrimToMaxLength(max_target_length, pad_id, config=config))
     operations.append(grain.Batch(batch_size=batch_size, drop_remainder=drop_remainder))
 
-  if shift and not use_dpo:
-    operations.append(input_pipeline_utils.ShiftData(ignored_ids=[pad_id, tokenizer.bos_token_id], axis=1))
+  target_transform = _get_training_objective_transform(
+      config,
+      shift=shift,
+      use_dpo=use_dpo,
+      use_sft=use_sft,
+      packing=packing,
+      pad_id=pad_id,
+      bos_token_id=tokenizer.bos_token_id,
+  )
+  if target_transform is not None:
+    operations.append(target_transform)
 
   # Since HuggingFace IterableDataset does not support access through index
   # Indexes generated by dummy_index_sampler is not used.
@@ -406,6 +535,7 @@ def make_hf_train_iterator(
         dataloading_host_count=len(process_indices_train),
         global_mesh=global_mesh,
         dataset=train_ds,
+        config=config,
         data_column_names=config.train_data_columns,
         tokenize=config.tokenize_train_data,
         tokenizer_path=config.tokenizer_path,
@@ -427,6 +557,9 @@ def make_hf_train_iterator(
         max_segments_per_seq=config.max_segments_per_seq,
         num_epoch=config.num_epoch,
         chat_template=config.chat_template,
+        formatting_func_path=config.formatting_func_path,
+        formatting_func_kwargs=config.formatting_func_kwargs,
+        grain_worker_count=config.grain_worker_count,
     )
   return train_iter
 
@@ -465,6 +598,7 @@ def make_hf_eval_iterator(
         dataloading_host_count=len(process_indices_eval),
         global_mesh=global_mesh,
         dataset=eval_ds,
+        config=config,
         data_column_names=config.eval_data_columns,
         tokenize=config.tokenize_eval_data,
         tokenizer_path=config.tokenizer_path,
@@ -484,5 +618,8 @@ def make_hf_eval_iterator(
         chat_template_path=config.chat_template_path,
         max_segments_per_seq=config.max_segments_per_seq,
         chat_template=config.chat_template,
+        formatting_func_path=config.formatting_func_path,
+        formatting_func_kwargs=config.formatting_func_kwargs,
+        grain_worker_count=config.grain_worker_count,
     )
   return eval_iter

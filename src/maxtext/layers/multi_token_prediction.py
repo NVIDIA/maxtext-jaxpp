@@ -12,40 +12,102 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""JAX implementation of the Multi Token Prediction https://arxiv.org/pdf/2412.19437 """
+"""JAX implementation of the Multi Token Prediction https://arxiv.org/pdf/2412.19437"""
+# pylint: disable=no-name-in-module
 
 from typing import Type
 
-from flax import linen as nn
 from flax import nnx
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
-from maxtext.common.common_types import Config, MODEL_MODE_TRAIN
-from maxtext.layers.nnx_decoders import NNXDecoderLayer
-from maxtext.utils.globals import EPS
-from maxtext.layers.decoders import DecoderLayer
-from maxtext.layers.initializers import variable_to_logically_partitioned
+from maxtext.common.common_types import Config, DecoderBlockType, MODEL_MODE_TRAIN, ShardMode
+from maxtext.layers import moe
 from maxtext.layers.linears import DenseGeneral
+from maxtext.layers.nnx_decoders import NNXDecoderLayer
 from maxtext.layers.normalizations import RMSNorm
+from maxtext.models import deepseek_batchsplit
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
 from maxtext.utils import sharding
+from maxtext.utils.globals import EPS
+
+try:
+  # lineage_adapter is Google-internal and excluded from the open-source export.
+  from maxtext.experimental.lineage import lineage_adapter  # pylint: disable=g-import-not-at-top
+except ImportError:
+  lineage_adapter = None
 
 
 # Custom Variable types for MTP intermediate outputs
 # These will be automatically converted to Linen mutable collections by ToLinen wrapper
 # The class names become collection names directly (no case conversion)
-class mtp_losses(nnx.Variable):  # pylint: disable=invalid-name
+class mtp_losses(nnx.Intermediate):  # pylint: disable=invalid-name
   """Variable type for storing MTP loss components -> 'mtp_losses' collection."""
 
 
-class mtp_acceptance(nnx.Variable):  # pylint: disable=invalid-name
+class mtp_acceptance(nnx.Intermediate):  # pylint: disable=invalid-name
   """Variable type for storing MTP acceptance predictions -> 'mtp_acceptance' collection."""
+
+
+def _shift_left_one_cp_aware(x: jnp.ndarray, axis_name: str = "context") -> jnp.ndarray:
+  """Left-shift x by 1 along axis=1, pulling the next token across CP ranks.
+
+  Standard ``jnp.roll(x, -1, axis=1)`` only rolls WITHIN a local shard. Under
+  context parallelism the sequence is split across the ``axis_name`` mesh
+  axis, so the last token of rank r should receive the first token of rank
+  r+1. We use ``jax.lax.ppermute`` to fetch that token and stitch it in.
+
+  Rank cp_size - 1 has no successor; its last position receives 0 (matching
+  the no-CP semantics where position T-1 is always masked out).
+
+  Falls back to a plain local roll when ``axis_name`` is not in scope (no
+  shard_map / no CP) or when CP size is 1.
+
+  Args:
+    x: Input array with sequence dim at axis=1.
+    axis_name: Mesh axis along which the sequence is sharded.
+
+  Returns:
+    Array shaped like x, left-shifted by 1 across CP boundaries.
+  """
+  # jnp.roll cannot slice an explicitly sharded sequence axis, so shift a copy
+  # gathered along it and restore the original sharding.
+  x_sharding = jax.typeof(x).sharding
+  spec = x_sharding.spec.partitions
+  if len(spec) > 1 and spec[1] is not None:
+    gathered = jax.sharding.NamedSharding(x_sharding.mesh, jax.sharding.PartitionSpec(spec[0], None, *spec[2:]))
+    return jax.reshard(_shift_left_one_cp_aware(jax.reshard(x, gathered), axis_name), x_sharding)
+
+  local_rolled = jnp.roll(x, -1, axis=1)
+
+  # Mask for the last position along axis=1 (avoids .at[...].set() scatter).
+  last_mask = jnp.arange(local_rolled.shape[1]) == local_rolled.shape[1] - 1
+  last_mask = last_mask.reshape((1, -1) + (1,) * (local_rolled.ndim - 2))
+  local_rolled = jnp.where(last_mask, 0, local_rolled)
+
+  try:
+    cp_size = jax.lax.axis_size(axis_name)
+  except NameError:
+    return local_rolled
+  if cp_size == 1:
+    return local_rolled
+
+  cp_rank = jax.lax.axis_index(axis_name)
+  first_token = jax.lax.dynamic_slice_in_dim(x, 0, 1, axis=1)
+  # Backward ring: rank r sends first_token to rank r-1.
+  perm = [(r, (r - 1) % cp_size) for r in range(cp_size)]
+  next_first = jax.lax.ppermute(first_token, axis_name=axis_name, perm=perm)
+  next_first = jnp.where(cp_rank == cp_size - 1, jnp.zeros_like(next_first), next_first)
+  return jnp.where(last_mask, next_first, local_rolled)
 
 
 def roll_and_mask(x: jnp.ndarray, shift: int = -1) -> jnp.ndarray:
   """Performs a leftward roll on sequence axis and masks invalid positions.
+
+  When ``shift=-1``, the roll is CP-aware: it pulls the next token across
+  CP rank boundaries via ``_shift_left_one_cp_aware`` rather than wrapping
+  locally.
 
   Args:
     x: Input array of shape [batch, seq_len, ...].
@@ -56,13 +118,56 @@ def roll_and_mask(x: jnp.ndarray, shift: int = -1) -> jnp.ndarray:
   """
   if shift == 0:
     return x
+  if shift == -1:
+    return _shift_left_one_cp_aware(x)
   return jnp.roll(x, shift, axis=1).at[:, shift:, ...].set(0)
+
+
+def roll_and_mask_by_segment(x: jnp.ndarray, segment_ids: jnp.ndarray | None, shift: int = -1) -> jnp.ndarray:
+  """Rolls sequence left within document boundaries defined by segment_ids.
+
+  For each position, if the next position belongs to a different segment (or
+  is the last position), the rolled value is zeroed out instead of wrapping
+  around from the next document.
+
+  When ``segment_ids`` is None, this behaves like ``roll_and_mask``, only
+  zeroing the last position.
+
+  Args:
+    x: Input array of shape [batch, seq_len, ...].
+    segment_ids: Integer segment IDs of shape [batch, seq_len], or None.
+      Same segment ID = same document. 0 = padding/EOD.
+      If None, falls back to simple roll_and_mask behavior.
+    shift: Number of positions to shift left (must be -1).
+
+  Returns:
+    Rolled array with cross-boundary and tail positions zeroed.
+  """
+  assert shift == -1, f"roll_and_mask_by_segment only supports shift=-1, got {shift}"
+
+  if segment_ids is None:
+    return roll_and_mask(x, shift)
+
+  rolled = _shift_left_one_cp_aware(x)
+
+  seg_current = segment_ids
+  seg_next = _shift_left_one_cp_aware(segment_ids)
+
+  # A position is a boundary if:
+  #   1. current segment != next segment (document boundary), OR
+  #   2. current segment == 0 (padding/EOD position)
+  is_boundary = (seg_current != seg_next) | (seg_current == 0)
+
+  mask = is_boundary[(...,) + (None,) * (x.ndim - 2)]
+
+  return jnp.where(mask, 0, rolled)
 
 
 class MultiTokenPredictionLayer(nnx.Module):
   """Multi-Token Prediction layer: normalize, concatenate, project, and transform.
 
-  Implements: h_next = TransformerLayer(W_p(concat(RMSNorm(h_prev), RMSNorm(e_target))))
+  Implements: h_next = TransformerLayer(W_p(concat(RMSNorm(h_prev),
+  RMSNorm(e_target))))
   """
 
   def __init__(
@@ -79,7 +184,6 @@ class MultiTokenPredictionLayer(nnx.Module):
     self.layer_number = layer_number
     self.transformer_layer_module = transformer_layer_module
     self.rngs = rngs
-    k = layer_number
     cfg = self.config
 
     self.embedding_norm = RMSNorm(
@@ -104,7 +208,7 @@ class MultiTokenPredictionLayer(nnx.Module):
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         use_bias=False,
-        kernel_axes=("concat_embed", "embed"),
+        kernel_axes=("embed", None),
         rngs=rngs,
     )
     # Use MODEL_MODE_TRAIN for initialization; runtime model_mode is passed dynamically.
@@ -112,7 +216,15 @@ class MultiTokenPredictionLayer(nnx.Module):
         config=cfg,
         mesh=mesh,
         model_mode=MODEL_MODE_TRAIN,
-        name=f"mtp_{k}_transformer_layer",
+        rngs=rngs,
+    )
+
+    self.final_norm = RMSNorm(
+        num_features=cfg.emb_dim,
+        epsilon=cfg.normalization_layer_epsilon,
+        dtype=cfg.dtype,
+        weight_dtype=cfg.weight_dtype,
+        kernel_axes=("norm",),
         rngs=rngs,
     )
 
@@ -148,6 +260,14 @@ class MultiTokenPredictionLayer(nnx.Module):
   def transformer_layer(self, module):
     setattr(self, f"mtp_{self.layer_number}_transformer_layer", module)
 
+  @property
+  def final_norm(self):
+    return getattr(self, f"mtp_{self.layer_number}_final_norm")
+
+  @final_norm.setter
+  def final_norm(self, module):
+    setattr(self, f"mtp_{self.layer_number}_final_norm", module)
+
   def __call__(
       self,
       prev_hidden_state: jnp.ndarray,
@@ -162,7 +282,8 @@ class MultiTokenPredictionLayer(nnx.Module):
 
     Args:
         prev_hidden_state: Shape [batch, seq_len, hidden_size].
-        target_token_embedding: Embedding for token t+k. Shape [batch, seq_len, embed_dim].
+        target_token_embedding: Embedding for token t+k. Shape [batch, seq_len,
+          embed_dim].
         position_ids: Shape [batch, seq_len].
         decoder_segment_ids: Shape [batch, seq_len] or None.
         deterministic: Whether to disable dropout.
@@ -171,32 +292,140 @@ class MultiTokenPredictionLayer(nnx.Module):
     Returns:
         Processed hidden state. Shape [batch, seq_len, hidden_size].
     """
+    if self.config.use_lineage:
+      # Lineage runs everything but `final_norm`, which the block applies.
+      out, mtp_lb_loss, mtp_bias_updates = lineage_adapter.run_lineage_mtp_layer(
+          prev_hidden_state=prev_hidden_state,
+          target_token_embedding=target_token_embedding,
+          mtp_params=nnx.state(self, (nnx.Param, moe.MoEBiasVar)),
+          layer_number=self.layer_number,
+          decoder_positions=position_ids,
+          mesh=self.mesh,
+          cfg=self.config,
+          decoder_segment_ids=decoder_segment_ids,
+      )
+      if mtp_lb_loss is not None:
+        self.sow(nnx.Intermediate, "moe_lb_loss", mtp_lb_loss)
+      if mtp_bias_updates is not None:
+        self.sow(nnx.Intermediate, "moe_bias_updates", mtp_bias_updates)
+      return out
+
     target_token_embedding = sharding.maybe_shard_with_logical(
         target_token_embedding,
         ("activation_batch", "activation_length", "activation_embed"),
         self.mesh,
         self.config.shard_mode,
-        self.config.logical_axis_rules,
+        sharding.get_logical_axis_rules(),
     )
 
     embedding_norm = self.embedding_norm(target_token_embedding)
     hidden_state_norm = self.hidden_state_norm(prev_hidden_state)
+    if self.config.shard_mode == ShardMode.EXPLICIT:
+      # Ensure that the embedding norm has the same sharding as the hidden state
+      # norm.
+      hidden_state_pspec = jax.sharding.NamedSharding(self.mesh, jax.typeof(hidden_state_norm).sharding.spec)
+      embedding_norm = jax.reshard(embedding_norm, hidden_state_pspec)
+
     concatenated_features = jnp.concatenate([embedding_norm, hidden_state_norm], axis=-1)
     projected_features = self.projection_layer(concatenated_features)
 
-    output = self.transformer_layer(
-        inputs=projected_features,
-        decoder_segment_ids=decoder_segment_ids,
-        decoder_positions=position_ids,
-        deterministic=deterministic,
-        model_mode=model_mode,
-    )
+    if self.config.decoder_block == DecoderBlockType.DEEPSEEK and self.config.use_batch_split_schedule:
+
+      def extract_fn(x):
+        if isinstance(x, nnx.variablelib.Variable):
+          return sharding.maybe_shard_with_logical(
+              x.value,
+              x.sharding_names,
+              self.mesh,
+              shard_mode=self.config.shard_mode,
+              rules=sharding.get_logical_axis_rules(),
+          )
+        return x
+
+      output = deepseek_batchsplit.batch_split_layer(
+          inputs=projected_features,
+          positions=position_ids,
+          params=nnx.to_pure_dict(nnx.state(self, (nnx.Param, moe.MoEBiasVar)), extract_fn)[
+              f"mtp_{self.layer_number}_transformer_layer"
+          ],
+          mesh=self.mesh,
+          cfg=self.config,
+      )
+    else:
+      output = self.transformer_layer(
+          inputs=projected_features,
+          decoder_segment_ids=decoder_segment_ids,
+          decoder_positions=position_ids,
+          deterministic=deterministic,
+          model_mode=model_mode,
+      )
 
     return output[0] if isinstance(output, tuple) else output
 
 
+def _cross_entropy_with_integer_labels(logits: jnp.ndarray, labels: jnp.ndarray) -> jnp.ndarray:
+  """Memory-efficient cross entropy loss from integer target labels.
+
+  Avoids materializing a dense 3D [batch, seq_len, vocab_size] one-hot target
+  tensor in HBM, significantly reducing memory consumption during MTP training.
+
+  Args:
+    logits: Unscaled logit tensor of shape [..., vocab_size].
+    labels: Integer target label IDs of shape [...].
+
+  Returns:
+    Cross-entropy loss tensor of shape [...].
+  """
+  log_sum_exp = jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
+  target_logits = jnp.take_along_axis(logits, labels[..., None], axis=-1)
+  return jnp.squeeze(log_sum_exp - target_logits, axis=-1)
+
+
 class MultiTokenPredictionBlock(nnx.Module):
-  """Orchestrates the MTP process by running a sequence of MTP layers."""
+  """Orchestrates DeepSeek Multi-Token Prediction (MTP) over K future positions.
+
+  Architecture:
+    For each prediction depth k in [1, K]:
+      1. Dual Input Norm & Projection:
+           h_in_k = W_p [ RMSNorm(h_{k-1}) ; RMSNorm(emb(x_{t+k})) ]
+      2. Transformer Layer (MLA + MoE):
+           h_k = TransformerLayer_k(h_in_k)
+      3. Dedicated Final Norm & Shared Output Head:
+           h_normed_k = mtp_k_final_norm(h_k)   # Dedicated MTP RMSNorm
+           logits_k   = lm_head(h_normed_k)     # Shared with main model
+      4. Loss Computation:
+           loss_k = CrossEntropy(logits_k, target=x_{t+k+1})
+
+  Dataflow:
+    Main Backbone ──► h_0
+                       │
+    x_{t+1} ──► emb ───┴──► [MTP Layer 1] ──► h_1 (unnormalized)
+                                                │
+                         ┌──────────────────────┴────────────────┐
+                         ▼                                       ▼
+                 mtp_1_final_norm                      To Layer 2 (if K > 1)
+                         │
+                         ▼
+            lm_head (normalize_y=False)
+                         │
+                         ▼
+                     MTP Logits ──► Loss_1
+
+  Norm Decoupling:
+    DeepSeek-V3 ties the projection head (shared_head.head == lm_head),
+    but keeps the final normalization separate (shared_head.norm != model.norm).
+    Passing normalize_y=False to apply_output_head prevents double-normalizing
+    with the main model's decoder_norm.
+    Reference: NVIDIA Megatron-LM multi_token_prediction.py:
+    https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/multi_token_prediction.py
+
+  Attributes:
+    config: Model hyperparameters.
+    mesh: Device mesh for tensor and activation sharding.
+    decoder: Decoder instance providing shared embedding and apply_output_head.
+    mtp_layer_{k}: MultiTokenPredictionLayer dynamically assigned for each depth
+      k in [1, mtp_num_layers], predicting token position t + k + 1.
+  """
 
   def __init__(
       self,
@@ -237,13 +466,58 @@ class MultiTokenPredictionBlock(nnx.Module):
       deterministic,
   ) -> dict:
     cfg = self.config
+    cp_size = self.mesh.shape.get(cfg.context_sharding, 1) if self.mesh is not None else 1
+
+    # Under packing, target_mask carries segment IDs (1, 2, ...) rather
+    # than a 0/1 loss mask. Normalize to 0/1 so downstream
+    # ``mtp_xent * target_mask`` scales loss correctly.
+    # When mtp_num_layers=0 and quantize_model traces the MTP block,
+    # decoder_target_tokens / decoder_target_mask may be None (the
+    # quantization path skips dummy targets when MTP is disabled).
+    if target_mask is None:
+      target_mask = jnp.ones_like(input_ids, dtype=jnp.int32)
+    else:
+      target_mask = jnp.asarray(target_mask)
+      target_mask = (target_mask != 0).astype(jnp.int32)
+
+    # Same guard: target_ids may be None during mtp_num_layers=0 quantization.
+    if target_ids is None:
+      target_ids = jnp.ones_like(input_ids, dtype=jnp.int32)
+
+    # CP load_balance shuffles token order via DUAL_CHUNK_SWAP, which breaks
+    # the ppermute-based neighbor fetch in _shift_left_one_cp_aware.
+    if max_utils.reordered_cp_size(cfg, self.mesh) > 1:
+      raise ValueError(
+          "MTP does not support context_parallel_load_balance. "
+          "DUAL_CHUNK_SWAP reorder breaks the ppermute-based neighbor "
+          "fetch in _shift_left_one_cp_aware."
+      )
+
+    # Segment tracking alignment: with mtp_num_layers > 1, rolled_segment_ids
+    # drifts one position behind target_ids each iteration, breaking boundary
+    # detection for layers k >= 2. Reject until multi-layer tracking is fixed.
+    if cp_size > 1 and cfg.packing and cfg.mtp_num_layers > 1:
+      raise ValueError(
+          "MTP with CP and packing only supports mtp_num_layers=1. "
+          "Multi-layer segment tracking alignment is not yet implemented."
+      )
+
     mtp_hidden_state = main_hidden_state
 
     # Rolling variables move prediction window one token to the right per iteration.
     rolled_input_ids = input_ids
     rolled_target_ids = target_ids
-    rolled_target_mask = target_mask
+    # Packed datasets use positive integer segment IDs (1, 2, ...) in
+    # targets_segmentation. MTP consumes this value as a loss/metric mask, so
+    # normalize it to binary validity before rolling
+    rolled_target_mask = target_mask != 0
     rolled_position_id = position_ids
+    # Track segment boundaries for segment-aware rolling.
+    # decoder_segment_ids itself is NOT rolled when passed to each MTP layer --
+    # the hidden state maintains original doc identity through properly masked
+    # self-attention. Only the rolling variables need segment-aware shift to
+    # avoid cross-document target leakage.
+    rolled_segment_ids = decoder_segment_ids
 
     mtp_losses_list = []
     mtp_weights_list = []
@@ -251,10 +525,13 @@ class MultiTokenPredictionBlock(nnx.Module):
     mtp_masks_list = []
 
     for k in range(1, cfg.mtp_num_layers + 1):
-      rolled_input_ids = roll_and_mask(rolled_input_ids)
-      rolled_target_ids = roll_and_mask(rolled_target_ids)
-      rolled_target_mask = roll_and_mask(rolled_target_mask)
-      rolled_position_id = roll_and_mask(rolled_position_id)
+      rolled_input_ids = roll_and_mask_by_segment(rolled_input_ids, rolled_segment_ids)
+      rolled_target_ids = roll_and_mask_by_segment(rolled_target_ids, rolled_segment_ids)
+      rolled_target_mask = roll_and_mask_by_segment(rolled_target_mask, rolled_segment_ids)
+      rolled_position_id = roll_and_mask_by_segment(rolled_position_id, rolled_segment_ids)
+      # Roll segment_ids itself for the next iteration (using plain roll).
+      if rolled_segment_ids is not None:
+        rolled_segment_ids = roll_and_mask(rolled_segment_ids)
 
       target_token_embedding = self.decoder._apply_embedding(
           shared_embedding,
@@ -274,10 +551,40 @@ class MultiTokenPredictionBlock(nnx.Module):
           model_mode=self.decoder.model_mode,
       )
 
-      mtp_logits = self.decoder.apply_output_head(shared_embedding, mtp_hidden_state, deterministic, model_mode)
+      # Apply separate normalization to the MTP hidden state before projecting to logits.
+      normed_mtp_hidden_state = mtp_layer.final_norm(mtp_hidden_state)
+      normed_mtp_hidden_state = sharding.maybe_shard_with_logical(
+          normed_mtp_hidden_state,
+          ("activation_batch", "activation_length", "activation_embed"),
+          self.mesh,
+          cfg.shard_mode,
+          sharding.get_logical_axis_rules(),
+      )
 
-      mtp_xent, _ = max_utils.cross_entropy_with_logits(
-          mtp_logits, jax.nn.one_hot(rolled_target_ids, cfg.vocab_size), 0.0
+      mtp_logits = self.decoder.apply_output_head(
+          shared_embedding, normed_mtp_hidden_state, deterministic, model_mode, normalize_y=False
+      )
+
+      logits_logical_axes = (
+          "activation_embed_and_logits_batch",
+          "activation_length",
+          "activation_vocab",
+      )
+      mtp_logits = sharding.maybe_shard_with_logical(
+          mtp_logits,
+          logits_logical_axes,
+          self.mesh,
+          cfg.shard_mode,
+          debug_sharding=cfg.debug_sharding,
+      )
+
+      mtp_xent = _cross_entropy_with_integer_labels(mtp_logits, rolled_target_ids)
+      mtp_xent = sharding.maybe_shard_with_logical(
+          mtp_xent,
+          ("activation_embed_and_logits_batch", "activation_length"),
+          self.mesh,
+          cfg.shard_mode,
+          debug_sharding=cfg.debug_sharding,
       )
       mtp_xent_masked = mtp_xent * rolled_target_mask
 
@@ -357,37 +664,3 @@ def calculate_mtp_acceptance_rate(intermediate_outputs, config):
   total_valid_tokens = jnp.sum(valid_mask)
 
   return (correct_predictions / (total_valid_tokens + EPS)) * 100
-
-
-def multi_token_prediction_block_as_linen(
-    *,
-    config: Config,
-    mesh: Mesh,
-    transformer_layer_module: Type[DecoderLayer],
-    decoder: nnx.Module,
-    rngs: nnx.Rngs,
-    name: str | None = None,
-) -> nn.Module:
-  """Initializes MultiTokenPredictionBlock as a Linen module.
-
-  Args:
-    config: Configuration object containing model hyperparameters.
-    mesh: JAX Mesh for model parallelism.
-    transformer_layer_module: The Transformer Decoder Layer class to use.
-    decoder: The decoder module that provides embedding and output head.
-    rngs: Random number generators for initialization.
-    name: Optional name for the module.
-
-  Returns:
-    An instance of MultiTokenPredictionBlock wrapped as a Linen module.
-  """
-  return nnx.bridge.to_linen(
-      MultiTokenPredictionBlock,
-      config=config,
-      mesh=mesh,
-      transformer_layer_module=transformer_layer_module,
-      decoder=decoder,
-      rngs=rngs,
-      metadata_fn=variable_to_logically_partitioned,
-      name=name,
-  )

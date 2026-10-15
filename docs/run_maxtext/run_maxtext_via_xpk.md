@@ -18,7 +18,17 @@
 
 # At scale with XPK
 
-This guide provides the recommended workflow for running MaxText on Google Kubernetes Engine (GKE) using the **Accelerated Processing Kit (XPK)**. For a complete reference on XPK, please see the [official XPK repository](https://github.com/AI-Hypercomputer/xpk).
+```{warning}
+This guide is kept for legacy compatibility only. The recommended path for new GKE deployments is [Running MaxText with Cluster Toolkit](run_maxtext_via_cluster_toolkit.md). XPK is deprecated and should not be used for new cluster provisioning or workload orchestration.
+
+For a direct Cluster Toolkit command reference, see [At scale with Cluster Toolkit](run_maxtext_via_cluster_toolkit.md). The XPK commands below are retained only for existing deployments.
+```
+
+## Cluster Toolkit replacement
+
+For new deployments, please refer to [Running MaxText with Cluster Toolkit](run_maxtext_via_cluster_toolkit.md).
+
+This guide documents the older workflow for running MaxText on Google Kubernetes Engine (GKE) using the **Accelerated Processing Kit (XPK)**. For a complete reference on XPK, please see the [official XPK repository](https://github.com/AI-Hypercomputer/xpk).
 
 ## Overview of the workflow
 
@@ -88,7 +98,7 @@ These commands configure your local environment to connect to Google Cloud servi
 2. **Install GKE auth plugin**
 
    ```
-   sudo apt-get update && sudo apt-get install google-cloud-sdk-gke-gcloud-auth-plugin
+   sudo apt-get update && sudo apt-get install google-cloud-cli-gke-gcloud-auth-plugin
    ```
 
 3. **Configure Docker credentials**
@@ -101,7 +111,7 @@ ______________________________________________________________________
 
 ## 3. Build the MaxText Docker image
 
-For instructions on building the MaxText Docker image, please refer to the [official documentation](https://maxtext.readthedocs.io/en/latest/build_maxtext.html).
+For instructions on building the MaxText Docker image, please refer to the [official documentation](build-docker).
 
 ______________________________________________________________________
 
@@ -115,77 +125,168 @@ This guide focuses on submitting workloads to an existing cluster. Cluster creat
 
 1. **Set your configuration**
 
-   ```
-   export PROJECT_ID="your-gcp-project-id"
-   export ZONE="your-gcp-zone" # e.g., us-central1-a
-   export CLUSTER_NAME="your-existing-cluster-name"
-   export BASE_OUTPUT_DIR="gs://your-output-bucket/"
-   export DATASET_PATH="gs://your-dataset-bucket/"
+   Set up the following environment variables to configure your training run. Replace
+   placeholders with your actual values.
+
+   ```bash
+   # -- Google Cloud Configuration --
+   # Your GCP project ID. Find it on the [Cloud Console Dashboard](https://console.cloud.google.com/home/dashboard).
+   # If you've already set it in your local config, you can retrieve it via:
+   # gcloud config get-value project
+   export PROJECT_ID=<GCP project ID>
+
+   # The GCP location (listed as "Location" in the UI) and name of your
+   # TPU-enabled (or GPU-enabled) GKE cluster. Both can be found on the
+   # [Cloud Console](https://console.cloud.google.com/kubernetes/list).
+   export ZONE=<GCP location> # e.g., 'us-central1' or 'us-central1-a'
+   export GKE_CLUSTER=<cluster name>
+
+   # -- Workload Configuration --
+   # An arbitrary string to identify this specific run.
+   # Note: Kubernetes requires workload names to be valid DNS labels (lowercase, no underscores or periods).
+   export RUN_NAME="maxtext-run-$(date +%Y%m%d-%H%M%S)"
+
+   # Number of TPU slices (for TPU clusters) or number of nodes (for GPU clusters)
+   export NUM_SLICES=1
+
+   # -- MaxText & Storage Configuration --
+   # Use a GCS bucket you own to store logs and checkpoints. Ideally in the same
+   # region as your TPUs to minimize latency and costs.
+   # You can list your buckets and their locations in the
+   # [Cloud Console](https://console.cloud.google.com/storage/browser).
+   export BASE_OUTPUT_DIRECTORY=<GCS_BUCKET> # e.g., gs://<my-bucket>/maxtext-runs
+   export DATASET_PATH="gs://<DATASET_PATH>/"
    ```
 
 2. **Configure gcloud CLI**
 
-   ```
+   ```bash
    gcloud config set project ${PROJECT_ID?}
    gcloud config set compute/zone ${ZONE?}
    ```
 
 ### A Note on multi-slice and multi-node runs
 
-The examples below run on a single TPU slice (`--num-slices=1`) or a small number of GPU nodes (`--num-nodes=2`). To scale your job to a larger, multi-host configuration, you simply increase these values.
+The examples below run on a single TPU slice (`--num-slices=1`) or a small number of GPU nodes (`--num-nodes=2`). To scale your job to a larger, multi-host configuration, you simply increase the `NUM_SLICES` value.
 
-For instance, to run a job across **four TPU slices**, you would change `--num-slices=1` to `--num-slices=4`. This tells XPK to allocate four `v5litepod-256` slices and orchestrate the training job across all of them as a single workload. Similarly, for GPUs, you would increase the `--num-nodes` value.
+For instance, to run a job across **four TPU slices**, you would change `export NUM_SLICES=1` to `export NUM_SLICES=4`. This tells XPK to allocate four `v5litepod-256` slices and orchestrate the training job across all of them as a single workload. Similarly, for GPUs, you would increase the value.
+
+```{note}
+If you installed `xpk` inside a Python virtual environment (`venv`), make sure to reactivate your virtual environment (e.g., `source <VENV_NAME>/bin/activate`) in any new terminal sessions before running `xpk` commands. Otherwise, you will encounter a `Command xpk not found` error.
+```
 
 3. **Create the workload (run the job)**
-
    - **On your TPU cluster:**
 
-     ```
-     xpk workload create\
-       --cluster ${CLUSTER_NAME?}\
-       --workload ${USER}-tpu-job\
-       --base-docker-image maxtext_base_image\
-       --tpu-type v5litepod-256\
-       --num-slices 1\
-       --command "python3 -m maxtext.trainers.pre_train.train run_name=${USER}-tpu-job base_output_directory=${BASE_OUTPUT_DIR?} dataset_path=${DATASET_PATH?} steps=100"
+     ```bash
+     xpk workload create \
+       --cluster ${GKE_CLUSTER?} \
+       --workload ${RUN_NAME?} \
+       --base-docker-image maxtext_base_image \
+       --tpu-type v5litepod-256 \
+       --num-slices ${NUM_SLICES?} \
+       --command "python3 -m maxtext.trainers.pre_train.train run_name=${RUN_NAME?} base_output_directory=${BASE_OUTPUT_DIRECTORY?} dataset_path=${DATASET_PATH?} steps=100"
      ```
 
    - **On your GPU cluster:**
 
-     ```
-     xpk workload create\
-       --cluster ${CLUSTER_NAME?}\
-       --workload ${USER}-gpu-job\
-       --base-docker-image maxtext_base_image\
-       --device-type h100-80gb-8\
-       --num-nodes 2\
-       --command "python3 -m maxtext.trainers.pre_train.train run_name=${USER}-gpu-job base_output_directory=${BASE_OUTPUT_DIR?} dataset_path=${DATASET_PATH?} steps=100"
+     ```bash
+     xpk workload create \
+       --cluster ${GKE_CLUSTER?} \
+       --workload ${RUN_NAME?} \
+       --base-docker-image maxtext_base_image \
+       --device-type h100-80gb-8 \
+       --num-nodes ${NUM_SLICES?} \
+       --command "python3 -m maxtext.trainers.pre_train.train run_name=${RUN_NAME?} base_output_directory=${BASE_OUTPUT_DIRECTORY?} dataset_path=${DATASET_PATH?} steps=100"
      ```
 
 ______________________________________________________________________
 
-## 5. Managing and monitoring your job
+## 6. Running with Ahead-of-Time (AOT) Compilation
+
+Ahead-of-Time (AOT) compilation can significantly reduce the startup time of your training job by pre-compiling the JAX training step for a specific hardware topology. The workflow involves generating a compiled artifact, including it in your Docker image, and then telling MaxText to use it at runtime.
+
+### Step 1: Generate the AOT artifact
+
+First, run `train_compile.py` script to create the compiled artifact for the specified TPU topology.
+
+```bash
+export WORKLOAD_NAME=<RUN_NAME>
+export TPU_TYPE="your-tpu-type" # e.g. "v5p-32"
+export NUM_SLICES=your-num-slices # e.g. 1
+export PER_DEVICE_BATCH_SIZE=your-batch-size # e.g. 1
+export USER=your-username
+
+python3 -m maxtext.trainers.pre_train.train_compile \
+  compile_topology=${TPU_TYPE?} \
+  compile_topology_num_slices=${NUM_SLICES?} \
+  compiled_trainstep_file=maxtext_${TPU_TYPE?}_aot.pickle \
+  per_device_batch_size=${PER_DEVICE_BATCH_SIZE?}
+```
+
+This will create a file named `maxtext_${TPU_TYPE?}_aot.pickle` in your MaxText root directory.
+
+### Step 2: Re-build and upload your Docker image
+
+The AOT artifact must be included in your Docker image. The `docker_upload_runner.sh` script automatically copies the contents of your MaxText directory into the image:
+
+```bash
+export CLOUD_IMAGE_NAME=<IMAGE_NAME>
+
+bash src/dependencies/scripts/docker_upload_runner.sh CLOUD_IMAGE_NAME=${CLOUD_IMAGE_NAME?}
+```
+
+### Step 3: Create the XPK workload with the AOT artifact
+
+Now, submit the workload as before, but add the `compiled_trainstep_file` argument to the command and use the custom Docker Image we built in step 2. This tells MaxText to load the pre-compiled step instead of compiling it at runtime.
+
+```bash
+export BASE_OUTPUT_DIR=your-output-dir # e.g. gs://your-output-bucket/
+export DATASET_PATH=your-dataset-path # e.g. gs://your-dataset-bucket/
+export CLUSTER_NAME=your-cluster-name
+export PROJECT_ID=your-project-id
+
+xpk workload create \
+  --cluster ${CLUSTER_NAME?} \
+  --workload ${WORKLOAD_NAME?} \
+  --docker-image "gcr.io/${PROJECT_ID?}/${CLOUD_IMAGE_NAME?}" \
+  --tpu-type ${TPU_TYPE?} \
+  --num-slices ${NUM_SLICES?} \
+  --command "python3 -m maxtext.trainers.pre_train.train \
+    run_name=${WORKLOAD_NAME?} \
+    base_output_directory=${BASE_OUTPUT_DIR?} \
+    dataset_path=${DATASET_PATH?} \
+    steps=100 \
+    per_device_batch_size=${PER_DEVICE_BATCH_SIZE?} \
+    compiled_trainstep_file=/deps/maxtext_${TPU_TYPE?}_aot.pickle"
+```
+
+Your job will now start faster by skipping the JAX compilation step on the cluster.
+
+______________________________________________________________________
+
+## 7. Managing and monitoring your job
 
 - **View logs in real-time:** The easiest way to see the output of your training job is through the Google Cloud Console.
 
-  1. Navigate to the **Kubernetes Engine** section.
+- 1. Navigate to the **Kubernetes Engine** section.
 
-  2. Go to **Workloads**.
+- 2. Go to **Workloads**.
 
-  3. Find your workload (e.g., `${USER}-tpu-job`) and click on it.
+  3. Find your workload (e.g., `${RUN_NAME?}`) and click on it.
 
-  4. Select the **Logs** tab to view the container logs.
+- 4. Select the **Logs** tab to view the container logs.
 
 - **List your jobs:**
 
-  ```
-  xpk workload list --cluster ${CLUSTER_NAME?}
+  ```bash
+  xpk workload list --cluster ${GKE_CLUSTER?}
   ```
 
-- **Analyze output:** Checkpoints and other artifacts will be saved to the Google Cloud Storage bucket you specified in `BASE_OUTPUT_DIR`.
+- **Analyze output:** Checkpoints and other artifacts will be saved to the Google Cloud Storage bucket you specified in `BASE_OUTPUT_DIRECTORY`.
 
 - **Delete a job:**
 
-  ```
-  xpk workload delete --cluster ${CLUSTER_NAME?} --workload <your-workload-name>
+  ```bash
+  xpk workload delete --cluster ${GKE_CLUSTER?} --workload ${RUN_NAME?}
   ```

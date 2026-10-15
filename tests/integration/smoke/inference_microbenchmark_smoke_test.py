@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" Smoke test for inference microbenchmark"""
+"""Smoke test for inference microbenchmark"""
 import jax
 import os.path
 import pytest
@@ -21,9 +21,13 @@ from absl.testing import absltest
 
 from maxtext.configs import pyconfig
 from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR, MAXTEXT_ASSETS_ROOT
-from maxtext.common.gcloud_stub import is_decoupled
+from maxtext.common.gcloud_stub import is_decoupled, jetstream
 
 pytestmark = [pytest.mark.external_serving]
+
+config_lib, _, _, _, _ = jetstream()
+if getattr(config_lib, "_IS_STUB", False):
+  pytest.skip("JetStream is not installed (stubbed)", allow_module_level=True)
 
 # Conditional import: only load when not in decoupled mode to avoid collection errors.
 # inference_microbenchmark depends on prefill_packing, which requires JetStream.

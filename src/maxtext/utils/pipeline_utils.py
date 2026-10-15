@@ -14,11 +14,9 @@
 
 """Pipeline layer wrapping a decoder layer(s). Supports circular pipelining"""
 
-import functools
 import jax
 from jax.sharding import PartitionSpec as P
-from flax import linen as nn
-from flax.linen.spmd import LogicallyPartitioned
+from flax import nnx
 
 
 def get_mesh_axis_dim_indices(physical_partition_spec, axis_name="fsdp"):
@@ -148,20 +146,6 @@ def strip_pipeline_repeat_logical_axis(full_logical_spec):
   return jax.tree.map(_remove_from_spec, full_logical_spec)
 
 
-# TODO(chengnuojin) Remove this function and its usage after pipeline nnx migration
-def remove_logically_partition(weights):
-  """Removes LogicallyPartitioned wrapper from weights."""
-
-  def _remove_logically_partition_leaf(v):
-    return getattr(v, "value") if isinstance(v, LogicallyPartitioned) else v
-
-  return jax.tree.map(
-      _remove_logically_partition_leaf,
-      weights,
-      is_leaf=lambda v: isinstance(v, LogicallyPartitioned),
-  )
-
-
 def create_gradient_accumulation_scan(
     model,
     length,
@@ -193,148 +177,200 @@ def create_gradient_accumulation_scan(
     A JAX custom_vjp function that executes the `length` pipeline iterations.
   """
 
-  @functools.partial(jax.custom_vjp)
-  def run_single_microbatch_custom(lightweight_state, bsw, weights, pos_arg, seg_arg):
-    return run_single_microbatch_custom_fwd(lightweight_state, bsw, weights, pos_arg, seg_arg)[0]
+  @jax.custom_vjp
+  def run_single_microbatch_custom(lightweight_state, bsw, pos_arg, seg_arg):
+    return run_single_microbatch_custom_fwd(lightweight_state, bsw, pos_arg, seg_arg)[0]
 
-  def run_single_microbatch_custom_fwd(lightweight_state, bsw, weights, pos_arg, seg_arg):
-    def _run(l, b, w):
+  def run_single_microbatch_custom_fwd(lightweight_state, bsw, pos_arg, seg_arg):
+    def _run(l, b):
       out = model.run_one_iteration(
-          l, b, w, pos_arg, seg_arg, deterministic, model_mode, logical_partition_spec=logical_partition_spec
+          l, b, pos_arg, seg_arg, deterministic, model_mode, logical_partition_spec=logical_partition_spec
       )
-      return out, b, w
+      return out
 
     # Rematerialize the inner step to save activation memory
-    _run_remat = jax.remat(_run, prevent_cse=False, policy=model.get_pipeline_remat_policy())
-    out, vjp_fun = jax.vjp(_run_remat, lightweight_state, bsw, weights)
+    _run_remat = jax.remat(_run, policy=model.get_pipeline_remat_policy())
+    out, vjp_fun = jax.vjp(_run_remat, lightweight_state, bsw)
     return out, vjp_fun
 
   def run_single_microbatch_custom_bwd(res, g_out):
     vjp_fun = res
-    d_l, d_b, d_w = vjp_fun(g_out)
-    return d_l, d_b, d_w, None, None
+    d_l, d_b = vjp_fun(g_out)
+    return d_l, d_b, None, None
 
   run_single_microbatch_custom.defvjp(run_single_microbatch_custom_fwd, run_single_microbatch_custom_bwd)
 
-  @functools.partial(jax.custom_vjp)
-  def run_pipeline_microbatches_custom(loop_state, bsw, weights, positions, segment_ids):
-    return run_pipeline_microbatches_custom_fwd(loop_state, bsw, weights, positions, segment_ids)[0]
+  @jax.custom_vjp
+  def run_pipeline_microbatches_custom(loop_state, bsw, positions, segment_ids):
+    return run_pipeline_microbatches_custom_fwd(loop_state, bsw, positions, segment_ids)[0]
 
-  def run_pipeline_microbatches_custom_fwd(loop_state, bsw, weights, positions, segment_ids):
+  def run_pipeline_microbatches_custom_fwd(loop_state, bsw, positions, segment_ids):
     final_lightweight, scan_vjp_fun = jax.vjp(
-        lambda l, b, w: jax.lax.scan(
-            lambda carry, _: (run_single_microbatch_custom(carry, b, w, positions, segment_ids)[0], None),
+        lambda l, b: jax.lax.scan(
+            lambda carry, _: (run_single_microbatch_custom(carry, b, positions, segment_ids), None),
             l,
             None,
             length=length,
         )[0],
         loop_state,
         bsw,
-        weights,
     )
 
-    return (final_lightweight, bsw, weights), scan_vjp_fun
+    return (final_lightweight, bsw), scan_vjp_fun
 
   def run_pipeline_microbatches_custom_bwd(residuals, g_final_state):
     scan_vjp_fun = residuals
-    g_lightweight, g_bsw, g_weights = g_final_state
-    d_init_lightweight, d_init_bsw, d_init_weights = scan_vjp_fun(g_lightweight)
+    g_lightweight, g_bsw = g_final_state
+    d_init_lightweight, d_init_bsw = scan_vjp_fun(g_lightweight)
 
     d_init_bsw = jax.tree.map(lambda d, g: d + g if hasattr(d, "shape") else d, d_init_bsw, g_bsw)
-    d_init_weights = jax.tree.map(lambda d, g: d + g if hasattr(d, "shape") else d, d_init_weights, g_weights)
 
-    return (d_init_lightweight, d_init_bsw, d_init_weights, None, None)
+    return (d_init_lightweight, d_init_bsw, None, None)
 
   run_pipeline_microbatches_custom.defvjp(run_pipeline_microbatches_custom_fwd, run_pipeline_microbatches_custom_bwd)
   return run_pipeline_microbatches_custom
 
 
-def create_rematerialized_pipeline_stage(
-    model,
-    run_iteration_scannable,
-    length,
-    deterministic,
-    model_mode,
-    logical_partition_spec,
-    physical_partition_spec,
-    positions,
-    segment_ids,
-):
-  """Builds a memory-checkpointed execution block for a single pipeline stage.
+def is_static_param(path, v):
+  """Predicate matching nnx.Param and FP8 _overwrite_with_gradient variables.
 
-  This function prepares the state for a specific chunk of pipeline execution by:
-  1. Prefetching the required weights for the current stage/loop iteration.
-  2. Executing `length` microbatches using either a memory-efficient `jax.lax.scan`
-     (if `scan_pipeline_iterations` is True) or an unrolled Python `for` loop.
-  3. Wrapping the entire stage block in `flax.linen.remat` to discard and recompute
-     activations during the backward pass based on the model's policy.
+  Used throughout the pipeline to split state into trainable params vs other state.
+  Must be consistent everywhere to prevent tree structure mismatches.
+  """
+  return isinstance(v, nnx.Param) or type(v).__name__ == "_overwrite_with_gradient"
+
+
+def advance_rng_state(state, iteration):
+  """Fold loop_iteration into all RNG keys to produce unique dropout masks per scan step.
+
+  jax.lax.scan has no split_rngs mechanism (unlike Linen's nn.scan), so every
+  iteration would otherwise see the same dropout mask. This mirrors the effect
+  of ``nn.scan(split_rngs={"random": True})`` from the Linen pipeline.
+
+  Only typed PRNG key variables (``RngKey``) are folded. RNG counters
+  (``RngCount``) are uint32 arrays and must be left untouched -- calling
+  ``jax.random.fold_in`` on raw uint32 data triggers a PRNG-impl shape
+  mismatch (e.g. shape ``(N, 2)`` vs ``unsafe_rbg`` expecting ``(4,)``).
 
   Args:
-    model: The model instance containing configuration and prefetching logic.
-    run_iteration_scannable: A fallback function for executing a single iteration unrolled.
-    length: The number of microbatches to process in this stage.
-    deterministic: Whether to run deterministically (e.g., disable dropout).
-    model_mode: The operational mode (e.g., 'train').
-    logical_partition_spec: Rules for logical tensor sharding.
-    physical_partition_spec: Rules for physical device mesh mappings (used in prefetching).
-    positions: Position IDs for the sequence.
-    segment_ids: Segment/Attention routing IDs for the sequence.
+    state: An ``nnx.State`` (or partition thereof) that may contain
+        ``nnx.RngState`` variable entries whose ``.value`` is a JAX PRNG key.
+    iteration: A scalar integer (the loop counter) folded into each key via
+        ``jax.random.fold_in``.
 
   Returns:
-    A function decorated with `nn.remat` that takes `(model, loop_state)` and returns
-    the updated `loop_state`.
+    A new state with the same tree structure, where every typed PRNG key
+    entry has a unique key derived from the original key and *iteration*.
   """
 
-  def execute_pipeline_stage(model, loop_state_and_bsw_and_weights):
-    loop_state, bsw, weights = loop_state_and_bsw_and_weights
-    # Retrieve the specific weights needed for this pipeline chunk
-    bsw = model.weight_prefetching(weights, physical_partition_spec, loop_state["loop_iteration"])
+  def _fold_if_rng(x):
+    if isinstance(x, nnx.Variable) and issubclass(x.type, nnx.RngState):
+      val = x.value
+      if jax.dtypes.issubdtype(val.dtype, jax.dtypes.prng_key):
 
-    if model.config.scan_pipeline_iterations:
-      scan_microbatches_fn = create_gradient_accumulation_scan(
-          model=model,
-          length=length,
-          deterministic=deterministic,
-          model_mode=model_mode,
-          logical_partition_spec=logical_partition_spec,
-      )
-      loop_state, bsw, weights = scan_microbatches_fn(loop_state, bsw, weights, positions, segment_ids)
+        def folded(k):
+          return jax.random.fold_in(k, iteration)
+
+        for _ in range(val.ndim):
+          folded = jax.vmap(folded)
+        return x.replace(value=folded(val))
+    return x
+
+  return jax.tree.map(_fold_if_rng, state, is_leaf=lambda x: isinstance(x, nnx.Variable))
+
+
+def is_spec_leaf(x):
+  """Predicate matching leaves in the bsw_pps treedef, which can be either P or None (if no sharding)."""
+  return isinstance(x, P) or x is None
+
+
+def flatten_nnx_state(state):
+  """Flatten nnx.State to (arrays, treedef, is_var_flags, var_types, var_metadata).
+
+  Returns raw arrays and Python-only metadata for reconstruction.
+  var_metadata: list of dicts with Variable field metadata (NO .raw_value).
+  Captures: nothing (pure function on inputs).
+  """
+
+  def _is_var(x):
+    return isinstance(x, nnx.Variable)
+
+  leaves_with_path, treedef = jax.tree_util.tree_flatten_with_path(state, is_leaf=_is_var)
+  arrays = []
+  is_var_flags = []
+  var_types = []
+  var_metadata = []
+  for _, leaf in leaves_with_path:
+    if isinstance(leaf, nnx.Variable):
+      arrays.append(leaf.value)
+      is_var_flags.append(True)
+      var_types.append(type(leaf))
+      var_metadata.append(dict(leaf._var_metadata))  # pylint: disable=protected-access
     else:
-      for _ in range(length):
-        (loop_state, bsw, weights), _ = run_iteration_scannable(model, loop_state, bsw, weights)
-    return (loop_state, bsw, weights), None
-
-  return nn.remat(
-      execute_pipeline_stage,
-      prevent_cse=not model.config.scan_pipeline_iterations,
-      policy=model.get_pipeline_remat_policy(),
-  )
+      arrays.append(leaf)
+      is_var_flags.append(False)
+      var_types.append(None)
+      var_metadata.append({})
+  return arrays, treedef, is_var_flags, var_types, var_metadata
 
 
-def create_flax_pipeline_scan(pipeline_stage_fn, length):
-  """Wraps the pipeline stage execution in a `flax.linen.scan`.
+def unflatten_nnx_state(arrays, treedef, is_var_flags, var_types, var_metadata):
+  """Reconstruct nnx.State from flattened arrays + metadata.
 
-  This lifts the pipeline stage function so it can be repeated sequentially over
-  the specified length. It safely handles Flax-specific state collections, ensuring
-  that metrics, intermediate values, and PRNG keys do not collide or overwrite
-  each other across the loop iterations.
-
-  Args:
-    pipeline_stage_fn: The function representing a single pipeline stage
-                       (usually created by `create_rematerialized_pipeline_stage`).
-    length: The total number of pipeline stages/repeats to scan over.
-
-  Returns:
-    A Flax scanned function that executes the full pipeline schedule.
+  Does NOT reference any nnx.Variable objects from the original state.
+  var_metadata contains only Python objects (no JAX arrays).
+  Captures: nothing (pure function on inputs).
   """
-  return nn.scan(
-      pipeline_stage_fn,
-      variable_axes={
-          "summaries": 0,
-          "aux_loss": 0,
-          "intermediates": 0,
-          "hyper_params": 0,
-      },
-      split_rngs={"random": True},
-      length=length,
+  new_leaves = []
+  for arr, is_var, vtype, meta in zip(arrays, is_var_flags, var_types, var_metadata):
+    if is_var and vtype is not None:
+      new_leaves.append(vtype(arr, **meta))
+    else:
+      new_leaves.append(arr)
+  return treedef.unflatten(new_leaves)
+
+
+def arrays_to_linen_collection(arrays, keys):
+  """Convert list of arrays + key names to a Linen-style flat dict.
+
+  Captures: nothing (pure function).
+  """
+  return dict(zip(keys, arrays))
+
+
+def linen_collection_to_arrays(collection, keys):
+  """Extract arrays from Linen-style flat dict in key order.
+
+  Captures: nothing (pure function).
+  """
+  return [collection[k] for k in keys]
+
+
+# ---------------------------------------------------------------------------
+# Non-pytree context: holds Python-only attributes from the pipeline module.
+# NNX modules are JAX pytrees — capturing them in lift.scan closures leaks
+# JIT-level tracers from self.layers. This wrapper is NOT a JAX pytree,
+# so JAX never tries to flatten it.
+# ---------------------------------------------------------------------------
+
+
+class PipelineContext:
+  """Non-pytree wrapper holding pipeline methods + Python config.
+
+  Created from an NNXCircularPipeline ONCE before entering transforms.
+  Captures ONLY bound methods (which internally access config/mesh/Python attrs)
+  and Python objects. No nnx.Variable or JAX arrays.
+  """
+
+  __slots__ = (
+      "weight_prefetching",
+      "run_one_iteration",
+      "from_all_variables_to_repeat_weights",
+      "from_repeat_weights_to_bsw",
   )
+
+  def __init__(self, pipeline_module):
+    self.weight_prefetching = pipeline_module.weight_prefetching
+    self.run_one_iteration = pipeline_module.run_one_iteration
+    self.from_all_variables_to_repeat_weights = pipeline_module.from_all_variables_to_repeat_weights
+    self.from_repeat_weights_to_bsw = pipeline_module.from_repeat_weights_to_bsw

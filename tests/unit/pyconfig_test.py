@@ -15,11 +15,16 @@
 """Tests for pyconfig."""
 
 import os.path
+import subprocess
+import sys
 import tempfile
 import unittest
+import yaml
 
 from maxtext.configs import pyconfig
 from maxtext.configs.pyconfig import resolve_config_path, _CONFIG_FILE_MAPPING, _module_from_path
+from maxtext.configs.types import _normalize_axes, _resolved_fsdp_size, infer_cp_axes, infer_ep_axes
+from maxtext.input_pipeline import data_processing_utils
 from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR, MAXTEXT_PKG_DIR
 from tests.utils.test_helpers import get_test_config_path, get_post_train_test_config_path
 
@@ -35,6 +40,136 @@ class PyconfigTest(unittest.TestCase):
     )
 
     self.assertTrue(config.quantization is None or config.quantization == "")
+
+  def test_gmm_v2_heuristic_tiling_requires_gmm_v2(self):
+    with self.assertRaisesRegex(ValueError, "`use_gmm_v2_heuristic_tiling=True` requires `use_gmm_v2=True`."):
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          use_gmm_v2_heuristic_tiling=True,
+          use_gmm_v2=False,
+      )
+
+  def test_step_dropless_fallback_rejects_unreplayable_combinations(self):
+    def initialize(**kwargs):
+      return pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          skip_jax_distributed_system=True,
+          model_name="mixtral-8x7b",
+          megablox=True,
+          sparse_matmul=True,
+          use_ring_of_experts=True,
+          use_ragged_sort=True,
+          ici_expert_parallelism=2,
+          ragged_buffer_factor=1.0,
+          moe_dropless_fallback="step",
+          **kwargs,
+      )
+
+    self.assertEqual(initialize().moe_dropless_fallback, "step")
+    for overrides, message in (
+        ({"enable_diloco": True, "dcn_diloco_parallelism": 2}, "not supported with enable_diloco"),
+        ({"compiled_trainstep_file": "/tmp/train_step.pickle"}, "not supported with compiled_trainstep_file"),
+        ({"optimizer_memory_host_offload": True}, "not supported with optimizer_memory_host_offload"),
+        ({"parameter_memory_host_offload": True}, "or parameter_memory_host_offload"),
+    ):
+      with self.subTest(**overrides), self.assertRaisesRegex(ValueError, message):
+        initialize(**overrides)
+
+  def test_gdn_context_parallelism_rejects_load_balance(self):
+    """The reorder composes the GatedDeltaNet recurrence out of order.
+
+    context_parallel_load_balance defaults to true, so this has to raise rather
+    than warn: the run trains either way and the loss falls either way.
+    """
+    with self.assertRaisesRegex(ValueError, "requires context_parallel_load_balance=False"):
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          model_name="qwen3-next-80b-a3b",
+          ici_context_parallelism=4,
+          context_parallel_load_balance=True,
+      )
+
+  def test_gdn_context_parallelism_accepts_load_balance_off(self):
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        model_name="qwen3-next-80b-a3b",
+        ici_context_parallelism=4,
+        context_parallel_load_balance=False,
+        skip_jax_distributed_system=True,
+    )
+    self.assertFalse(config.context_parallel_load_balance)
+
+  def test_load_parameters_path_allowed_without_checkpointing(self):
+    """A warm start does not go through the CheckpointManager.
+
+    `load_parameters_path` is restored by its own `ocp.Checkpointer` inside
+    `model_creation_utils.from_pretrained`, so it must stay legal to warm start
+    from a checkpoint while never writing one back.
+    """
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        load_parameters_path="gs://some-bucket/some-run/0/items",
+        enable_checkpointing=False,
+        skip_jax_distributed_system=True,
+    )
+    self.assertFalse(config.enable_checkpointing)
+    self.assertEqual(config.load_parameters_path, "gs://some-bucket/some-run/0/items")
+
+  def test_load_full_state_path_still_requires_checkpointing(self):
+    """A full-state resume does read through the CheckpointManager."""
+    with self.assertRaisesRegex(ValueError, "enable_checkpointing=True to resume from load_full_state_path"):
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          load_full_state_path="gs://some-bucket/some-run/0/items",
+          enable_checkpointing=False,
+      )
+
+  def test_load_parameters_path_allowed_with_checkpointing(self):
+    """The pre-existing combination keeps working."""
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        load_parameters_path="gs://some-bucket/some-run/0/items",
+        enable_checkpointing=True,
+        skip_jax_distributed_system=True,
+    )
+    self.assertTrue(config.enable_checkpointing)
+
+  def test_managed_mldiagnostics_storage_path(self):
+    # Test completely omitting the parameter (defaults to "" from base.yml)
+    config_omitted = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        run_name="test_run_1",
+        base_output_directory="gs://base_dir1",
+        skip_jax_distributed_system=True,
+    )
+    self.assertEqual(
+        config_omitted.managed_mldiagnostics_dir,
+        "gs://base_dir1/test_run_1/managed-mldiagnostics",
+    )
+
+    config_none = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        run_name="test_run_2",
+        base_output_directory="gs://base_dir2",
+        managed_mldiagnostics_storage_path="",
+        skip_jax_distributed_system=True,
+    )
+    self.assertEqual(
+        config_none.managed_mldiagnostics_dir,
+        "gs://base_dir2/test_run_2/managed-mldiagnostics",
+    )
+
+    config_custom = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        run_name="test_run_3",
+        base_output_directory="gs://base_dir3",
+        managed_mldiagnostics_storage_path="gs://custom_base",
+        skip_jax_distributed_system=True,
+    )
+    self.assertEqual(
+        config_custom.managed_mldiagnostics_dir,
+        "gs://custom_base/test_run_3/managed-mldiagnostics",
+    )
 
   def test_multiple_unmodifiable_configs(self):
     config_train = pyconfig.initialize(
@@ -74,6 +209,52 @@ class PyconfigTest(unittest.TestCase):
     with self.assertRaises(ValueError):
       config_inference.ici_fsdp_parallelism = 4
 
+  def _zero1_config(self, **kwargs):
+    return pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        shard_optimizer_over_data=True,
+        **kwargs,
+    )
+
+  def test_zero1_without_fsdp_is_allowed(self):
+    """Data-parallel-only Zero-1 is the supported configuration."""
+    config = self._zero1_config(ici_data_parallelism=-1, ici_fsdp_parallelism=1)
+    self.assertTrue(config.shard_optimizer_over_data)
+
+  def test_zero1_with_mesh_axes_omitting_fsdp_allowed(self):
+    """Custom mesh_axes that omit 'fsdp' or 'fsdp_transpose' do not raise KeyError."""
+    self.assertEqual(_resolved_fsdp_size(["data", "tensor"], [2, 4], 8), 1)
+
+  def test_zero1_with_fsdp_raises_error(self):
+    """Zero-1 shards the optimizer moments over "data" on top of the parameter layout.
+
+    FSDP shards the parameters over "fsdp", so the two together leave the gradients
+    sharded P('fsdp', ...) while the moments they are added to are sharded
+    P(('data', 'fsdp'), ...) — an outright type error under explicit sharding, and an
+    extra collective under auto. The combination is refused when the config is built.
+    """
+    with self.assertRaisesRegex(ValueError, "cannot be combined with FSDP"):
+      self._zero1_config(ici_data_parallelism=1, ici_fsdp_parallelism=2)
+
+  def test_zero1_with_fsdp_transpose_raises_error(self):
+    with self.assertRaisesRegex(ValueError, "cannot be combined with FSDP"):
+      self._zero1_config(ici_data_parallelism=1, ici_fsdp_parallelism=1, ici_fsdp_transpose_parallelism=2)
+
+  def test_zero1_with_autofilled_fsdp_raises_error(self):
+    """`ici_fsdp_parallelism=-1` absorbs whatever data parallelism leaves behind.
+
+    The check has to resolve the -1 the way mesh creation later will, otherwise this
+    config — four-way FSDP on a v5p-8 — would slip through and fail at trace time.
+    """
+    with self.assertRaisesRegex(ValueError, "cannot be combined with FSDP"):
+      self._zero1_config(
+          compile_topology="v5p-8",
+          compile_topology_num_slices=1,
+          ici_data_parallelism=2,
+          ici_fsdp_parallelism=-1,
+      )
+
   def test_overriding_model(self):
     config = pyconfig.initialize(
         [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
@@ -83,8 +264,19 @@ class PyconfigTest(unittest.TestCase):
         base_emb_dim=1024,  # Defined as 3072 in gemma-7b
     )
 
-    self.assertEqual(config.base_emb_dim, 1024)
-    self.assertEqual(config.base_mlp_dim, 24576)
+    self.assertEqual(config.base_emb_dim, 1024)  # override
+    self.assertEqual(config.base_mlp_dim, 24576)  # unchanged
+
+  def test_overriding_model_raises_error(self):
+    """Test that overriding a model config with override_model_config=False raises an error."""
+    with self.assertRaises(ValueError):
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          skip_jax_distributed_system=True,
+          model_name="gemma-7b",
+          override_model_config=False,
+          base_emb_dim=1024,  # Defined as 3072 in gemma-7b
+      )
 
   def test_overriding_model_in_sft(self):
     # TODO: Update MAXTEXT_PKG_DIR after repo restructuring is complete.
@@ -93,10 +285,104 @@ class PyconfigTest(unittest.TestCase):
         skip_jax_distributed_system=True,
         model_name="llama3.1-8b",
         override_model_config=True,
+        base_emb_dim=1024,  # Defined as 4096 in llama3.1-8b
     )
 
-    self.assertEqual(config.base_emb_dim, 4096)
-    self.assertEqual(config.base_mlp_dim, 14336)
+    self.assertEqual(config.base_emb_dim, 1024)  # override
+    self.assertEqual(config.base_mlp_dim, 14336)  # unchanged
+
+  def test_tokenizer_path_resolution_for_qwen3_base(self):
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        model_name="qwen3-30b-a3b-base",
+    )
+    self.assertEqual(config.tokenizer_path, "Qwen/Qwen3-30B-A3B-Base")
+
+  def test_explicit_sharding_qwen3_decoder_support(self):
+    """The Qwen3 decoders that have been onboarded to explicit sharding are accepted."""
+    for decoder_block in (
+        "qwen3",
+        "qwen3_moe",
+        "qwen3_custom_moe",
+        "qwen3_5",
+        "qwen3_next",
+    ):
+      with self.subTest(decoder_block=decoder_block):
+        config = pyconfig.initialize(
+            [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+            skip_jax_distributed_system=True,
+            shard_mode="explicit",
+            decoder_block=decoder_block,
+        )
+        self.assertEqual(config.decoder_block.value, decoder_block)
+
+    # The Qwen3-VL/Omni encoders are multimodal and are not onboarded yet.
+    with self.assertRaisesRegex(Exception, "not supported with `use_multimodal`"):
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          skip_jax_distributed_system=True,
+          shard_mode="explicit",
+          model_name="qwen3-vl-4b",
+          override_model_config=True,
+          use_multimodal=True,
+          scan_layers=False,  # Required by the Qwen3-VL deepstack path; unrelated to sharding.
+      )
+
+  def test_explicit_sharding_gated_delta_net_unsupported_combinations(self):
+    """The hybrid Qwen3 decoders reject the combinations they have not been onboarded to."""
+    for decoder_block in ("qwen3_5", "qwen3_next"):
+
+      def initialize(decoder_block=decoder_block, **kwargs):
+        return pyconfig.initialize(
+            [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+            skip_jax_distributed_system=True,
+            shard_mode="explicit",
+            decoder_block=decoder_block,
+            **kwargs,
+        )
+
+      with self.subTest(decoder_block=decoder_block):
+        with self.assertRaisesRegex(Exception, "requires `sparse_matmul=True`"):
+          initialize(sparse_matmul=False, megablox=False)
+
+        with self.assertRaisesRegex(Exception, "does not support context parallelism"):
+          initialize(ici_context_parallelism=2)
+
+        with self.assertRaisesRegex(Exception, "does not support context parallelism"):
+          initialize(ici_context_usp_ulysses_parallelism=2)
+
+  def test_explicit_sharding_mistral_decoder_support(self):
+    """The Mistral-family decoders that have been onboarded to explicit sharding are accepted."""
+    for decoder_block in ("mistral", "mixtral"):
+      with self.subTest(decoder_block=decoder_block):
+        config = pyconfig.initialize(
+            [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+            skip_jax_distributed_system=True,
+            shard_mode="explicit",
+            decoder_block=decoder_block,
+        )
+        self.assertEqual(config.decoder_block.value, decoder_block)
+
+  def test_explicit_sharding_qwen2_decoder_support(self):
+    """The Qwen2 decoder is accepted under explicit sharding."""
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        shard_mode="explicit",
+        decoder_block="qwen2",
+    )
+    self.assertEqual(config.decoder_block.value, "qwen2")
+
+  def test_explicit_sharding_kimi_k2_support(self):
+    """Kimi-K2 runs on the deepseek decoder block, so it is accepted under explicit sharding."""
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        shard_mode="explicit",
+        model_name="kimi-k2-1t",
+    )
+    self.assertEqual(config.decoder_block.value, "deepseek")
 
   def test_resolve_config_path(self):
     self.assertEqual(resolve_config_path("foo"), os.path.join("src", "foo"))
@@ -121,14 +407,435 @@ class PyconfigTest(unittest.TestCase):
       self.assertTrue(os.path.isfile(full_path), f"Default config for '{module}' not found at {full_path}")
 
   def test_module_from_path(self):
-    import maxtext.trainers.pre_train.train as train_module
+    import maxtext.trainers.pre_train.train as train_module  # pylint: disable=import-outside-toplevel
+
     module_file = train_module.__file__
     result = _module_from_path(module_file)
     self.assertEqual(result, "maxtext.trainers.pre_train.train")
 
-  def test_unknown_module_raises(self):
+  def test_train_import_without_tensorflow(self):
+    """Verifies that importing the pre-training entrypoint does not require TensorFlow.
+
+    This runs in a subprocess because TensorFlow may already be cached in the main process.
+    The subprocess temporarily replaces Python's built-in import function with
+    a wrapper that raises ``ModuleNotFoundError`` only for TensorFlow imports.
+    A successful subprocess proves that ``train`` remains importable and sets
+    ``_TF_AVAILABLE`` to False when TensorFlow is absent.
+    """
+    script = """
+import builtins
+
+# Save Python's real import function so non-TensorFlow imports continue to work.
+original_import = builtins.__import__
+
+
+def import_without_tensorflow(name, *args, **kwargs):
+  if name == "tensorflow" or name.startswith("tensorflow."):
+    raise ModuleNotFoundError("TensorFlow blocked by test")
+  return original_import(name, *args, **kwargs)
+
+
+# Simulate TensorFlow not being installed for the remainder of this subprocess.
+builtins.__import__ = import_without_tensorflow
+
+from maxtext.trainers.pre_train import train
+
+assert train._TF_AVAILABLE is False
+"""
+
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+  def test_hlo_dump_module_names_none_coercion(self):
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        dump_hlo_local_module_name=None,
+        dump_hlo_module_name=None,
+    )
+    self.assertEqual(config.dump_hlo_local_module_name, "")
+    self.assertEqual(config.dump_hlo_module_name, "")
+
+  def test_unknown_module_falls_back_to_base_yml(self):
+    """An unknown module should fall back to base.yml with a warning (not raise)."""
+    config = pyconfig.initialize_pydantic(["/custom_rl/module.py", "run_name=test", "skip_jax_distributed_system=True"])
+    self.assertEqual(config.run_name, "test")
+
+  def test_identical_override_allowed(self):
+    """Test that overriding a model config key with an identical value is allowed."""
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        model_name="qwen3-8b",
+        override_model_config=False,
+        tokenizer_type="huggingface",  # Defined as huggingface in qwen3-8b
+    )
+    self.assertEqual(config.tokenizer_type, "huggingface")
+
+  def test_list_config_coercion(self):
+    """Verifies that string/tuple inputs for list[str] config fields are coerced to lists."""
+    # Case 1: Plain string (coerced to single-item list)
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        train_data_columns="messages",
+    )
+    self.assertEqual(config.train_data_columns, ["messages"])
+
+    # Case 2: Stringified list literal
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        train_data_columns="['col1', 'col2']",
+    )
+    self.assertEqual(config.train_data_columns, ["col1", "col2"])
+
+    # Case 3: Stringified list literal with whitespace
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        train_data_columns="[ 'col1' ,    'col2' ]",
+    )
+    self.assertEqual(config.train_data_columns, ["col1", "col2"])
+
+    # Case 4: Stringified tuple literal
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        train_data_columns="('col1', 'col2')",
+    )
+    self.assertEqual(config.train_data_columns, ["col1", "col2"])
+
+    # Case 5: Real tuple value (passed via kwargs)
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        train_data_columns=("col1", "col2"),
+    )
+    self.assertEqual(config.train_data_columns, ["col1", "col2"])
+
+    # Case 6: Malformed stringified list (falls back to wrapping as single-item list)
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        train_data_columns="[malformed, list",
+    )
+    self.assertEqual(config.train_data_columns, ["[malformed, list"])
+
+  def test_coerced_list_is_validated_successfully(self):
+    """Verifies that a coerced list from pyconfig is successfully validated by the dataset pipeline."""
+    # Simulate a user passing `train_data_columns=messages` on the CLI
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        train_data_columns="messages",
+    )
+    # Verify coercion to list was successful
+    self.assertEqual(config.train_data_columns, ["messages"])
+
+    # Verify that passing this coerced list to the SFT column validator passes without error (Scenario A)
+    data_processing_utils.validate_and_configure_sft_columns(config.train_data_columns, None)
+
+  def test_local_sa_flags_inherit_from_global_when_unset(self):
+    """local_sa_* flags default to None and should inherit the corresponding sa_* value."""
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        sa_block_q=64,
+        sa_block_kv=128,
+        sa_block_kv_compute=192,
+        sa_block_q_dkv=64,
+        sa_block_kv_dkv=128,
+        sa_block_kv_dkv_compute=192,
+        sa_block_q_dq=64,
+        sa_block_kv_dq=128,
+        sa_use_fused_bwd_kernel=True,
+        sa_q_layout="HEAD_DIM_MINOR",
+        sa_k_layout="HEAD_DIM_MINOR",
+        sa_v_layout="HEAD_DIM_MINOR",
+        use_splash_scheduler=True,
+    )
+    self.assertEqual(config.local_sa_block_q, 64)
+    self.assertEqual(config.local_sa_block_kv, 128)
+    self.assertEqual(config.local_sa_block_kv_compute, 192)
+    self.assertEqual(config.local_sa_block_q_dkv, 64)
+    self.assertEqual(config.local_sa_block_kv_dkv, 128)
+    self.assertEqual(config.local_sa_block_kv_dkv_compute, 192)
+    self.assertEqual(config.local_sa_block_q_dq, 64)
+    self.assertEqual(config.local_sa_block_kv_dq, 128)
+    self.assertTrue(config.local_sa_use_fused_bwd_kernel)
+    self.assertEqual(config.local_sa_q_layout, "HEAD_DIM_MINOR")
+    self.assertEqual(config.local_sa_k_layout, "HEAD_DIM_MINOR")
+    self.assertEqual(config.local_sa_v_layout, "HEAD_DIM_MINOR")
+    self.assertTrue(config.local_use_splash_scheduler)
+
+  def test_local_sa_flags_explicit_override(self):
+    """Explicitly set local_sa_* flags should not be overridden by the global sa_* value."""
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        sa_block_q=512,
+        local_sa_block_q=64,
+        sa_block_kv=512,
+        local_sa_block_kv=128,
+        sa_block_kv_compute=512,
+        local_sa_block_kv_compute=192,
+        sa_block_q_dkv=512,
+        local_sa_block_q_dkv=64,
+        sa_block_kv_dkv=512,
+        local_sa_block_kv_dkv=128,
+        sa_block_kv_dkv_compute=512,
+        local_sa_block_kv_dkv_compute=192,
+        sa_block_q_dq=512,
+        local_sa_block_q_dq=64,
+        sa_block_kv_dq=512,
+        local_sa_block_kv_dq=128,
+        sa_use_fused_bwd_kernel=False,
+        local_sa_use_fused_bwd_kernel=True,
+        sa_q_layout="HEAD_DIM_MINOR",
+        local_sa_q_layout="SEQ_MINOR",
+        sa_k_layout="HEAD_DIM_MINOR",
+        local_sa_k_layout="SEQ_MINOR",
+        sa_v_layout="HEAD_DIM_MINOR",
+        local_sa_v_layout="SEQ_MINOR",
+        use_splash_scheduler=True,
+        local_use_splash_scheduler=False,
+    )
+    self.assertEqual(config.local_sa_block_q, 64)
+    self.assertEqual(config.local_sa_block_kv, 128)
+    self.assertEqual(config.local_sa_block_kv_compute, 192)
+    self.assertEqual(config.local_sa_block_q_dkv, 64)
+    self.assertEqual(config.local_sa_block_kv_dkv, 128)
+    self.assertEqual(config.local_sa_block_kv_dkv_compute, 192)
+    self.assertEqual(config.local_sa_block_q_dq, 64)
+    self.assertEqual(config.local_sa_block_kv_dq, 128)
+    self.assertTrue(config.local_sa_use_fused_bwd_kernel)
+    self.assertEqual(config.local_sa_q_layout, "SEQ_MINOR")
+    self.assertEqual(config.local_sa_k_layout, "SEQ_MINOR")
+    self.assertEqual(config.local_sa_v_layout, "SEQ_MINOR")
+    self.assertFalse(config.local_use_splash_scheduler)
+
+  def test_sa_and_gmm_eval_flags_inherit_and_override(self):
+    """eval_sa_* and eval_wi/wo_tile_fwd_* use base.yml defaults; eval_local_sa_* inherits from eval_sa_* when unset."""
+    cfg = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        sa_block_q=256,
+        sa_block_kv=512,
+        local_sa_block_q=64,
+        sa_q_layout="SEQ_MINOR",
+        local_sa_q_layout="HEAD_DIM_MINOR",
+        wi_tile_fwd_batch_seq=256,
+        wo_tile_fwd_embed_dim=2048,
+    )
+    self.assertEqual((cfg.eval_sa_block_q, cfg.eval_sa_block_kv, cfg.eval_local_sa_block_q), (512, 512, 512))
+    self.assertEqual((cfg.eval_sa_q_layout, cfg.eval_local_sa_q_layout), ("HEAD_DIM_MINOR", "HEAD_DIM_MINOR"))
+    self.assertEqual((cfg.eval_wi_tile_fwd_batch_seq, cfg.eval_wo_tile_fwd_embed_dim), (512, 1024))
+
+    cfg_override = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        sa_block_q=256,
+        eval_sa_block_q=1024,
+        eval_sa_block_kv=2048,
+        eval_local_sa_block_q=128,
+        sa_q_layout="HEAD_DIM_MINOR",
+        eval_sa_q_layout="SEQ_MINOR",
+        wi_tile_fwd_batch_seq=256,
+        eval_wi_tile_fwd_batch_seq=1024,
+        eval_wo_tile_fwd_mlp_dim=4096,
+    )
+    self.assertEqual(
+        (cfg_override.eval_sa_block_q, cfg_override.eval_local_sa_block_q, cfg_override.eval_local_sa_block_kv),
+        (1024, 128, 2048),
+    )
+    self.assertEqual((cfg_override.eval_sa_q_layout, cfg_override.eval_local_sa_q_layout), ("SEQ_MINOR", "SEQ_MINOR"))
+    self.assertEqual((cfg_override.eval_wi_tile_fwd_batch_seq, cfg_override.eval_wo_tile_fwd_mlp_dim), (1024, 4096))
+
+  def test_eval_start_step_config(self):
+    """Verifies that eval_start_step defaults to 0 and can be overridden via pyconfig."""
+    config_default = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+    )
+    self.assertEqual(config_default.eval_start_step, 0)
+
+    config_override = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        eval_start_step=50,
+    )
+    self.assertEqual(config_override.eval_start_step, 50)
+
+  def test_eval_start_step_negative_raises_error(self):
+    """Verifies that eval_start_step < 0 raises a validation error."""
+    with self.assertRaises((ValueError, Exception)):
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          skip_jax_distributed_system=True,
+          eval_start_step=-1,
+      )
+
+  # ------------------------------------------------------------------
+  # Tests for infer_cp_axes / infer_ep_axes and EP rank flag disabling
+  # ------------------------------------------------------------------
+
+  def test_normalize_axes_basics(self):
+    """_normalize_axes handles None, str, list, and empty list."""
+    self.assertEqual(_normalize_axes(None), ())
+    self.assertEqual(_normalize_axes("expert"), ("expert",))
+    self.assertEqual(_normalize_axes(["a", "b"]), ("a", "b"))
+    self.assertEqual(_normalize_axes([]), ())
+
+  def test_moe_sharding_strategy_mutual_exclusivity(self):
+    """Ensure that shard_exp_on_fsdp, use_2d_fsdp_sharding, and shard_embed_moe_on_fsdp are mutually exclusive."""
+
+    def init_config(**kwargs):
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          skip_jax_distributed_system=True,
+          **kwargs,
+      )
+
+    with self.assertRaisesRegex(ValueError, "Only one of shard_exp_on_fsdp"):
+      init_config(shard_exp_on_fsdp=True, use_2d_fsdp_sharding=True)
+
+    with self.assertRaisesRegex(ValueError, "Only one of shard_exp_on_fsdp"):
+      init_config(shard_exp_on_fsdp=True, shard_embed_moe_on_fsdp=True)
+
+    with self.assertRaisesRegex(ValueError, "Only one of shard_exp_on_fsdp"):
+      init_config(use_2d_fsdp_sharding=True, shard_embed_moe_on_fsdp=True)
+
+  def test_ep_rank_1_raises_on_ep_flags(self):
+    """When EP rank is 1 (no EP rules), setting EP-only flags must raise ValueError."""
+    # No 'exp' rule -> infer_ep_axes returns () -> EP rank is 1.
+    rules_no_ep = [["activation_length", ["context"]]]
+    self.assertEqual(infer_ep_axes(rules_no_ep), ())
+
+    # Each flag that must be disabled when EP rank == 1.
+    ep_disabled_flags = {
+        "use_random_routing": (False, True),
+        "use_ragged_sort": (False, True),
+        "ragged_buffer_factor": (-1.0, 2.0),
+        "eval_ragged_buffer_factor": (-1.0, 2.0),
+        "use_ring_of_experts": (False, True),
+        "num_moe_emb_chunks": (0, 2),
+    }
+    for flag_name, (_, bad_value) in ep_disabled_flags.items():
+      with self.subTest(flag=flag_name):
+        with self.assertRaises(ValueError, msg=f"{flag_name}={bad_value} should raise when EP rank is 1"):
+          pyconfig.initialize(
+              [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+              skip_jax_distributed_system=True,
+              **{flag_name: bad_value},
+          )
+
+  def test_cp_as_ep_infer_axes(self):
+    """cp-as-ep: exp -> ['context', 'expert'], so ici_context_parallelism contributes to EP rank."""
+    cp_as_ep_rules = [
+        ["exp", ["context", "expert"]],
+        ["activation_length", ["context"]],
+    ]
+    self.assertEqual(infer_ep_axes(cp_as_ep_rules), ("context", "expert"))
+    # CP still inferred from activation_length
+    self.assertEqual(infer_cp_axes(cp_as_ep_rules), ("context",))
+
+  def test_ep_as_cp_infer_axes(self):
+    """ep-as-cp: activation_length -> ['expert'], exp -> 'expert'. Expert axis serves both CP and EP."""
+    ep_as_cp_rules = [
+        ["activation_length", ["expert"]],
+        ["exp", "expert"],
+    ]
+    self.assertEqual(infer_cp_axes(ep_as_cp_rules), ("expert",))
+    self.assertEqual(infer_ep_axes(ep_as_cp_rules), ("expert",))
+
+  def test_shard_embed_moe_on_fsdp_requires_quantization(self):
+    """Verifies that a ValueError is raised when shard_embed_moe_on_fsdp
+    is used without fixed weight quantization calibration."""
     with self.assertRaises(ValueError):
-      pyconfig.initialize_pydantic(["/custom_rl/module.py", "run_name=test"])
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          skip_jax_distributed_system=True,
+          shard_embed_moe_on_fsdp=True,
+          quantization="",
+      )
+
+    with self.assertRaises(ValueError):
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          skip_jax_distributed_system=True,
+          shard_embed_moe_on_fsdp=True,
+          quantization="int8",
+          weight_quantization_calibration_method="absmax",
+      )
+
+    # This should not raise
+    pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        shard_embed_moe_on_fsdp=True,
+        quantization="int8",
+        weight_quantization_calibration_method="fixed,-1,1",
+    )
+
+  def test_base_yml_types_parity(self):
+    """Verifies that types.MaxTextConfig() defaults match MaxTextConfig(**base_yaml)."""
+    base_yml_path = os.path.join(MAXTEXT_CONFIGS_DIR, "base.yml")
+    with open(base_yml_path, "r", encoding="utf-8") as f:
+      base_yaml = yaml.safe_load(f)
+
+    # 1. Ensure all base.yml keys exist in types.py
+    pydantic_fields = pyconfig.types.MaxTextConfig.model_fields
+    for key in base_yaml.keys():
+      if key == "base_config":
+        continue
+      self.assertIn(
+          key,
+          pydantic_fields,
+          f"Key '{key}' from base.yml is missing in types.MaxTextConfig",
+      )
+
+    # Clean YAML dictionary (normalize string 'none' to None)
+    clean_yaml = {}
+    for k, v in base_yaml.items():
+      if k in ("base_config", "run_name"):
+        continue
+      if isinstance(v, str) and v.lower() == "none":
+        clean_yaml[k] = None
+      elif k == "tokenizer_path" and v == "":
+        clean_yaml[k] = None
+      else:
+        clean_yaml[k] = v
+
+    # 2. Instantiate MaxTextConfig with pure defaults vs cleaned base.yml.
+    # Note: MaxTextConfig.__init__ sets os.environ["XLA_FLAGS"] as a side-effect during validation,
+    # so we clean it up between instantiations to ensure identical test conditions.
+    orig_xla_flags = os.environ.pop("XLA_FLAGS", None)
+    try:
+      cfg_defaults = pyconfig.types.MaxTextConfig(run_name="parity_test_run")
+      os.environ.pop("XLA_FLAGS", None)
+      cfg_from_yaml = pyconfig.types.MaxTextConfig(run_name="parity_test_run", **clean_yaml)
+    finally:
+      if orig_xla_flags is not None:
+        os.environ["XLA_FLAGS"] = orig_xla_flags
+      else:
+        os.environ.pop("XLA_FLAGS", None)
+
+    for field_name in pydantic_fields.keys():
+      if field_name in pyconfig.types.DerivedValues.model_fields:
+        continue
+
+      val_default = getattr(cfg_defaults, field_name)
+      val_yaml = getattr(cfg_from_yaml, field_name)
+
+      # Treat None and "" as semantically equivalent for unset optional string/path fields
+      if (val_default is None and val_yaml == "") or (val_default == "" and val_yaml is None):
+        continue
+
+      self.assertEqual(
+          val_default,
+          val_yaml,
+          f"Default value mismatch for field '{field_name}': types.py default={val_default} vs base.yml={val_yaml}",
+      )
 
 
 if __name__ == "__main__":

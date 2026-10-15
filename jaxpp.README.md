@@ -8,13 +8,12 @@ This repository is a fork of [MaxText](https://github.com/AI-Hypercomputer/maxte
 The changes between this repo and the upstream MaxText is kept minimal in general.
 Some of the notable changes are listed below.
 
-* The `__call__` method of the `Decoder` class in [src/maxtext/layers/decoders.py](src/maxtext/layers/decoders.py)
+* The `__call__` method of the `NNXDecoder` class in [src/maxtext/layers/nnx_decoders.py](src/maxtext/layers/nnx_decoders.py)
   calls `jaxpp.pipeline_enter_stage` to mark stage boundaries for pipeline parallelism.
-* The `maybe_initialize_jax_distributed_system` function in [src/maxtext/utils/max_utils.py](src/maxtext/utils/max_utils.py)
-  creates `RemoteMpmdMesh` to be used by JaxPP.
-* [src/maxtext/trainers/pre_train/train.py](src/maxtext/trainers/pre_train/train.py) contains changes to
- * Enable pipeline parallelism for the train step, and
- * Mark the pipeline loop in the train step with `jaxpp.treduce`.
+* The `jit_train_step` function in [src/maxtext/utils/train_utils.py](src/maxtext/utils/train_utils.py)
+  creates a `jaxpp.MpmdMesh` and compiles the train step with `jaxpp.mpmd_jit_with_loop`.
+* [src/maxtext/utils/gradient_accumulation.py](src/maxtext/utils/gradient_accumulation.py)
+  runs pipeline microbatches with `jaxpp.treduce_i` in the shared NNX training flow.
 
 # Docker image
 

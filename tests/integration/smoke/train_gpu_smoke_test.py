@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" Smoke test """
+"""Smoke test"""
 import os
 import unittest
 
@@ -41,7 +41,7 @@ class Train(unittest.TestCase):
   def test_tiny_config(self):
     test_tmpdir = os.environ.get("TEST_TMPDIR")  # pylint: disable=unused-variable
     train_main(
-        [
+        [  # pyrefly: ignore[bad-argument-type]
             None,
             get_test_config_path("gpu/gpu_smoke_test.yml"),
             # pylint: disable=f-string-without-interpolation

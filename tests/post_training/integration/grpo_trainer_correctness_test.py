@@ -26,27 +26,25 @@ Usage:
 """
 
 import os
-import subprocess
 import sys
 import unittest
-from flax import linen as nn
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 import jsonlines
 import maxtext as mt
-from maxtext.configs import pyconfig
-from maxtext.utils.globals import MAXTEXT_ASSETS_ROOT, MAXTEXT_PKG_DIR, MAXTEXT_TEST_ASSETS_ROOT
-from maxtext.common.common_types import MODEL_MODE_TRAIN
+from maxtext.configs import pyconfig, types
+from maxtext.utils.globals import MAXTEXT_PKG_DIR, MAXTEXT_TEST_ASSETS_ROOT
+from flax import nnx
 from maxtext.experimental.rl import grpo_utils
-from maxtext.experimental.rl.grpo_trainer import _merge_grpo_state, grpo_loss_fn, setup_train_loop
-from maxtext.experimental.rl.grpo_utils import compute_log_probs
+from maxtext.experimental.rl.grpo_trainer import grpo_loss_fn_nnx, setup_train_loop
+from maxtext.experimental.rl.grpo_utils import compute_log_probs_nnx
+from tests.utils.test_helpers import ensure_tokenizer_downloaded
 from maxtext.inference import offline_engine
 from maxtext.inference.maxengine import maxengine
 from maxtext.inference.offline_engine import InputData
-from maxtext.layers import quantizations
-from maxtext.models import models
 from maxtext.utils import maxtext_utils
+from maxtext.utils import model_creation_utils
 import numpy as np
 import pytest
 import transformers
@@ -68,24 +66,30 @@ def get_golden_data(config):
 
 
 def setup_maxtext_model(config, mesh):
-  """setup maxtext model"""
-  init_rng = jax.random.PRNGKey(config.init_weights_seed)
-  quant = quantizations.configure_quantization(config)
+  """Sets up the MaxText model.
 
-  maxtext_model = models.transformer_as_linen(config=config, mesh=mesh, quant=quant, model_mode=MODEL_MODE_TRAIN)
-  state, state_mesh_annotations = maxtext_utils.setup_decode_state(maxtext_model, config, init_rng, mesh, None)
-  state_mesh_shardings = nn.logical_to_mesh_sharding(state_mesh_annotations, mesh, config.logical_axis_rules)
+  Returns (model, state, reference, init_rng, state_mesh_shardings, data_sharding). The
+  model carries its own params (state is None) and reference is a cloned frozen model.
+  """
+  init_rng = jax.random.PRNGKey(config.init_weights_seed)
   data_sharding = jax.NamedSharding(mesh, jax.sharding.PartitionSpec(None))
-  reference_params = jax.tree.map(jnp.copy, state.params["params"])
-  state = _merge_grpo_state(state, reference_params)
-  return (
-      maxtext_model,
-      state,
-      reference_params,
-      init_rng,
-      state_mesh_shardings,
-      data_sharding,
-  )
+
+  maxtext_model = model_creation_utils.from_pretrained(config, mesh=mesh, rng_key=init_rng)
+  reference = nnx.clone(maxtext_model)
+  # state_mesh_shardings is unused by the live correctness test on the NNX path.
+  return maxtext_model, None, reference, init_rng, None, data_sharding
+
+
+def _logps(config, model, state, ids, pos, seg, comp_seg, rngs=None):
+  """Per-token log-probs from the NNX model."""
+  del state, rngs  # unused on the NNX path
+  return compute_log_probs_nnx(model, ids, pos, seg, comp_seg, config, is_train=False)
+
+
+def _grpo_loss(config, model, state, reference, data, rng):
+  """GRPO loss with the NNX policy and frozen reference model."""
+  del state  # unused on the NNX path
+  return grpo_loss_fn_nnx(model, config, data, rng, None, reference)
 
 
 def prepare_maxtext_inputs(input_str, tokenizer_model):
@@ -113,24 +117,15 @@ class GrpoTrainerTest(unittest.TestCase):
   def setUp(self):
     super().setUp()
     jax.config.update("jax_default_prng_impl", "unsafe_rbg")
-    command = [
-        "gcloud",
-        "storage",
-        "cp",
-        "--recursive",
-        "gs://maxtext-dataset/hf/llama3.1-tokenizer",
-        os.path.join(MAXTEXT_ASSETS_ROOT, ""),
-    ]
-    exit_code = subprocess.call(command, cwd=os.path.dirname(MAXTEXT_PKG_DIR))
-    if exit_code != 0:
-      raise ValueError(f"{command} failed with exit code: {exit_code}")
+    tokenizer_path = ensure_tokenizer_downloaded("llama3.1-tokenizer", skip_test_on_failure=True)
     self.config = pyconfig.initialize(
         [
             None,
             os.path.join(MAXTEXT_PKG_DIR, "experimental", "rl", "grpo_trainer_test.yml"),
         ],
+        config_class=types.RLConfig,
         run_name="unit_test_grpo_trainer",
-        tokenizer_path=os.path.join(MAXTEXT_ASSETS_ROOT, "llama3.1-tokenizer"),
+        tokenizer_path=tokenizer_path,
         enable_checkpointing=False,
         train_data_columns="prompt",
     )
@@ -139,8 +134,9 @@ class GrpoTrainerTest(unittest.TestCase):
             None,
             os.path.join(MAXTEXT_PKG_DIR, "experimental", "rl", "grpo_trainer_test.yml"),
         ],
+        config_class=types.RLConfig,
         run_name="unit_test_grpo_trainer_inference",
-        tokenizer_path=os.path.join(MAXTEXT_ASSETS_ROOT, "llama3.1-tokenizer"),
+        tokenizer_path=tokenizer_path,
         enable_checkpointing=False,
         ici_tensor_parallelism=4,
         per_device_batch_size=self.config.per_device_batch_size * self.config.rl["num_generations"],
@@ -178,15 +174,14 @@ class GrpoTrainerTest(unittest.TestCase):
         self.config.prompt, self.tokenizer_model
     )
     # Obtain per-token logits.
-    maxtext_per_token_logps, _ = compute_log_probs(
+    maxtext_per_token_logps, _ = _logps(
+        self.config,
         maxtext_model,
-        state.params,
+        state,
         input_ids,
         input_position,
         input_segmentation,
         completion_segmentation,
-        self.config,
-        is_train=False,
         rngs=self.rng,
     )
     jax.debug.print(
@@ -219,7 +214,7 @@ class GrpoTrainerTest(unittest.TestCase):
         "ar_completions_segmentation": completion_segmentation,
     }
     # Compute the loss and auxiliary values.
-    maxtext_loss, aux = grpo_loss_fn(maxtext_model, self.config, data, rng, state.params, reference_params)
+    maxtext_loss, aux = _grpo_loss(self.config, maxtext_model, state, reference_params, data, rng)
 
     # Assert that the computed loss and auxiliary averages match the golden data.
     self.assertEqual(maxtext_loss.tolist(), golden_data["maxtext_loss"])
@@ -278,6 +273,7 @@ class ReshardingTest(unittest.TestCase):
             sys.argv[0],
             os.path.join(MAXTEXT_PKG_DIR, "experimental", "rl", config_file),
         ],
+        config_class=types.RLConfig,
         **init_kwargs,
     )
     return config

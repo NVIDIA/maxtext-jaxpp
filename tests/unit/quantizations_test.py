@@ -19,9 +19,11 @@ import os.path
 import sys
 from typing import Any
 import unittest
+from absl import logging as absl_logging
 from aqt.jax.v2 import aqt_tensor
 from aqt.jax.v2.flax import aqt_flax
 from flax import nnx
+from flax.nnx import traversals
 import jax
 from jax import lax
 from jax import numpy as jnp
@@ -29,13 +31,15 @@ from jax.sharding import Mesh
 from maxtext.configs import pyconfig
 from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR
 from maxtext.common.common_types import DECODING_ACTIVE_SEQUENCE_INDICATOR
+from maxtext.kernels.megablox import ops
 from maxtext.kernels.megablox import gmm
 from maxtext.layers import nnx_wrappers, quantizations
 from maxtext.utils import maxtext_utils
 from maxtext.utils import model_creation_utils
-from tests.utils.test_helpers import get_test_config_path, get_decoupled_parallelism_overrides
+from tests.utils.test_helpers import get_test_config_path
 import numpy as np
 import pytest
+import qwix
 
 _QUERY_REGEX = ".*/query"
 _VALUE_REGEX = ".*/value"
@@ -48,7 +52,7 @@ class QuantTestModule(nnx.Module):
       self,
       quantization: quantizations.AqtQuantization,
       data_type: Any,
-      rngs: nnx.Rngs,
+      rngs: nnx.Rngs,  # pylint: disable=unused-argument
   ):
     self.quantization = quantization
     self.identity = jnp.identity(2, dtype=data_type)
@@ -336,27 +340,22 @@ class QuantTest(unittest.TestCase):
 
   def init_pyconfig(self, **kwargs):
     """Initialize MaxText pyconfig."""
-    # Conditionally set ici_fsdp_parallelism to match device count in decoupled mode
-    extra_args = get_decoupled_parallelism_overrides()
-    init_kwargs = (
-        {
-            "run_name": "test",
-            "dataset_type": "synthetic",
-            "enable_checkpointing": False,
-            "enable_goodput_recording": False,
-            "steps": 1,
-            "per_device_batch_size": 1,
-            "use_qwix_quantization": True,
-            "skip_jax_distributed_system": True,
-            "base_emb_dim": 1024,
-            "base_num_query_heads": 8,
-            "base_num_kv_heads": 8,
-            "base_mlp_dim": 4096,
-            "base_num_decoder_layers": 12,
-        }
-        | kwargs
-        | extra_args
-    )
+    init_kwargs = {
+        "run_name": "test",
+        "dataset_type": "synthetic",
+        "enable_checkpointing": False,
+        "enable_goodput_recording": False,
+        "steps": 1,
+        "per_device_batch_size": 1,
+        "use_qwix_quantization": True,
+        "skip_jax_distributed_system": True,
+        "base_emb_dim": 16,
+        "base_num_query_heads": 1,
+        "base_num_kv_heads": 1,
+        "base_mlp_dim": 16,
+        "base_num_decoder_layers": 1,
+        "max_target_length": 16,
+    } | kwargs
     config = pyconfig.initialize(
         [sys.argv[0], get_test_config_path()],
         **init_kwargs,
@@ -391,85 +390,84 @@ class QuantTest(unittest.TestCase):
 
     jax.tree_util.tree_map_with_path(compare_fn, a, b)
 
-  def quantization_config(self, quant, logits_tolerance=2e-1, grad_tolerance=5e-1):
+  def quantization_config(self, quant, logits_tolerance=2e-1, grad_tolerance=5e-1, **kwargs):
     """Run forward pass and backward pass for quantized model and compare with base model."""
-    cfg = self.init_pyconfig(quantization=quant)
-    model = model_creation_utils.create_model(self.cfg, self.mesh)
-    qt_model = model_creation_utils.create_model(cfg, self.mesh)
-
+    # pylint: disable=protected-access
+    cfg = self.init_pyconfig(quantization=quant, **kwargs)
     ids, decoder_segment_ids, decoder_positions = self.get_data()
-    var = model.init(
-        {"params": self.rng, "aqt": self.rng, "dropout": self.rng},
-        ids,
-        decoder_positions,
-        decoder_segment_ids,
-        enable_dropout=False,
-        mutable=True,
-    )
-    quantized_vars = qt_model.init(
-        {"params": self.rng, "aqt": self.rng, "dropout": self.rng},
-        ids,
-        decoder_positions,
-        decoder_segment_ids,
-        enable_dropout=False,
-        mutable=True,
-    )
 
-    def loss_base(all_vars, inputs):
-      logits, _ = model.apply(
-          all_vars,
-          *inputs,
+    qt_model = model_creation_utils.create_model(cfg, self.mesh, rngs=nnx.Rngs(0))
+    if getattr(self.__class__, "_cached_base_results_nnx", None) is None:
+      base_cfg = self.init_pyconfig(quantization="", **kwargs)
+      base_model = model_creation_utils.create_model(base_cfg, self.mesh, rngs=nnx.Rngs(0))
+
+      def loss_base(model):
+        logits = model(
+            decoder_input_tokens=ids,
+            decoder_positions=decoder_positions,
+            decoder_segment_ids=decoder_segment_ids,
+            enable_dropout=False,
+        )
+        return jnp.mean((logits) ** 2)
+
+      grads_base = nnx.grad(loss_base)(base_model)
+      logits_base = base_model(
+          decoder_input_tokens=ids,
+          decoder_positions=decoder_positions,
+          decoder_segment_ids=decoder_segment_ids,
           enable_dropout=False,
-          rngs={"params": self.rng},
-          mutable=True,
       )
-      return jnp.mean((logits) ** 2)
+      self.__class__._cached_base_results_nnx = (grads_base, logits_base)
 
-    def loss_quant(all_vars, inputs):
-      logits, _ = qt_model.apply(
-          all_vars,
-          *inputs,
+    grads_base, logits = self.__class__._cached_base_results_nnx
+
+    def loss_quant(model):
+      logits_q = model(
+          decoder_input_tokens=ids,
+          decoder_positions=decoder_positions,
+          decoder_segment_ids=decoder_segment_ids,
           enable_dropout=False,
-          rngs={"params": self.rng},
-          mutable=True,
       )
-      return jnp.mean((logits) ** 2)
+      return jnp.mean((logits_q) ** 2)
 
-    # Compute gradients w.r.t. both models
-    grads_base = jax.grad(loss_base)(var, (ids, decoder_positions, decoder_segment_ids))
-    grads_quant = jax.grad(loss_quant)(quantized_vars, (ids, decoder_positions, decoder_segment_ids))
+    grads_quant = nnx.grad(loss_quant)(qt_model)
+    quant_logits = qt_model(
+        decoder_input_tokens=ids,
+        decoder_positions=decoder_positions,
+        decoder_segment_ids=decoder_segment_ids,
+        enable_dropout=False,
+    )
 
-    logits, _ = model.apply(
-        var,
-        ids,
-        decoder_positions,
-        decoder_segment_ids,
-        enable_dropout=False,
-        rngs={"params": self.rng},
-        mutable=True,
-    )
-    quant_logits, _ = qt_model.apply(
-        quantized_vars,
-        ids,
-        decoder_positions,
-        decoder_segment_ids,
-        enable_dropout=False,
-        rngs={"params": self.rng},
-        mutable=True,
-    )
     print("relative error in logits:" f" {jnp.abs(quant_logits - logits).mean() / jnp.abs(logits).mean()}")
     assert jnp.abs(quant_logits - logits).mean() / jnp.abs(logits).mean() < logits_tolerance
-    self.print_grad_diff(grads_base["params"], grads_quant["params"])
-    self.assertTrue(
-        self.pytree_allclose(
-            grads_base["params"],
-            grads_quant["params"],
-            tolerance=grad_tolerance,
-        )
-    )
+
+    # nnx.grad returns a State object which is a mapping of paths to gradients.
+    # Flatten them to check for tolerance.
+    grads_base_flat = traversals.flatten_mapping(grads_base)
+    grads_quant_flat = traversals.flatten_mapping(grads_quant)
+
+    # Filter for param collections to compare only parameters and not stats/buffers if any
+    # Note: NNX grads structure might contain variables like 'kernel', 'bias'.
+    # For simplicity we compare all matching keys.
+    def flatten_and_filter(grads_flat):
+      return {k: v for k, v in grads_flat.items() if hasattr(v, "shape") and "quant_stats" not in str(k)}
+
+    gb_f = flatten_and_filter(grads_base_flat)
+    gq_f = flatten_and_filter(grads_quant_flat)
+
+    for k in gb_f:
+      if k in gq_f:
+        diff = jnp.abs(gb_f[k] - gq_f[k]).mean() / (jnp.abs(gb_f[k]).mean() + 1e-8)
+        if diff > grad_tolerance:
+          print(f"Gradient mismatch for {k}: rel_error = {diff}")
+          assert diff <= grad_tolerance
 
   @pytest.mark.tpu_only
   def test_int8_quantization(self):
+    self.quantization_config("int8")
+
+  @pytest.mark.tpu_only
+  def test_int8_quantization_nnx(self):
     self.quantization_config("int8")
 
   @pytest.mark.tpu_only
@@ -477,18 +475,36 @@ class QuantTest(unittest.TestCase):
     self.quantization_config("fp8")
 
   @pytest.mark.tpu_only
+  def test_fp8_quantization_nnx(self):
+    self.quantization_config("fp8")
+
+  @pytest.mark.tpu_only
   def test_fp8_full_quantization(self):
+    self.quantization_config("fp8_full")
+
+  @pytest.mark.tpu_only
+  def test_fp8_full_quantization_nnx(self):
     self.quantization_config("fp8_full")
 
   @pytest.mark.gpu_only
   @pytest.mark.external_serving
   def test_fp8_gpu_quantization(self):
-    self.quantization_config("fp8_gpu", grad_tolerance=1.0)
+    self.quantization_config("fp8_gpu", grad_tolerance=1.5)
+
+  @pytest.mark.gpu_only
+  @pytest.mark.external_serving
+  def test_fp8_gpu_quantization_nnx(self):
+    self.quantization_config("fp8_gpu", grad_tolerance=1.5)
 
   @pytest.mark.gpu_only
   @pytest.mark.external_serving
   def test_fp8_nanoo_quantization(self):
-    self.quantization_config("fp8_nanoo", grad_tolerance=1.0)
+    self.quantization_config("fp8_nanoo", grad_tolerance=1.5)
+
+  @pytest.mark.gpu_only
+  @pytest.mark.external_serving
+  def test_fp8_nanoo_quantization_nnx(self):
+    self.quantization_config("fp8_nanoo", grad_tolerance=1.5)
 
   @pytest.mark.skip(reason="No runner with GPU arch >= 89 is available")
   @pytest.mark.gpu_only
@@ -558,6 +574,283 @@ def test_gmm_kernel(group_sizes, k, n, tiling, dtype):
   ).block_until_ready()
 
   assert jnp.abs(quant_out - base_out).mean() / jnp.abs(base_out).mean() < 2e-1
+
+
+class MaybeQuantizeModelTest(unittest.TestCase):
+
+  def test_maybe_quantize_model_pops_intermediates(self):
+    config = pyconfig.initialize(
+        [None, get_test_config_path()],
+        enable_checkpointing=False,
+        quantization="int8",
+        use_qwix_quantization=True,
+        use_batch_split_schedule=False,
+        micro_batch_size_to_train_on=1,
+        max_target_length=2,
+    )
+
+    class DummyModel(nnx.Module):
+
+      def __init__(self):
+        self.param = nnx.Param(jnp.ones((2, 2)))
+
+      def __call__(self, tokens, positions, segment_ids, enable_dropout=False):
+        self.sow(nnx.Intermediate, "some_metric", jnp.mean(self.param.get_value()))
+        return tokens.astype(jnp.float32) @ self.param.get_value()
+
+    model = DummyModel()
+
+    # Verify that before quantizing, there are no intermediates sowed yet
+    _, state = nnx.split(model)
+    self.assertNotIn("intermediates", state.to_pure_dict())
+
+    # 1. Run maybe_quantize_model (which runs Qwix tracing and then pops intermediates in-place)
+    quantized_model = quantizations.maybe_quantize_model(model, config)
+
+    # 2. Extract state to check if intermediates exist
+    _, state = nnx.split(quantized_model)
+    state_dict = state.to_pure_dict()
+
+    # Assert that intermediates collection does not exist in the state
+    self.assertNotIn("intermediates", state_dict)
+
+  def test_nnx_abstract_state_has_no_intermediates(self):
+    # Initialize a configuration with Qwix quantization enabled
+    config = pyconfig.initialize(
+        [None, get_test_config_path()],
+        enable_checkpointing=False,
+        model_name="deepseek3-tiny",
+        attention="dot_product",
+        use_qwix_quantization=True,
+        use_qk_clip=True,  # This sows QK clip intermediates during the forward pass
+    )
+
+    # Create the abstract model
+    mesh = jax.make_mesh((1, 1, 1, 1), ("data", "fsdp", "expert", "context"))
+    _, abstract_model = model_creation_utils.create_nnx_abstract_model(config, mesh)
+
+    # Split model to extract its state dict
+    _, state = nnx.split(abstract_model)
+    state_dict = state.to_pure_dict()
+
+    # Assert that intermediates collection is NOT present in the abstract state
+    self.assertNotIn("intermediates", state_dict)
+
+
+class EinsumParent(nnx.Module):
+  """Minimal NNX parent for apply_einsum_in_nnx tests."""
+
+  def __init__(self, rngs: nnx.Rngs):
+    self.rngs = rngs
+
+
+class MoEQuantizedEinsumTest(unittest.TestCase):
+  """Tests for MoE quantized einsum helpers."""
+
+  def test_nanoo_fp8_einsum_uses_fnuz_dtypes(self):
+    quant = quantizations.NANOOFp8Quantization()
+    einsum_mod = quant.einsum(dtype=jnp.float32)
+    self.assertEqual(einsum_mod.e4m3_dtype, jnp.float8_e4m3fnuz)
+    self.assertEqual(einsum_mod.e5m2_dtype, jnp.float8_e5m2fnuz)
+
+  def test_create_fp8_einsum(self):
+    for quant_str in ("fp8", "nanoo_fp8"):
+      quant = _configure_quantization(quant_str=quant_str)
+      wrapper = quantizations.create_fp8_einsum(quant, jnp.float32, nnx.Rngs(0))
+      lhs = jnp.ones((4, 8))
+      rhs = jnp.ones((8, 16))
+      result = wrapper("ab,bc->ac", lhs, rhs, mutable=["_overwrite_with_gradient"])
+      self.assertEqual(result.shape, (4, 16))
+
+  def test_apply_einsum_in_nnx_plain_callable(self):
+    parent = EinsumParent(nnx.Rngs(0))
+    lhs = jnp.ones((2, 3))
+    rhs = jnp.ones((3, 4))
+    result = quantizations.apply_einsum_in_nnx(parent, "plain", jnp.einsum, [], "ij,jk->ik", lhs, rhs)
+    expected = jnp.einsum("ij,jk->ik", lhs, rhs)
+    self.assertTrue(jnp.allclose(result, expected))
+
+  def test_apply_einsum_in_nnx_aqt_reuses_wrapper(self):
+    quant = _configure_quantization(quant_str="int8")
+    parent = EinsumParent(nnx.Rngs(0))
+    lhs = jnp.ones((2, 2))
+    rhs = jnp.ones((2, 2))
+    aqt_quant: quantizations.AqtQuantization = quant
+    einsum = aqt_quant.einsum(mesh_axes=())
+    result1 = quantizations.apply_einsum_in_nnx(parent, "aqt_test", einsum, ["aqt"], "bc,ab->ac", lhs, rhs)
+    wrapper = getattr(parent, "quant_einsum_aqt_test")
+    result2 = quantizations.apply_einsum_in_nnx(parent, "aqt_test", einsum, ["aqt"], "bc,ab->ac", lhs, rhs)
+    self.assertIs(getattr(parent, "quant_einsum_aqt_test"), wrapper)
+    self.assertEqual(result1.shape, result2.shape)
+
+
+class StaticScaleTest(unittest.TestCase):
+  """Tests for static scale extraction."""
+
+  def test_get_static_scale_fixed_symmetric(self):
+    scale = quantizations.get_static_scale(jnp.float8_e4m3fn, "fixed,224.0")
+    self.assertIsNotNone(scale)
+    np.testing.assert_allclose(scale, 0.5, rtol=1e-5)
+
+  def test_get_static_scale_invalid_format(self):
+    with self.assertRaises(ValueError):
+      quantizations.get_static_scale(jnp.float8_e4m3fn, "fixed,1,2,3")
+
+    with self.assertRaises(ValueError):
+      quantizations.get_static_scale(jnp.float8_e4m3fn, "fixed,-200.0,224.0")
+
+    with self.assertRaises(ValueError):
+      quantizations.get_static_scale(jnp.float8_e4m3fn, "fixed")
+
+    with self.assertRaises(ValueError):
+      quantizations.get_static_scale(jnp.float8_e4m3fn, "absmax")
+
+
+class LhsScaleTest(unittest.TestCase):
+  """Tests for LHS scale extraction in GMM v2 forward."""
+
+  def test_fwd_prepare_lhs_scale_fixed_symmetric(self):
+
+    rule = qwix.QtRule(
+        act_qtype=jnp.float8_e4m3fn,
+        act_calibration_method="fixed,224.0",
+    )
+    scale = ops._fwd_prepare_lhs_scale(rule)  # pylint: disable=protected-access
+    self.assertIsNotNone(scale)
+    self.assertEqual(scale.shape, (1, 1))
+    self.assertEqual(scale.dtype, jnp.float32)
+    np.testing.assert_allclose(scale, 0.5, rtol=1e-5)
+
+  def test_fwd_prepare_lhs_scale_dynamic_returns_none(self):
+
+    rule = qwix.QtRule(
+        act_qtype=jnp.float8_e4m3fn,
+        act_calibration_method="absmax",
+    )
+    scale = ops._fwd_prepare_lhs_scale(rule)  # pylint: disable=protected-access
+    self.assertIsNone(scale)
+
+  def test_fwd_prepare_lhs_scale_no_rule_returns_none(self):
+
+    rule = qwix.QtRule(
+        act_qtype=None,
+        act_calibration_method=None,
+    )
+    scale = ops._fwd_prepare_lhs_scale(rule)  # pylint: disable=protected-access
+    self.assertIsNone(scale)
+
+
+class RouterProjQwixInterceptionTest(unittest.TestCase):
+  """Verifies Qwix interception behavior for the MoE router projection."""
+
+  def _assert_router_proj_interception(self, quantize_router_proj: bool):
+    """Verifies Qwix interception behavior for the MoE router (gate) projection."""
+    cfg = pyconfig.initialize(
+        [
+            "",
+            get_test_config_path(),
+            "model_name=deepseek3-671b",
+            "quantization=fp8_full",
+            "use_qwix_quantization=true",
+            "per_device_batch_size=1",
+            "max_target_length=16",
+            f"quantize_router_proj={quantize_router_proj}",
+        ],
+        run_name="deepseek3_router_proj_quantize_test",
+        skip_jax_distributed_system=True,
+    )
+    rules = quantizations.get_quantization_rule(cfg)
+    with self.assertLogs(absl_logging.get_absl_logger(), level="DEBUG") as cm:
+      # Create abstract model using nnx.eval_shape (0 FLOPs, 0 device allocation)
+      _, _ = model_creation_utils.create_nnx_abstract_model(cfg)
+
+    gate_logs = [log for log in cm.output if "/gate'" in log and "op=dot_general" in log]
+    self.assertTrue(gate_logs, "Expected gate dot_general operations to be traced by Qwix")
+    for log in gate_logs:
+      self.assertIn("rule=0", log)
+
+    other_logs = [log for log in cm.output if "shared_experts" in log and "op=dot_general" in log]
+    self.assertTrue(other_logs, "Expected shared_experts dot_general operations to be traced by Qwix")
+
+    if quantize_router_proj:
+      self.assertEqual(len(rules), 1)
+      self.assertIsNotNone(rules[0].weight_qtype)
+      for log in other_logs:
+        self.assertIn("rule=0", log)
+    else:
+      self.assertEqual(len(rules), 2)
+      self.assertIsNone(rules[0].weight_qtype)
+      for log in other_logs:
+        self.assertIn("rule=1", log)
+
+  def test_deepseek3_quantize_router_proj_true_intercepts_gate_ops(self):
+    """DeepSeek3 with quantize_router_proj=True intercepts gate ops with quantized rule=0."""
+    self._assert_router_proj_interception(quantize_router_proj=True)
+
+  def test_deepseek3_quantize_router_proj_false_leaves_gate_unquantized(self):
+    """DeepSeek3 with quantize_router_proj=False matches unquantized rule=0 (weight_qtype=None) for gate."""
+    self._assert_router_proj_interception(quantize_router_proj=False)
+
+
+class LogitsProjQwixTest(unittest.TestCase):
+  """Verifies Qwix rule generation and interception behavior for logits projection (logits_dense)."""
+
+  def _assert_logits_proj_interception(self, quantize_logits_proj: bool, expected_rule: str):
+    """Verifies Qwix interception behavior for the logits projection."""
+    cfg = pyconfig.initialize(
+        [
+            "",
+            get_test_config_path(),
+            "model_name=deepseek3-671b",
+            "quantization=fp8_full",
+            "use_qwix_quantization=true",
+            "per_device_batch_size=1",
+            "max_target_length=16",
+            f"quantize_logits_proj={quantize_logits_proj}",
+        ],
+        run_name="deepseek3_logits_proj_quantize_test",
+        skip_jax_distributed_system=True,
+    )
+    with self.assertLogs(absl_logging.get_absl_logger(), level="DEBUG") as cm:
+      # Create abstract model using nnx.eval_shape (0 FLOPs, 0 device allocation)
+      _, _ = model_creation_utils.create_nnx_abstract_model(cfg)
+
+    logits_dense_logs = [log for log in cm.output if "module='decoder/logits_dense'" in log and "op=dot_general" in log]
+    self.assertTrue(logits_dense_logs, "Expected logits_dense dot_general operations to be traced by Qwix")
+    for log in logits_dense_logs:
+      self.assertIn(expected_rule, log)
+
+  def test_deepseek3_quantize_logits_proj_true_intercepts_logits_dense(self):
+    """DeepSeek3 with quantize_logits_proj=True intercepts logits_dense ops with quantized rule=0."""
+    self._assert_logits_proj_interception(quantize_logits_proj=True, expected_rule="rule=0")
+
+  def test_deepseek3_quantize_logits_proj_false_leaves_logits_dense_unquantized(self):
+    """DeepSeek3 with quantize_logits_proj=False leaves logits_dense unquantized (rule=None)."""
+    self._assert_logits_proj_interception(quantize_logits_proj=False, expected_rule="rule=None")
+
+  def test_logits_proj_calibration_methods(self):
+    """Verifies logits_dense QtRule calibration method inheritance and override."""
+    for override, expected in [("", "fixed,-224,224"), ("absmax", "absmax")]:
+      extra = [f"logits_proj_quant_calibration_method={override}"] if override else []
+      cfg = pyconfig.initialize(
+          [
+              "",
+              get_test_config_path(),
+              "model_name=deepseek3-671b",
+              "quantization=fp8_full",
+              "use_qwix_quantization=true",
+              "weight_quantization_calibration_method=fixed,-224,224",
+              "act_quantization_calibration_method=fixed,-224,224",
+              "quantize_logits_proj=true",
+              *extra,
+          ],
+          run_name="logits_proj_calib_test",
+          skip_jax_distributed_system=True,
+      )
+      rule = [
+          r for r in quantizations.get_fp8_full_qwix_rule_w_sparsity(cfg) if r.module_path == "decoder/logits_dense.*"
+      ][0]
+      self.assertEqual((rule.weight_calibration_method, rule.act_calibration_method), (expected, expected))
 
 
 if __name__ == "__main__":

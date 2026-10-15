@@ -14,7 +14,7 @@
 
 # model config for DeepSeek V3 - 671B that uses fsdp on two logical axes
 
-# For DeepSeek default device-limited routing, 
+# For DeepSeek default device-limited routing,
 # please set n_routing_groups=8 and topk_routing_group=4 in your command-line arguments.
 
 base_emb_dim: 7168
@@ -60,6 +60,7 @@ mesh_axes: ['diloco', 'data', 'stage', 'fsdp', 'fsdp_transpose', 'expert', 'cont
 data_sharding: [['data', 'stage', 'fsdp', 'fsdp_transpose', 'expert', 'context']]
 logical_axis_rules: [
     ['activation_batch', ['data', 'fsdp', 'fsdp_transpose', 'expert', 'context']],
+    ['activation_batch_attn', ['data', 'fsdp', 'fsdp_transpose', 'expert', 'context']],
     ['activation_batch_moe', ['data', 'fsdp', 'fsdp_transpose', 'expert', 'context']],
     ['activation_embed_and_logits_batch', ['data', 'stage', 'fsdp', 'fsdp_transpose', 'expert', 'context']],
     ['activation_kv_batch', ['data', 'fsdp', 'fsdp_transpose', 'expert', 'context']],
@@ -69,9 +70,9 @@ logical_axis_rules: [
     ['activation_heads', []],
     ['activation_stage', 'stage'],
     ['embed', ['fsdp']],
+    ['embed_attn', ['fsdp']],
     ['embed_moe', ['fsdp']],
-    ['embed_no_exp', ['fsdp']],
-    ['embed_no_exp_moe', ['fsdp']],
+    ['embed_vocab', ['fsdp', 'fsdp_transpose']],
     ['q_lora', ['fsdp']],
     ['kv_lora', ['fsdp']],
     ['layers', 'stage'],
@@ -81,7 +82,6 @@ logical_axis_rules: [
     ['kv_heads', ['fsdp_transpose', 'expert']],
     ['heads', ['fsdp_transpose', 'expert']],
     ['mlp', ['fsdp_transpose', 'expert']],
-    ['mlp_only_fsdp_transpose', ['fsdp_transpose']],
-    ['mlp_only_tensor', ['expert']],
+    ['mlp_moe', ['fsdp_transpose', 'expert']],
     ['diloco', 'diloco'],
 ]

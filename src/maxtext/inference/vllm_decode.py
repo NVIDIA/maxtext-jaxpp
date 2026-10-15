@@ -34,30 +34,59 @@ from typing import Any, Sequence
 
 from absl import app
 from absl import flags
-from flax.linen import partitioning as nn_partitioning
+from flax.core.spmd import logical_axis_rules
 import jax
-import transformers
-
-from maxtext.utils import model_creation_utils
-from maxtext.utils import max_logging
-from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR
+from maxtext.common import profiler
 from maxtext.common.common_types import Config
+from maxtext.configs import pyconfig
 from maxtext.integration.tunix.tunix_adapter import TunixMaxTextAdapter
+import maxtext.integration.vllm.maxtext_vllm_adapter as adapter
+from maxtext.multimodal import utils as mm_utils
+from maxtext.utils import lora_utils
+from maxtext.utils import max_logging
+from maxtext.utils import model_creation_utils
+from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR
+import transformers
 from tunix.rl.rollout import base_rollout
 from tunix.rl.rollout.vllm_rollout import VllmRollout
 from vllm import LLM
+# Force uses_mrope to False to disable 3D multimodal position IDs in text-only runs.
+# TODO(b/520142315): Class-level monkey patching is required here because ModelConfig.uses_mrope
+# is evaluated during the internal initialization of the LLM engine, making instance-level
+# configuration impossible. Check if a cleaner configuration option can be added in upstream vLLM.
+from vllm.config import ModelConfig
 from vllm.sampling_params import SamplingParams
-from maxtext.configs import pyconfig
 
-os.environ["SKIP_JAX_PRECOMPILE"] = "1"
-os.environ["NEW_MODEL_DESIGN"] = "1"
+_USE_MROPE = False
+_ORIGINAL_USES_MROPE = ModelConfig.uses_mrope.fget
 
+
+def _uses_mrope(self):
+  return _ORIGINAL_USES_MROPE(self) if _USE_MROPE else False
+
+
+ModelConfig.uses_mrope = property(_uses_mrope)
 
 # --- DEFINE FLAGS GLOBALLY ---
 FLAGS = flags.FLAGS
 
 flags.DEFINE_bool("use_tunix", False, "Whether to use Tunix for vLLM decoding.")
 flags.DEFINE_integer("seed", 42, "Random seed for sampling.")
+
+
+def build_chat_messages(config: Config) -> list[dict[str, Any]]:
+  """Builds the chat message list, prepending a system prompt when set."""
+  messages = []
+  if config.system_prompt:
+    messages.append({"role": "system", "content": config.system_prompt})
+
+  if config.use_multimodal and config.image_path:
+    content = [{"type": "image"} for _ in config.image_path.split(",")]
+    content.append({"type": "text", "text": config.prompt})
+    messages.append({"role": "user", "content": content})
+  else:
+    messages.append({"role": "user", "content": config.prompt})
+  return messages
 
 
 def decode_with_vllm(config: Config) -> None:
@@ -79,9 +108,12 @@ def decode_with_vllm(config: Config) -> None:
       "additional_config": {
           "maxtext_config": {
               "model_name": config.model_name,
-              "weight_dtype": "bfloat16",
+              "use_multimodal": config.use_multimodal,
+              "weight_dtype": config.weight_dtype.name,
               "allow_split_physical_axes": True,
               "debug_sharding": config.debug_sharding,
+              "prefuse_moe_weights": config.prefuse_moe_weights,
+              "scan_layers": config.scan_layers,
           },
           "sharding": {
               "sharding_strategy": {
@@ -101,6 +133,14 @@ def decode_with_vllm(config: Config) -> None:
     vllm_args["additional_config"]["sharding"]["sharding_strategy"]["expert_parallelism"] = config.ici_expert_parallelism
     vllm_args["enable_expert_parallel"] = enable_expert_parallel
 
+  if config.max_num_batched_tokens is not None:
+    vllm_args["max_num_batched_tokens"] = config.max_num_batched_tokens
+  if config.max_num_seqs is not None:
+    vllm_args["max_num_seqs"] = config.max_num_seqs
+
+  global _USE_MROPE
+  _USE_MROPE = config.use_multimodal and config.use_mrope
+
   max_logging.log(
       f"Initializing LLM with DP={config.ici_data_parallelism}, TP={config.ici_tensor_parallelism} "
       f"and EP={config.ici_expert_parallelism if enable_expert_parallel else 1}..."
@@ -110,7 +150,7 @@ def decode_with_vllm(config: Config) -> None:
   argv_list = ["", str(vllm_config_path), "log_config=False"]
   vllm_config = pyconfig.initialize(argv_list)
 
-  with nn_partitioning.axis_rules(vllm_config.logical_axis_rules):
+  with logical_axis_rules(vllm_config.logical_axis_rules):
     llm = LLM(**vllm_args)
 
   max_logging.log("Generating output...")
@@ -122,11 +162,8 @@ def decode_with_vllm(config: Config) -> None:
   prompts = [config.prompt]
   if config.use_chat_template:
     # Format the prompt using chat template if specified
-    messages = [
-        {"role": "user", "content": config.prompt},
-    ]
     input_with_chat_template = tokenizer.apply_chat_template(
-        messages,
+        build_chat_messages(config),
         tokenize=False,  # Set to False to get the string
         add_generation_prompt=True,
         add_special_tokens=False,  # Prevent adding special tokens
@@ -134,21 +171,32 @@ def decode_with_vllm(config: Config) -> None:
     prompts = [input_with_chat_template]
 
   max_prompt_length = max(len(tokenizer.encode(p)) for p in prompts)
+
+  if config.use_multimodal and config.image_path:
+    images = [mm_utils.load_image_from_path(path.strip()) for path in config.image_path.split(",")]
+    image_data = images[0] if len(images) == 1 else images
+    prompts = [{"prompt": prompts[0], "multi_modal_data": {"image": image_data}}]
   max_tokens_to_generate = config.max_target_length - max_prompt_length
   if max_tokens_to_generate <= 0:
     raise ValueError(
         f"max_target_length ({config.max_target_length}) must be greater than max_prompt_length ({max_prompt_length})"
     )
 
+  # MaxText uses -1 to mean "disabled"; vLLM requires top_p in (0, 1].
+  top_p = config.decode_sampling_nucleus_p if config.decode_sampling_nucleus_p > 0 else 1.0
+  top_k = config.decode_sampling_top_k if config.decode_sampling_top_k > 0 else -1
+
   sampling_params = SamplingParams(
       temperature=config.decode_sampling_temperature,
       max_tokens=max_tokens_to_generate,
-      top_k=config.decode_sampling_top_k,
-      top_p=config.decode_sampling_nucleus_p,
-      seed=FLAGS.seed,
+      top_k=top_k,
+      top_p=top_p,
   )
 
+  prof = profiler.Profiler(config)
+  prof.activate()
   outputs = llm.generate(prompts, sampling_params)
+  prof.deactivate()
 
   # max_logging.log Outputs
   for output in outputs:
@@ -170,7 +218,18 @@ def decode_with_tunix(
     mesh: The JAX mesh for parallelism.
   """
   # Wrap the model for Tunix
-  tunix_model = TunixMaxTextAdapter(base_model=model)
+  use_no_op_mappings = False
+  if hasattr(config, "vllm_hf_overrides") and config.vllm_hf_overrides:
+    overrides = config.vllm_hf_overrides
+    if isinstance(overrides, str) and "MaxTextForCausalLM" in overrides:
+      use_no_op_mappings = True
+    elif isinstance(overrides, dict) and "MaxTextForCausalLM" in overrides.get("architectures", []):
+      use_no_op_mappings = True
+
+  tunix_model = TunixMaxTextAdapter(
+      base_model=model,
+      use_no_op_mappings=use_no_op_mappings,
+  )
 
   # Load the tokenizer
   tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -183,11 +242,8 @@ def decode_with_tunix(
   prompts = [config.prompt]
   if config.use_chat_template:
     # Format the prompt using chat template if specified
-    messages = [
-        {"role": "user", "content": config.prompt},
-    ]
     input_with_chat_template = tokenizer.apply_chat_template(
-        messages,
+        build_chat_messages(config),
         tokenize=False,  # Set to False to get the string
         add_generation_prompt=True,
         add_special_tokens=False,  # Prevent adding special tokens
@@ -201,13 +257,46 @@ def decode_with_tunix(
         f"max_target_length ({config.max_target_length}) must be greater than max_prompt_length ({max_prompt_length})"
     )
 
+  # MaxText uses -1 to mean "disabled"; vLLM requires top_p in (0, 1].
+  top_p = config.decode_sampling_nucleus_p if config.decode_sampling_nucleus_p > 0 else 1.0
+  top_k = config.decode_sampling_top_k if config.decode_sampling_top_k > 0 else -1
+
+  rollout_vllm_additional_config = {
+      "maxtext_config": {
+          "model_name": config.model_name,
+          "weight_dtype": config.weight_dtype.name,
+          "allow_split_physical_axes": True,
+          "debug_sharding": config.debug_sharding,
+          "prefuse_moe_weights": config.prefuse_moe_weights,
+          "scan_layers": config.scan_layers,
+      }
+  }
+
+  if config.lora.enable_lora:
+    rollout_vllm_additional_config["maxtext_config"]["lora"] = {
+        "enable_lora": config.lora.enable_lora,
+        "lora_restore_path": config.lora.lora_restore_path,
+        "lora_rank": config.lora.lora_rank,
+        "lora_alpha": config.lora.lora_alpha,
+        "lora_module_path": config.lora.lora_module_path,
+    }
+
   # Create vLLM rollout for inference
   rollout_config = base_rollout.RolloutConfig(
       max_tokens_to_generate=max_tokens_to_generate,
       max_prompt_length=max_prompt_length,
       temperature=config.decode_sampling_temperature,
-      top_p=config.decode_sampling_nucleus_p,
-      top_k=config.decode_sampling_top_k,
+      top_p=top_p,
+      top_k=top_k,
+      rollout_vllm_model_version=config.tokenizer_path,
+      rollout_vllm_hbm_utilization=config.hbm_utilization_vllm,
+      rollout_vllm_init_with_random_weights=True,
+      rollout_vllm_tpu_backend_type="jax",
+      tensor_parallel_size=(config.ici_tensor_parallelism if config.ici_tensor_parallelism > 0 else 1),
+      data_parallel_size=jax.device_count()
+      // (config.ici_tensor_parallelism if config.ici_tensor_parallelism > 0 else 1),
+      rollout_vllm_additional_config=rollout_vllm_additional_config,
+      rollout_vllm_kwargs={"hf_overrides": config.vllm_hf_overrides},
   )
   vllm_rollout = VllmRollout(
       model=tunix_model,
@@ -217,12 +306,7 @@ def decode_with_tunix(
       # other special formatting, which is not part of max_prompt_length.
       cache_config_or_size=max_prompt_length + max_tokens_to_generate + 256,
       mesh=mesh,
-      model_version=config.tokenizer_path,
-      hbm_utilization=0.8,
-      # Initialize vllm model with random weights to speed up bootstrap time.
-      # Actual model weights will be loaded later.
-      init_with_random_weights=True,
-      tpu_backend_type="jax",
+      rollout_config=rollout_config,
   )
 
   # Generate text
@@ -232,6 +316,11 @@ def decode_with_tunix(
 
 
 def main(argv: Sequence[str]) -> None:
+  # Keep these in main(): registering the adapter and setting engine env flags
+  # at import time would leak into any process that merely imports this module.
+  os.environ["SKIP_JAX_PRECOMPILE"] = "1"
+  os.environ["NEW_MODEL_DESIGN"] = "1"
+
   jax.config.update("jax_default_prng_impl", "unsafe_rbg")
   os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
   if "xla_tpu_spmd_rng_bit_generator_unsafe" not in os.environ.get("LIBTPU_INIT_ARGS", ""):
@@ -240,9 +329,14 @@ def main(argv: Sequence[str]) -> None:
     )
 
   config = pyconfig.initialize(argv)
+  adapter.register(config)
 
   if FLAGS.use_tunix:
-    maxtext_model, mesh = model_creation_utils.create_nnx_model(config)
+    maxtext_model, mesh = model_creation_utils.from_pretrained(config)
+    if config.lora.enable_lora:
+      maxtext_model = lora_utils.apply_lora_to_model(maxtext_model, mesh, config)
+      if config.lora.lora_restore_path:
+        lora_utils.restore_lora_from_path(maxtext_model, config)
     decode_with_tunix(config, model=maxtext_model, mesh=mesh)
   else:
     decode_with_vllm(config)

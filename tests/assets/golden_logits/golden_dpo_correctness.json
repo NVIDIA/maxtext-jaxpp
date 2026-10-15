@@ -1,0 +1,18 @@
+{
+  "explicit_prompt_len_3_column": {
+    "loss_step_1": 0.6931471824645996,
+    "margin_step_1": 0.0,
+    "loss": 0.690365,
+    "margin": 0.005573,
+    "chosen_logps": -882.7361450195312,
+    "rejected_logps": -587.572693
+  },
+  "default_prompt_len_2_column": {
+    "loss_step_1": 0.6931471824645996,
+    "margin_step_1": 0.0,
+    "loss": 0.620875,
+    "margin": 0.150177,
+    "chosen_logps": -907.599609375,
+    "rejected_logps": -578.226013
+  }
+}

@@ -17,18 +17,27 @@
 from typing import Callable
 
 import jax
+import jax.numpy as jnp
 
 from flax import linen as nn
 from flax import nnx
 from aqt.jax.v2 import aqt_tensor
 
-from maxtext.common.common_types import Array, DType, Shape, PRNGKey
+from maxtext.common.common_types import Array, DType, Shape, PRNGKey, is_fp8_dtype
 
 Initializer = Callable[[PRNGKey, Shape, DType], Array]
 InitializerAxis = int | tuple[int, ...]
 NdInitializer = Callable[[PRNGKey, Shape, DType, InitializerAxis, InitializerAxis], Array]
 
-default_embed_init = nn.initializers.variance_scaling(1.0, "fan_in", "normal", out_axis=0)
+
+def _default_embed_init(key, shape, dtype=jnp.float32):
+  target_dtype = dtype
+  sample_dtype = jnp.float32 if is_fp8_dtype(dtype) else dtype
+  fn = nn.initializers.variance_scaling(1.0, "fan_in", "normal", out_axis=0)
+  return fn(key, shape, sample_dtype).astype(target_dtype)
+
+
+default_embed_init = _default_embed_init
 
 default_bias_init = jax.nn.initializers.constant(0.0)
 default_scalar_init = jax.nn.initializers.constant(0.01)
@@ -54,16 +63,18 @@ def nd_dense_init(scale, mode, distribution):
 
   def init_fn(key, shape, dtype, in_axis, out_axis):
     """Initializes an array using variance scaling with specified axes."""
+    target_dtype = dtype
+    sample_dtype = jnp.float32 if is_fp8_dtype(dtype) else dtype
     fn = jax.nn.initializers.variance_scaling(scale, mode, distribution, in_axis, out_axis)
-    return fn(key, shape, dtype)
+    return fn(key, shape, sample_dtype).astype(target_dtype)
 
   return init_fn
 
 
-def variable_to_logically_partitioned(variable: nnx.VariableState):
+def variable_to_logically_partitioned(variable: nnx.Variable):
   """Wraps an NNX variable's value in `nn.LogicallyPartitioned`.
 
-  This function inspects the metadata of an `nnx.VariableState` object. If
+  This function inspects the metadata of an `nnx.Variable` object. If
   sharding information ('out_sharding', 'sharding' or 'sharding_names') is
   present, it wraps the variable's value in `nn.LogicallyPartitioned` to apply
   the specified sharding constraints.
@@ -73,16 +84,17 @@ def variable_to_logically_partitioned(variable: nnx.VariableState):
   wrapping.
 
   Args:
-    variable: The `nnx.VariableState` object to process.
+    variable: The `nnx.Variable` object to process.
 
   Returns:
     The variable's value, potentially wrapped in `nn.LogicallyPartitioned`.
   """
-  if isinstance(variable.value, aqt_tensor.QTensor):
-    return variable.value
+  val = variable.get_value()
+  if isinstance(val, aqt_tensor.QTensor):
+    return val
 
   if variable.type.__name__ == "_overwrite_with_gradient":
-    return variable.value
+    return val
 
   metadata = variable.get_metadata()
   out_sharding = None
@@ -94,11 +106,21 @@ def variable_to_logically_partitioned(variable: nnx.VariableState):
     out_sharding = metadata["sharding"]
 
   if out_sharding is not None:
+    if nnx.PARTITION_NAME in metadata:
+      partition_name = metadata[nnx.PARTITION_NAME]
+      scan_axis = metadata.get("param_scan_axis", 0) if variable.type == nnx.Param else 0
+
+      sharding_list = [out_sharding] if isinstance(out_sharding, str) else list(out_sharding)
+      if partition_name not in sharding_list:
+        sharding_list.insert(scan_axis, partition_name)
+
+      out_sharding = tuple(sharding_list)
+
     return nn.LogicallyPartitioned(  # type: ignore[wrong-keyword-args]
-        variable.value,
+        val,
         out_sharding,  # type: ignore[arg-type]
         mesh=metadata.get("mesh"),
         rules=metadata.get("rules"),
     )
   else:
-    return variable.value
+    return val

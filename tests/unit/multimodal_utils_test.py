@@ -1,4 +1,4 @@
-# Copyright 2023–2025 Google LLC
+# Copyright 2023–2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,16 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" Tests for the common MaxText utilities """
+"""Tests for the common MaxText utilities"""
 import os
+import types
 import unittest
 import numpy as np
 
+from maxtext.common.common_types import DecoderBlockType, VisionEncoderBlockType
 from maxtext.configs import pyconfig
 from maxtext.utils.globals import MAXTEXT_REPO_ROOT
+from maxtext.input_pipeline import input_pipeline_utils
 from maxtext.multimodal import processor as mm_processor
 from maxtext.multimodal import utils as mm_utils
 from maxtext.multimodal import processor_gemma3
+from maxtext.multimodal import processor_gemma4
 from maxtext.multimodal import processor_llama4
 
 
@@ -74,6 +78,80 @@ class TestTextImageFusionGemma3(unittest.TestCase):
         ]
     )
     np.testing.assert_array_equal(new_tokens, expected)
+
+
+class TestTextImageFusionGemma4(unittest.TestCase):
+  """Test inserting place_holder tokens for image for Gemma 4"""
+
+  def setUp(self):
+    super().setUp()
+    # Gemma 4 specific token IDs
+    self.BOI_TOKEN = 255999
+    self.EOI_TOKEN = 258882
+    self.PLACEHOLDER_TOKEN = 258880
+
+    # Mock sequence for testing the raw insert_sequence utility
+    self.mock_sequence = [self.BOI_TOKEN, self.PLACEHOLDER_TOKEN, self.EOI_TOKEN]
+
+  def test_insert_sequence_zero_image(self):
+    tokens = np.asarray([1, 2, 3, 4, 5, 6])
+    num_images = 0
+    new_tokens = processor_gemma4.insert_sequence(
+        at=self.PLACEHOLDER_TOKEN, sequence=self.mock_sequence, tokens=tokens, max_num_images=num_images
+    )
+    np.testing.assert_array_equal(new_tokens, tokens)
+
+  def test_insert_sequence_single_image(self):
+    tokens = np.asarray([1, 2, 3, self.PLACEHOLDER_TOKEN, 5, 6])
+    num_images = 1
+    new_tokens = processor_gemma4.insert_sequence(
+        at=self.PLACEHOLDER_TOKEN, sequence=self.mock_sequence, tokens=tokens, max_num_images=num_images
+    )
+    expected = np.asarray([1, 2, 3] + self.mock_sequence + [5, 6])
+    np.testing.assert_array_equal(new_tokens, expected)
+
+  def test_insert_sequence_two_images(self):
+    tokens = np.asarray([1, self.PLACEHOLDER_TOKEN, 3, 4, self.PLACEHOLDER_TOKEN, 6])
+    num_images = 2
+    new_tokens = processor_gemma4.insert_sequence(
+        at=self.PLACEHOLDER_TOKEN, sequence=self.mock_sequence, tokens=tokens, max_num_images=num_images
+    )
+    expected = np.asarray([1] + self.mock_sequence + [3, 4] + self.mock_sequence + [6])
+    np.testing.assert_array_equal(new_tokens, expected)
+
+  def test_insert_sequence_in_batch(self):
+    tokens = np.asarray(
+        [[1, 2, 3, self.PLACEHOLDER_TOKEN, 5, 6], [1, self.PLACEHOLDER_TOKEN, 3, 4, self.PLACEHOLDER_TOKEN, 6]]
+    )
+    num_images = 2
+    new_tokens = processor_gemma4.insert_sequence(
+        at=self.PLACEHOLDER_TOKEN, sequence=self.mock_sequence, tokens=tokens, max_num_images=num_images
+    )
+    expected = np.asarray(
+        [
+            [1, 2, 3] + self.mock_sequence + [5, 6] + [0] * (len(self.mock_sequence) - 1),
+            [1] + self.mock_sequence + [3, 4] + self.mock_sequence + [6],
+        ]
+    )
+    np.testing.assert_array_equal(new_tokens, expected)
+
+  def test_add_extra_tokens_for_images_gemma4_full_sequence(self):
+    """Verifies that the correct number of pooled soft tokens are inserted."""
+    tokens = np.asarray([1, 2, self.PLACEHOLDER_TOKEN, 4])
+
+    # Use the actual Gemma4 function
+    new_tokens = processor_gemma4.add_extra_tokens_for_images_gemma4(tokens=tokens, max_num_images=1)
+
+    # Calculate expected soft tokens based on 672x960 image size, 16 patch size, and 3x3 pooling
+    num_patches = (672 // 16) * (960 // 16)  # 2520
+    num_soft_tokens = num_patches // (3**2)  # 280
+
+    expected_sequence = [self.BOI_TOKEN] + [self.PLACEHOLDER_TOKEN] * num_soft_tokens + [self.EOI_TOKEN]
+    expected_tokens = np.asarray([1, 2] + expected_sequence + [4])
+
+    # The length should be 3 (original non-image tokens) + 282 (inserted sequence) = 285
+    self.assertEqual(len(new_tokens), 285)
+    np.testing.assert_array_equal(new_tokens, expected_tokens)
 
 
 class TestLlama4ImageProcessing(unittest.TestCase):
@@ -202,6 +280,7 @@ class TestLlama4PostProcessing(unittest.TestCase):
     config = pyconfig.initialize(
         ["", base_config_path],
         model_name="llama4-17b-16e",
+        skip_jax_distributed_system=True,
     )
     image_offsets = mm_processor.get_image_offsets(config=config, processor_output=processor_output)
     post_processed_tokens = processor_llama4.add_extra_tokens_for_images_llama4(dummy_tokens, processor_output)
@@ -279,6 +358,199 @@ class TestLlama4PostProcessing(unittest.TestCase):
     # The first position should always be preserved.
     np.testing.assert_array_equal(merged[0, 0], text_embeddings[0, 0])
     np.testing.assert_array_equal(merged_null[0, 0], text_embeddings[0, 0])
+
+  def test_merge_mm_embeddings_with_token_level_video_mask(self):
+    """A projected-token mask packs only valid padded video embeddings."""
+    text_embeddings = np.arange(1 * 8 * 2, dtype=np.float32).reshape(1, 8, 2)
+    video_embeddings = np.arange(1 * 6 * 2, dtype=np.float32).reshape(1, 6, 2) + 100.0
+    placeholder_mask = np.zeros((1, 8), dtype=np.int32)
+    placeholder_mask[:, 2:5] = 1
+    video_token_mask = np.asarray([[1, 1, 1, 0, 0, 0]], dtype=np.int32)
+
+    merged = mm_utils.merge_mm_embeddings(
+        text_embeddings,
+        video_embeddings,
+        placeholder_mask,
+        video_token_mask,
+    )
+
+    np.testing.assert_array_equal(merged[0, 2:5], video_embeddings[0, :3])
+    np.testing.assert_array_equal(merged[0, 5:], text_embeddings[0, 5:])
+
+
+class TestMultimodalProcessorRouting(unittest.TestCase):
+  """Tests for multimodal processor prompt/response formatting and training preprocessing."""
+
+  def test_reformat_response_multimodal_vs_text_only(self):
+    # Multimodal Qwen3 model should append <|im_end|>
+    self.assertEqual(mm_processor.reformat_response("Hello world", "qwen3-vl-2b"), "Hello world<|im_end|>")
+    # Text-only Qwen3 model should return response unchanged
+    self.assertEqual(mm_processor.reformat_response("Hello world", "qwen3-4b"), "Hello world")
+    # Multimodal Gemma 3 model should append <end_of_turn>
+    self.assertEqual(mm_processor.reformat_response("Hello world", "gemma3-4b"), "Hello world<end_of_turn>")
+    # Multimodal Llama 4 model should append <|eot|>
+    self.assertEqual(mm_processor.reformat_response("Hello world", "llama4-17b-16e"), "Hello world<|eot|>")
+
+  def test_input_pipeline_reformat_response_string_and_list(self):
+    # Test list response column (e.g. ChartQA where label = ['186600'])
+    ex_list = {"label": ["186600"]}
+    res_list = input_pipeline_utils.reformat_response(ex_list, "label", "maxtext-omni-gemma3-qwen3")
+    self.assertEqual(res_list["label"], "186600<|im_end|>")
+
+    # Test string response column (e.g. ChartNet where summary = 'This is a chart summary.')
+    ex_str = {"summary": "This is a chart summary."}
+    res_str = input_pipeline_utils.reformat_response(ex_str, "summary", "maxtext-omni-gemma3-qwen3")
+    self.assertEqual(res_str["summary"], "This is a chart summary.<|im_end|>")
+
+    # Test empty list and tuple raise ValueError
+    with self.assertRaises(ValueError):
+      input_pipeline_utils.reformat_response({"label": []}, "label", "maxtext-omni-gemma3-qwen3")
+    # Test empty string raises ValueError
+    with self.assertRaises(ValueError):
+      input_pipeline_utils.reformat_response({"summary": ""}, "summary", "maxtext-omni-gemma3-qwen3")
+    # Test None raises ValueError
+    with self.assertRaises(ValueError):
+      input_pipeline_utils.reformat_response({"label": None}, "label", "maxtext-omni-gemma3-qwen3")
+
+  def test_reformat_prompt_text_only_fallback(self):
+    # Text-only models should return prompt unchanged
+    self.assertEqual(
+        mm_processor.reformat_prompt("Tell me a story", "<img>", "qwen3-4b", num_images=0), "Tell me a story"
+    )
+    self.assertEqual(
+        mm_processor.reformat_prompt("Tell me a story", "<img>", "llama2-7b", num_images=0), "Tell me a story"
+    )
+
+  def test_get_vision_and_decoder_block_routing(self):
+    # pylint: disable=protected-access
+    # Multimodal Qwen3-VL
+    self.assertEqual(mm_processor._get_vision_block("qwen3-vl-2b"), "qwen3_vl")
+    self.assertEqual(mm_processor._get_decoder_block("qwen3-vl-2b"), "qwen3")
+
+    # Multimodal Qwen3.5
+    self.assertEqual(mm_processor._get_vision_block("qwen3.5-35b-a3b"), "qwen3_5")
+    self.assertEqual(mm_processor._get_decoder_block("qwen3.5-35b-a3b"), "qwen3_5")
+
+    # Small Gemma 4 (tests gemma4_small decoder block)
+    self.assertEqual(mm_processor._get_vision_block("gemma4-e4b"), "gemma4")
+    self.assertEqual(mm_processor._get_decoder_block("gemma4-e4b"), "gemma4_small")
+
+    # Text-only Qwen3-4B should have empty vision block and fallback to model_name
+    self.assertIsNone(mm_processor._get_vision_block("qwen3-4b"))
+    self.assertEqual(mm_processor._get_decoder_block("qwen3-4b"), "qwen3-4b")
+
+    # Text-only Llama 2 should have empty vision block and fallback to model_name
+    self.assertIsNone(mm_processor._get_vision_block("llama2-7b"))
+    self.assertEqual(mm_processor._get_decoder_block("llama2-7b"), "llama2-7b")
+
+  def test_get_vision_and_decoder_block_routing_from_config(self):
+    # pylint: disable=protected-access
+    # Test with pyconfig Config objects
+    base_config_path = os.path.join(MAXTEXT_REPO_ROOT, "src", "maxtext", "configs", "base.yml")
+    config_qwen3_vl = pyconfig.initialize(
+        ["", base_config_path],
+        model_name="qwen3-vl-2b",
+        scan_layers=False,
+        skip_jax_distributed_system=True,
+    )
+    self.assertEqual(mm_processor._get_vision_block(config_qwen3_vl), "qwen3_vl")
+    self.assertEqual(mm_processor._get_decoder_block(config_qwen3_vl), "qwen3")
+
+    config_gemma3 = pyconfig.initialize(
+        ["", base_config_path],
+        model_name="gemma3-4b",
+        skip_jax_distributed_system=True,
+    )
+    self.assertEqual(mm_processor._get_vision_block(config_gemma3), "gemma3")
+    self.assertEqual(mm_processor._get_decoder_block(config_gemma3), "gemma3")
+
+    config_text_only = pyconfig.initialize(
+        ["", base_config_path],
+        model_name="qwen3-4b",
+        skip_jax_distributed_system=True,
+    )
+    self.assertIsNone(mm_processor._get_vision_block(config_text_only))
+    self.assertEqual(mm_processor._get_decoder_block(config_text_only), "qwen3")
+
+    # Test with config-like objects covering DecoderBlockType and VisionEncoderBlockType
+    mock_config = types.SimpleNamespace(
+        decoder_block=DecoderBlockType.GEMMA4_SMALL,
+        vision_encoder_block=VisionEncoderBlockType.GEMMA4,
+    )
+    self.assertEqual(mm_processor._get_vision_block(mock_config), "gemma4")
+    self.assertEqual(mm_processor._get_decoder_block(mock_config), "gemma4_small")
+
+    # Test config with DEFAULT decoder_block and NONE vision_encoder_block
+    mock_default = types.SimpleNamespace(
+        decoder_block=DecoderBlockType.DEFAULT,
+        vision_encoder_block=VisionEncoderBlockType.NONE,
+        model_name="custom_model",
+    )
+    self.assertIsNone(mm_processor._get_vision_block(mock_default))
+    self.assertEqual(mm_processor._get_decoder_block(mock_default), "custom_model")
+
+  def test_get_dummy_image_shape_for_init(self):
+    # Multimodal models should return non-empty dummy shape
+    self.assertGreater(len(mm_processor.get_dummy_image_shape_for_init("gemma3-4b")), 0)
+    self.assertGreater(len(mm_processor.get_dummy_image_shape_for_init("gemma4-26b")), 0)
+    self.assertGreater(len(mm_processor.get_dummy_image_shape_for_init("llama4-17b-16e")), 0)
+    self.assertGreater(len(mm_processor.get_dummy_image_shape_for_init("qwen3-vl-2b")), 0)
+
+    # Text-only models should return empty tuple ()
+    self.assertEqual(mm_processor.get_dummy_image_shape_for_init("qwen3-4b"), ())
+    self.assertEqual(mm_processor.get_dummy_image_shape_for_init("llama2-7b"), ())
+
+  def test_preprocess_image_for_training(self):
+    dummy_image = np.zeros((224, 224, 3), dtype=np.uint8)
+    base_config_path = os.path.join(MAXTEXT_REPO_ROOT, "src", "maxtext", "configs", "base.yml")
+
+    # Multimodal model should return non-empty output
+    config_gemma3 = pyconfig.initialize(
+        ["", base_config_path],
+        model_name="gemma3-4b",
+        skip_jax_distributed_system=True,
+    )
+    output = mm_processor.preprocess_image_for_training([dummy_image], config_gemma3)
+    self.assertIsNotNone(output)
+
+    # Text-only model should raise ValueError
+    config_text_only = pyconfig.initialize(
+        ["", base_config_path],
+        model_name="qwen3-4b",
+        skip_jax_distributed_system=True,
+    )
+    with self.assertRaises(ValueError):
+      mm_processor.preprocess_image_for_training([dummy_image], config_text_only)
+
+  def test_omni_gemma3_qwen3_processor_routing(self):
+    # pylint: disable=protected-access,import-outside-toplevel
+    self.assertEqual(mm_processor._get_vision_block("maxtext-omni-gemma3-qwen3"), "gemma3")
+    self.assertEqual(mm_processor._get_decoder_block("maxtext-omni-gemma3-qwen3"), "qwen3")
+
+    omni_config = types.SimpleNamespace(
+        vision_encoder_block=VisionEncoderBlockType.GEMMA3,
+        decoder_block=DecoderBlockType.QWEN3,
+        model_name="maxtext-omni-gemma3-qwen3",
+    )
+    self.assertEqual(mm_processor.get_image_offsets(omni_config, None), 255)
+
+    from maxtext.experimental.omni_pipeline.utils import processor_maxtext_omni
+
+    qwen_image_pad = processor_maxtext_omni.DECODER_SPECIAL_TOKENS["qwen3"]["image_pad"]
+    tokens = [1, qwen_image_pad, 2]
+    fused = mm_processor.prepare_text_for_image_fusion(tokens, config=omni_config)
+    self.assertEqual(len(fused), 1 + 256 + 1)
+
+    mask = mm_processor.get_bidirectional_mask_vision(omni_config, np.array([[10, qwen_image_pad]]))
+    np.testing.assert_array_equal(mask, [[False, True]])
+
+    unsupported_omni = types.SimpleNamespace(
+        vision_encoder_block=VisionEncoderBlockType.LLAMA4,
+        decoder_block=DecoderBlockType.QWEN3,
+        model_name="maxtext-omni-unsupported",
+    )
+    with self.assertRaises(ValueError):
+      mm_processor.get_image_offsets(unsupported_omni, None)
 
 
 if __name__ == "__main__":

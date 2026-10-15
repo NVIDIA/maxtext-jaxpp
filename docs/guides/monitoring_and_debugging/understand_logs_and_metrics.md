@@ -20,11 +20,11 @@
 
 When you run a training job, MaxText produces detailed output logs. This guide shows you how to interpret these logs to understand your configuration and monitor performance.
 
-To start, run a simple pretraining job on a single-host TPU. For instance, we can run the following command on TPU v5p-8. The resulting log is used as an example throughout this guide.
+To start, run a simple pretraining job on a single-host TPU. For instance, we can run the following command on TPU v5p-8. The resulting log is used as an example throughout this guide. Replace `<GCS_BUCKET>` in the command below to point to the GCS bucket you want to use for your output.
 
 ```bash
 python3 -m maxtext.trainers.pre_train.train \
-base_output_directory=gs://runner-maxtext-logs run_name=demo \
+base_output_directory=gs://<GCS_BUCKET> run_name=demo \
 model_name=deepseek2-16b \
 per_device_batch_size=24 max_target_length=2048 steps=10 dataset_type=synthetic enable_checkpointing=false
 ```
@@ -80,23 +80,23 @@ Config param data_sharding: (('data', 'stage', 'fsdp', 'fsdp_transpose', 'sequen
 This also includes the **output paths** for your run artifacts.
 
 ```
-Config param base_output_directory: gs://runner-maxtext-logs
+Config param base_output_directory: gs://<GCS_BUCKET>
 Config param run_name: demo
-Config param metrics_dir: gs://runner-maxtext-logs/demo/metrics/
-Config param tensorboard_dir: gs://runner-maxtext-logs/demo/tensorboard/
-Config param checkpoint_dir: gs://runner-maxtext-logs/demo/checkpoints/
+Config param metrics_dir: gs://<GCS_BUCKET>/demo/metrics/
+Config param tensorboard_dir: gs://<GCS_BUCKET>/demo/tensorboard/
+Config param checkpoint_dir: gs://<GCS_BUCKET>/demo/checkpoints/
 ```
 
 ### Understanding output paths
 
-MaxText organizes all of your run's artifacts into a main output directory. The primary location for your run is constructed by combining the `base_output_directory` and the `run_name` you specify in your command. Based on the logs above, the base path for this specific run is `gs://runner-maxtext-logs/demo`.
+MaxText organizes all of your run's artifacts into a main output directory. The primary location for your run is constructed by combining the `base_output_directory` and the `run_name` you specify in your command. Based on the logs above, the base path for this specific run is `gs://<GCS_BUCKET>/demo`.
 
 Within this base path, MaxText creates several subdirectories for different types of artifacts. Many of these are optional and only created if you enable them with a specific flag.
 
 - **TensorBoard logs (`tensorboard/`)**
 
   - Flag: `enable_tensorboard=True` (default)
-  - Path: `gs://runner-maxtext-logs/demo/tensorboard/`
+  - Path: `gs://<GCS_BUCKET>/demo/tensorboard/`
 
 - **Profiler traces (`tensorboard/plugins/profile/`)**
 
@@ -106,17 +106,17 @@ Within this base path, MaxText creates several subdirectories for different type
 - **Metrics in plain text (`metrics/`)**
 
   - Flag: `gcs_metrics=True`
-  - Path: `gs://runner-maxtext-logs/demo/metrics/`
+  - Path: `gs://<GCS_BUCKET>/demo/metrics/`
 
 - **Configuration file (`config.yml`)**
 
   - Flag: `save_config_to_gcs=True`
-  - Path: `gs://runner-maxtext-logs/demo/config.yml`
+  - Path: `gs://<GCS_BUCKET>/demo/config.yml`
 
 - **Checkpoints (`checkpoints/`)**
 
   - Flag: `enable_checkpointing=True`
-  - Path: `gs://runner-maxtext-logs/demo/checkpoints/`
+  - Path: `gs://<GCS_BUCKET>/demo/checkpoints/`
 
 To generate all optional artifacts in one run, you can set the corresponding flags in the command line, like in the example below.
 
@@ -124,7 +124,7 @@ This command enables tensorboard, profiler, text metrics, config saving, and che
 
 ```bash
 python3 -m maxtext.trainers.pre_train.train \
-base_output_directory=gs://runner-maxtext-logs run_name=demo2 \
+base_output_directory=gs://<GCS_BUCKET> run_name=demo2 \
 model_name=deepseek2-16b \
 per_device_batch_size=24 max_target_length=2048 steps=10 dataset_type=synthetic \
 enable_tensorboard=True \
@@ -159,10 +159,11 @@ Before executing training, the program analyzes the resource requirements for yo
 We first perform a "dry run" compilation of a training step to [analyze its memory requirement](https://github.com/AI-Hypercomputer/maxtext/blob/28e5097ac467ed8b1d17676d68aa5acc50f9d60d/src/MaxText/train.py#L380-L382). This static analysis is performed by the XLA compiler. The log outputs [memory sizes](https://github.com/AI-Hypercomputer/maxtext/blob/28e5097ac467ed8b1d17676d68aa5acc50f9d60d/src/MaxText/max_utils.py#L672-L690):
 
 ```none
-Total memory size: 100.4 GB, Output size: 44.5 GB, Temp size: 55.9 GB, Argument size: 44.5 GB, Host temp size: 0.0 GB.
+Total estimated memory size: 100.4 GB, estimated output size: 44.5 GB, estimated temp size: 55.9 GB, estimated argument size: 44.5 GB, Estimated host temp size: 0.0 GB.
+Note that compiler could over-estimate the HBM usage.
 ```
 
-The most important number is `Total memory size: 100.4 GB`. This is the total High Bandwidth Memory (HBM) the TPU device needs to execute the program. Here is a breakdown:
+The most important number is `Total estimated memory size: 100.4 GB`. This is the estimated total High Bandwidth Memory (HBM) the TPU device needs to execute the program. Note that the compiler could over-estimate the HBM usage. Here is a breakdown:
 
 - `Argument size: 44.5 GB`: This is the memory needed to hold the inputs for your function. This typically includes the batch of data, parameter (master copy), and optimizer state (e.g., moment).
 - `Output size: 44.5 GB`: This is the space required to store the results of the computation, such as the updated model weights and updated optimizer states.
@@ -197,7 +198,7 @@ The **model FLOPs** are the floating point operations to perform model computati
 - The number of model FLOPs is dependent on model architecture, input size (batch size, sequence length), and gradient accumulation steps. It does not include optimization operations.
 - We break down the FLOPs into two parts:
   - "Learnable weight FLOPs" are matmuls between activations and learnable weights. Specifically, this occurs in embedding, feed forward networks, attention-related projections, and unembedding.
-  - "Attention FLOPs" are matmuls in attention score computation like $\\mathrm{softmax}{\\left(\\frac{QK^\\top}{\\sqrt{d}}\\right)} V$.
+  - "Attention FLOPs" are matmuls in attention score computation like $\mathrm{softmax}{\left(\frac{QK^\top}{\sqrt{d}}\right)} V$.
 
 One **TFLOP** (TeraFLOP) is equal to $10^{12}$ FLOPs. The log shows the theoretical estimate of **model TFLOP per device**:
 
@@ -207,7 +208,7 @@ Per train step:
  split as 94.54% learnable weight flops and 5.46% attention flops
 ```
 
-In this example, given `model=deepseek2-16b`, `per_device_batch_size=24`, `max_target_length=2048`, and no gradient accumulation, we have $\\text{model tflop per device} \\approx 764.67$.
+In this example, given `model=deepseek2-16b`, `per_device_batch_size=24`, `max_target_length=2048`, and no gradient accumulation, we have $\text{model tflop per device} \approx 764.67$.
 
 - 94.54% of the TFLOPs are attributed to learnable weight and 5.46% are attributed to attention.
 - As you will see next, this number is important for calculating performance metrics, such as TFLOP/s/device and Model FLOPs Utilization (MFU).
@@ -233,8 +234,8 @@ completed step: 9, seconds: 5.667, TFLOP/s/device: 134.924, Tokens/s/device: 867
 
 Before we dive deep here, recall a few numbers from previous sections:
 
-- $\\text{max target length} = 2048$, $\\text{per device batch size} = 24$
-- $\\text{model tflop per device} \\approx 764.67$ (rounded), $\\text{number of devices} = 4$
+- $\text{max target length} = 2048$, $\text{per device batch size} = 24$
+- $\text{model tflop per device} \approx 764.67$ (rounded), $\text{number of devices} = 4$
 
 ### 4.1. Performance metrics
 
@@ -244,41 +245,41 @@ The performance metrics fluctuate at the beginning, and become stable towards th
 completed step: 9, seconds: 5.667, TFLOP/s/device: 134.924, Tokens/s/device: 8672.758, total_weights: 196608, loss: 10.374
 ```
 
-As shown in `seconds: 5.667`, $\\text{measured step time in seconds} \\approx 5.667$ (rounded).
+As shown in `seconds: 5.667`, $\text{measured step time in seconds} \approx 5.667$ (rounded).
 
 **TFLOP per second per device**
 
 - It is [computed](https://github.com/AI-Hypercomputer/maxtext/blob/28e5097ac467ed8b1d17676d68aa5acc50f9d60d/src/MaxText/metric_logger.py#L211-L213) as
 
-$$\\text{tflop/s/device} = \\frac{\\text{model tflop per device}}{\\text{measured step time in seconds}}$$
+$$\text{tflop/s/device} = \frac{\text{model tflop per device}}{\text{measured step time in seconds}}$$
 
 - Here we have `TFLOP/s/device: 134.924`. Let's try to verify manually: $764.67 / 5.667 = 134.934$. Not exactly the same but close, since the both tflop and time are rounded in the log.
 - Further, we can calculate **Model FLOPs Utilization (MFU)** from this:
 
-$$\\text{MFU} = \\frac{\\text{tflop/s/device}}{\\text{peak hardware tflop/s}}$$
+$$\text{MFU} = \frac{\text{tflop/s/device}}{\text{peak hardware tflop/s}}$$
 
-For TPU v5p, $\\text{peak hardware tflop/s}=459$. Thus, $134.924 / 459 = 29.40$%. Note this is an example for explanation with small batch size and sequence length, so the MFU is not optimal.
+For TPU v5p, $\text{peak hardware tflop/s}=459$. Thus, $134.924 / 459 = 29.40$%. Note this is an example for explanation with small batch size and sequence length, so the MFU is not optimal.
 
 **Tokens per second per device (throughput)**
 
 - It is [computed](https://github.com/AI-Hypercomputer/maxtext/blob/28e5097ac467ed8b1d17676d68aa5acc50f9d60d/src/MaxText/metric_logger.py#L215-L217) as
 
-$$\\text{token/s/device} = \\frac{\\text{number of tokens per device}}{\\text{measured step time in seconds}}$$
+$$\text{token/s/device} = \frac{\text{number of tokens per device}}{\text{measured step time in seconds}}$$
 
 - The numerator is from [calculate_tokens_training_per_device](https://github.com/AI-Hypercomputer/maxtext/blob/28e5097ac467ed8b1d17676d68aa5acc50f9d60d/src/MaxText/maxtext_utils.py#L148)
 
-$$\\text{number of tokens per device} = \\text{per device batch size} \\times \\text{max target length}$$
+$$\text{number of tokens per device} = \text{per device batch size} \times \text{max target length}$$
 
-- Here we have `Tokens/s/device: 8672.758`. Let's try to verify manually: $24 \\times 2048 / 5.667 = 8673.372$. Not exactly the same but close, since the time is rounded in the log.
+- Here we have `Tokens/s/device: 8672.758`. Let's try to verify manually: $24 \times 2048 / 5.667 = 8673.372$. Not exactly the same but close, since the time is rounded in the log.
 
 ### 4.2. Learning metrics
 
 **Loss**. The loss is the key indicator of learning progress, which should decrease over training steps. In this example, the loss is `12.038` at Step 0 and decreases to `10.374` at Step 9. Ideally, we want the loss to converge to a small value with sufficiently large training steps.
 
-**Total weights**. When discussing the throughput, we have $\\text{number of tokens} = \\text{per device batch size} \\times \\text{max target length} \\times \\text{number of device}$. In this example, $\\text{number of tokens} = 24 \\times 2048 \\times 4 = 196608$. There are two types of tokens: real tokens and pad tokens. The pad tokens are placeholders introduced by data preprocessing: We truncate or pad each sentence to max target length. Only real tokens contribute to the learning signal (i.e., loss). Therefore, we monitor $\\text{number of real tokens}$, which is shown as [total weights](https://github.com/AI-Hypercomputer/maxtext/blob/28e5097ac467ed8b1d17676d68aa5acc50f9d60d/src/MaxText/train.py#L151).
+**Total weights**. When discussing the throughput, we have $\text{number of tokens} = \text{per device batch size} \times \text{max target length} \times \text{number of device}$. In this example, $\text{number of tokens} = 24 \times 2048 \times 4 = 196608$. There are two types of tokens: real tokens and pad tokens. The pad tokens are placeholders introduced by data preprocessing: We truncate or pad each sentence to max target length. Only real tokens contribute to the learning signal (i.e., loss). Therefore, we monitor $\text{number of real tokens}$, which is shown as [total weights](https://github.com/AI-Hypercomputer/maxtext/blob/28e5097ac467ed8b1d17676d68aa5acc50f9d60d/src/MaxText/train.py#L151).
 
 - Here we see `total_weights: 196608` for all steps. This is because we are using `dataset_type=synthetic`, where all sentences are generated with a length of `max_target_length=2048`. As a result, there are no pad tokens and total weights = number of tokens.
-- However, in real datasets, sentences can have variable lengths and total weights < number of tokens. For example, we can set `dataset_type=tfds dataset_path=gs://maxtext-dataset dataset_name='c4/en:3.0.1'`, and will see total weights smaller than `196608`:
+- However, in real datasets, sentences can have variable lengths and total weights < number of tokens. For example, we can set `dataset_type=tfds dataset_path=gs://<DATASET_PATH> dataset_name='c4/en:3.0.1'`, and will see total weights smaller than `196608`:
   ```none
   completed step: 8, seconds: 5.670, TFLOP/s/device: 134.856, Tokens/s/device: 8668.393, total_weights: 163259, loss: 9.596
   completed step: 9, seconds: 5.669, TFLOP/s/device: 134.884, Tokens/s/device: 8670.184, total_weights: 155934, loss: 9.580

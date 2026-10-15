@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" Checkpoint conversion utility functions. """
+"""Checkpoint conversion utility functions."""
 
 import contextlib
+import gc
 import io
+import logging
 import os
 import tempfile
 import time
@@ -30,10 +32,10 @@ import pathlib
 from etils import epath
 
 import jax
+import jax.numpy as jnp
+from jax import tree
 from jax.experimental import multihost_utils
 from jaxtyping import Array
-
-from google.cloud.storage import Client, transfer_manager
 
 from safetensors import safe_open
 from safetensors.numpy import save_file as numpy_save_file
@@ -45,8 +47,16 @@ from huggingface_hub import HfApi, repo_exists, snapshot_download
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 from transformers import AutoModelForCausalLM
 
+from flax.training import train_state
+from maxtext.common import checkpointing
+from maxtext.common.gcloud_stub import gcs_storage
+from maxtext.checkpoint_conversion.utils.tensor_handling import nesting_depth, stacked_axes
 from maxtext.utils import max_logging
 import orbax.checkpoint as ocp
+
+_storage = gcs_storage()
+Client = _storage.Client
+transfer_manager = _storage.transfer_manager
 
 
 SAFE_TENSORS_CONFIG_FILE = "config.json"
@@ -99,11 +109,19 @@ def validate_and_filter_param_map_keys(param_map_keys, maxtext_state_keys):
   # 1 Validate: every maxtext state key must be covered by param map
   missing_keys = maxtext_state_keys - flattened_map_keys
   if missing_keys:
+    hint = ""
+    ckpt_has_scanned = any("scanned_blocks" in k for k in missing_keys)
+    map_has_scanned = any("scanned_blocks" in k for k in flattened_map_keys)
+    if ckpt_has_scanned and not map_has_scanned:
+      hint = "\nHint: checkpoint keys contain 'scanned_blocks' but param_map does not — try scan_layers=True."
+    elif map_has_scanned and not ckpt_has_scanned:
+      hint = "\nHint: param_map contains 'scanned_blocks' keys but checkpoint does not — try scan_layers=False."
     raise ValueError(
         "maxtext_state_dict must be a subset of flattened param_map"
         + f"\nparam map\n{param_map_keys}"
         + f"\nmaxtext:\n{maxtext_state_keys}"
         + f"\nmissing keys:\n{missing_keys}"
+        + hint
     )
 
   # 2 Filter: param map may have extra keys
@@ -146,36 +164,47 @@ def convert_jax_weight_to_numpy(weight: "jax.Array", dtype_str: None | str = Non
     A NumPy array containing the data from `weight`, cast to `dtype_str` if provided.
   """
   final_dtype_str = str(weight.dtype) if dtype_str is None else dtype_str
-  # JAX dtypes like 'bfloat16', 'float32' are understood by np.dtype()
-  target_np_dtype = np.dtype(final_dtype_str)
   expected_shape = weight.shape
 
-  # Gather the array across devices if it's sharded.
-  # process_allgather typically returns the array on the host.
+  if str(weight.dtype) != final_dtype_str:
+    # Cast in JAX before process_allgather to reduce interconnect data transfer and host RAM
+    # usage when downcasting dtypes.
+    weight = weight.astype(final_dtype_str)
+
   weight = multihost_utils.process_allgather(weight)
-
-  # Convert JAX array to NumPy array.
-  np_array = np.array(weight)
-
-  # Cast to the target NumPy dtype if it's different.
-  if np_array.dtype != target_np_dtype:
-    np_array = np_array.astype(target_np_dtype)
-
-  return np_array.reshape(expected_shape)  # Reshape for safety, though usually preserved.
+  # Use np.asarray to avoid redundant copies when the gathered buffer can be viewed directly.
+  np_array = np.asarray(weight)
+  return np_array.reshape(expected_shape)
 
 
 def _process(hf_path, processed_slice, output_weights, current_hook_fns, hf_shape_map, save_dtype):
   """Applies hooks, converts a JAX slice to NumPy, and appends it to the output list, used in to_huggingface"""
-  if hf_path not in hf_shape_map:
-    raise ValueError(f"HF path '{hf_path}' not found in hf_shape_map.")
-  target_hf_shape = hf_shape_map[hf_path]
-  # If hook is unsepecified, use identity
-  if current_hook_fns:
-    processed_slice = apply_hook_fns(processed_slice, target_hf_shape, current_hook_fns)
-  numpy_slice = convert_jax_weight_to_numpy(processed_slice, save_dtype).squeeze()
-  if numpy_slice.shape != tuple(target_hf_shape):
-    raise ValueError(f"Shape mismatch for {hf_path}: Expect {target_hf_shape}, got {numpy_slice.shape}")
-  output_weights.append((hf_path, numpy_slice))
+  # --- Case 1: 1-to-N Splitting (hf_path is a tuple) ---
+  if isinstance(hf_path, tuple):
+    # Perform safety check on the collective tuple key first
+    if hf_path not in hf_shape_map:
+      raise ValueError(f"HF path tuple '{hf_path}' not found in hf_shape_map.")
+    target_hf_shapes = hf_shape_map[hf_path]
+
+    # Apply hooks (your hook function returns a tuple of sliced JAX arrays)
+    if current_hook_fns:
+      processed_slice = apply_hook_fns(processed_slice, target_hf_shapes, current_hook_fns)
+
+    # Iterate, unpack, and convert each component independently
+    for path, single_slice, shape in zip(hf_path, processed_slice, target_hf_shapes):
+      numpy_slice = convert_jax_weight_to_numpy(single_slice, save_dtype).reshape(shape)
+      output_weights.append((path, numpy_slice))
+
+  # --- Case 2: Legacy Standard 1-to-1 Mapping (hf_path is a single string) ---
+  else:
+    if hf_path not in hf_shape_map:
+      raise ValueError(f"HF path '{hf_path}' not found in hf_shape_map.")
+    target_hf_shape = hf_shape_map[hf_path]
+
+    if current_hook_fns:
+      processed_slice = apply_hook_fns(processed_slice, target_hf_shape, current_hook_fns)
+    numpy_slice = convert_jax_weight_to_numpy(processed_slice, save_dtype).reshape(target_hf_shape)
+    output_weights.append((hf_path, numpy_slice))
 
 
 def process_maxtext_param(
@@ -190,11 +219,10 @@ def process_maxtext_param(
 
   This function is responsible for taking a MaxText parameter and transforming
   it into one or more Hugging Face compatible parameters. It handles various
-  scenarios based on
+  scenarios based on:
   - the MaxText key form (`atomic_mt_key` or `composite_mt_key`)
-  - and the Hugging Face value form (unscanned string, scanned list of strings,
+  - the Hugging Face value form (unscanned string, scanned list of strings,
     unscanned with expert stacking, or scanned with expert stacking).
-  Note: We assume composite_mt_key can only occur for unscanned/scanned HF keys, but not those with expert stacking.
 
   Args:
     maxtext_param_key: The key identifying the MaxText parameter(s). Can be
@@ -222,6 +250,9 @@ def process_maxtext_param(
   if maxtext_param_key not in param_map:
     raise ValueError(f"MaxText param key '{maxtext_param_key}' not found in param_map.")
   hf_target_paths = param_map[maxtext_param_key]
+  if hf_target_paths is None:
+    max_logging.log(f"\tskipping parameter mapped to None: {maxtext_param_key}")
+    return []
   if not hf_target_paths:
     raise ValueError(f"No HF target paths found for MaxText key '{maxtext_param_key}'")
 
@@ -246,35 +277,34 @@ def process_maxtext_param(
     return output_weights
 
   # Stacked MaxText weight
-  # This now handles three cases:
+  # This handles the 3 remaining cases:
   # 2. Standard scanned layers (1D list of targets from a tensor stacked only on the layer axis)
   # 3. Unscanned MoE layers (1D list of targets from a tensor stacked only on the expert axis)
   # 4. Scanned MoE layers (2D list of targets from a tensor stacked on expert and layer axes)
 
   if not isinstance(hf_target_paths[0], list):
     # Case 2 or 3: The source tensor is stacked on a single axis.
-    # i.e., hf_target_paths is an (un-nested) list
-    # We determine if it's standard scanned (stack on layer axis) or unscanned MoE (stack on expert axis).
     if maxtext_config.scan_layers:
       max_logging.log("\tscan")
-      # Case 2: Standard scanned layer.
-      # The tensor is stacked ONLY on the layer axis.
-      axis_to_slice = maxtext_config.param_scan_axis
+      # Case 2: Standard scanned layer. Stacked on layer axis (param_scan_axis) for multidimensional
+      # weights or 2D block scales, or axis 0 for 1D tensors (e.g. per-layer scalar scales like
+      # Llama 3.1 FP8 `kernel_scale` with shape (num_layers,)).
+      weight_sample = maxtext_param_weight[0] if isinstance(maxtext_param_weight, list) else maxtext_param_weight
+      axis_to_slice = (
+          maxtext_config.param_scan_axis if getattr(weight_sample, "ndim", 0) > maxtext_config.param_scan_axis else 0
+      )
     else:
       max_logging.log("\tunscan moe")
-      # Case 3: Unscanned MoE layer, e.g., from 'layers_0-moe_block-wi_0'.
-      # The tensor is stacked ONLY on the expert axis. Assuming expert is axis 0.
+      # Case 3: Unscanned MoE layer. Stacked ONLY on the expert axis. Assuming expert is axis 0.
       axis_to_slice = 0
 
     # Iterate through the slices of the MaxText weight along the determined stacking axis.
-    # Handles MaxText key forms (`atomic_mt_key` and `composite_mt_key`)
     for i, hf_path in enumerate(hf_target_paths):
       if isinstance(maxtext_param_weight, list):
-        # This handles `composite_mt_key` mappings where `maxtext_param_weight` is a list of tensors.
-        # Each tensor in the list is sliced independently along the `axis_to_slice`.
+        # Handles `composite_mt_key` mappings where weight is a list of tensors.
         weight_slice = [jax.lax.index_in_dim(x, i, axis=axis_to_slice, keepdims=False) for x in maxtext_param_weight]
       else:
-        # For `atomic_mt_key` mappings, slice the single MaxText tensor.
+        # Handles `atomic_mt_key` mappings by slicing the single tensor.
         weight_slice = jax.lax.index_in_dim(maxtext_param_weight, i, axis=axis_to_slice, keepdims=False)
       _process(
           hf_path,
@@ -287,32 +317,38 @@ def process_maxtext_param(
 
     return output_weights
 
-  # Multi axis stacked: isinstance(hf_target_paths[0], list)
-  max_logging.log("\tscan moe")
-  # Case 4: Scanned MoE layer, e.g., from 'layers-moe_block-wi_0'.
-  # The tensor is stacked on expert and layer axes. We slice experts first, then layers.
-  # MaxText format is (experts, layers, ...), so expert axis is 0, layer axis is 1.
-  expert_axis_to_slice = 0
+  # Case 4: Multi-axis stacked -- the exact inverse of _build_multi_axis_stacked_tensor.
+  # `stacked_axes` says where the stacked axes sit in the MaxText tensor: leading for
+  # scanned MoE (experts, layers), at (param_scan_axis, param_scan_axis + 1) for a
+  # nested block scan's (blocks, local), or all three for weights that are both.
+  # Slicing removes one axis at a time, so once the first `level` axes are gone the
+  # next one has shifted down to `axes[level] - level`.
+  key_str = maxtext_param_key[0] if isinstance(maxtext_param_key, tuple) else maxtext_param_key
+  depth = nesting_depth(hf_target_paths)
+  axes = stacked_axes(key_str, maxtext_config, depth)
+  max_logging.log("\tscan nested local" if axes != tuple(range(depth)) else "\tscan moe")
 
-  # Outer loop for experts
-  for expert_idx, expert_paths_for_layer in enumerate(hf_target_paths):
-    # Slice along the expert axis to get the tensor for the current expert across all layers.
-    expert_tensor_slice = jax.lax.index_in_dim(
-        maxtext_param_weight, expert_idx, axis=expert_axis_to_slice, keepdims=False
-    )
-    # Inner loop for layers
-    for layer_idx, hf_path in enumerate(expert_paths_for_layer):
-      # Slice the expert tensor along the layer axis to get the final individual weight.
-      # axis is 0 on the new sliced tensor
-      layer_tensor_slice = jax.lax.index_in_dim(expert_tensor_slice, layer_idx, axis=0, keepdims=False)
+  def _emit_slices(weight, hf_paths, level):
+    if level == depth:
       _process(
-          hf_path,
-          layer_tensor_slice,
+          hf_paths,
+          weight,
           output_weights,
           current_hook_fns,
           hf_shape_map,
           save_dtype=maxtext_config.weight_dtype,
       )
+      return
+    axis_to_slice = axes[level] - level
+    for idx, sub_paths in enumerate(hf_paths):
+      if isinstance(weight, list):
+        # Handles `composite_mt_key` mappings where weight is a list of tensors.
+        weight_slice = [jax.lax.index_in_dim(x, idx, axis=axis_to_slice, keepdims=False) for x in weight]
+      else:
+        weight_slice = jax.lax.index_in_dim(weight, idx, axis=axis_to_slice, keepdims=False)
+      _emit_slices(weight_slice, sub_paths, level + 1)
+
+  _emit_slices(maxtext_param_weight, hf_target_paths, 0)
 
   return output_weights
 
@@ -338,7 +374,8 @@ def save_config_file(
 ):
   """Saves the model configuration file(config.json)."""
   if jax.process_index() == 0:
-    config.architectures = [MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]]
+    if config.model_type in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
+      config.architectures = [MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]]
     if output_dir_final.startswith("hf://"):
       max_logging.log(f"  Serializing {file_name} to memory for Hugging Face Hub upload...")
       json_string = config.to_json_string()
@@ -438,9 +475,24 @@ def save_safetensor_file(
     if "model.safetensors" in state_dict and isinstance(state_dict["model.safetensors"], dict):
       state_dict = state_dict["model.safetensors"]
 
+    # safetensors' numpy backend (0.8.0) serializes a non-contiguous array's
+    # raw buffer and ignores strides, writing the correct shape metadata with
+    # untransposed data -- silent corruption. Its torch backend raises on
+    # non-contiguous input instead; the numpy path does not. Any hook ending in
+    # `.T` (e.g. the DeepSeek-V4 MHC alpha composite) produces exactly such a
+    # view, so normalise every tensor to C-contiguous before writing.
+    for _key in list(state_dict.keys()):
+      _val = state_dict[_key]
+      if isinstance(_val, np.ndarray) and not _val.flags["C_CONTIGUOUS"]:
+        state_dict[_key] = np.ascontiguousarray(_val)
+
     if output_dir_final.startswith("gs://"):
+      local_path = os.path.join(local_dir_to_save_to, file_name)
+      numpy_save_file(state_dict, local_path, metadata={"format": "pt"})
+      state_dict.clear()
+      gc.collect()
       cloud_path = os.path.join(output_dir_final, file_name)
-      upload_state_dict_to_gcs(state_dict=state_dict, gs_bucket_path=cloud_path)
+      upload_file_to_gcs(local_file=local_path, gs_bucket_path=cloud_path, remove_local_file_after_upload=True)
     elif output_dir_final.startswith("hf://"):
       max_logging.log(f"  Serializing {file_name} to memory for Hugging Face Hub upload...")
       serialized_content = save_flax_to_bytes(state_dict, metadata={"format": "pt"})
@@ -504,7 +556,7 @@ def save_weight_files(
     index,
     local_dir_to_save_to: str,
     output_dir_final: str,
-    parallel_threads=8,
+    parallel_threads=4,
     remove_local_copy_after_upload: bool = False,
 ):
   """Saves weight files and index if needed.
@@ -516,21 +568,39 @@ def save_weight_files(
     # 'shards' is actually the single state_dict here
     save_safetensor_file(shards, local_dir_to_save_to, output_dir_final, SAFE_TENSORS_WEIGHTS_FILE)
   else:
-    # Save sharded weights in parallel
-    with ThreadPoolExecutor(max_workers=parallel_threads) as executor:
-      shard_items = list(shards.items())
-      futures = [
-          executor.submit(
-              save_safetensor_file,
-              shard_dict,
-              local_dir_to_save_to,
-              output_dir_final,
-              shard_name,
-          )
-          for shard_name, shard_dict in shard_items
-      ]
-      for future in futures:
-        future.result()
+    if output_dir_final.startswith("gs://"):
+
+      def _save_and_upload(shard_name, shard_dict):
+        local_path = os.path.join(local_dir_to_save_to, shard_name)
+        numpy_save_file(shard_dict, local_path, metadata={"format": "pt"})
+        shard_dict.clear()
+        del shard_dict
+        gc.collect()
+        cloud_path = os.path.join(output_dir_final, shard_name)
+        upload_file_to_gcs(local_file=local_path, gs_bucket_path=cloud_path, remove_local_file_after_upload=True)
+
+      with ThreadPoolExecutor(max_workers=parallel_threads) as executor:
+        futures = []
+        for shard_name in list(shards.keys()):
+          shard_dict = shards.pop(shard_name)
+          if "model.safetensors" in shard_dict and isinstance(shard_dict["model.safetensors"], dict):
+            shard_dict = shard_dict["model.safetensors"]
+          shard_dict = {k: v for k, v in shard_dict.items() if v is not None}
+          futures.append(executor.submit(_save_and_upload, shard_name, shard_dict))
+
+        for future in futures:
+          future.result()
+    else:
+      for shard_name in list(shards.keys()):
+        shard_dict = shards.pop(shard_name)
+        save_safetensor_file(
+            shard_dict,
+            local_dir_to_save_to,
+            output_dir_final,
+            shard_name,
+        )
+        shard_dict.clear()
+        gc.collect()
 
     # Save index file
     save_index_file(
@@ -563,7 +633,7 @@ def save_model_files(
     tokenizer: None | Any,  # transformers.PreTrainedTokenizerBase
     processor,
     output_dir: str,
-    parallel_threads=8,
+    parallel_threads=4,
 ):
   """
   Saves model files (config and weights) to the specified directory.
@@ -629,6 +699,8 @@ def save_model_files(
     # The actual file saving within save_weight_files is guarded.
     # Unwrap nested dict if needed
     shards, index = shard_checkpoint(weight_arrays)
+    weight_arrays.clear()
+    gc.collect()
     save_weight_files(shards, index, current_save_path, output_dir, parallel_threads, remove_local_copy)
 
   if jax.process_index() == 0:
@@ -783,14 +855,24 @@ class MemoryMonitorTqdm(tqdm):
     return super().format_meter(n=n, total=total, elapsed=elapsed, postfix=postfix, **extra_kwargs)
 
 
+def _recursive_update(d: dict, u: dict) -> dict:
+  """Recursively updates dictionary d with dictionary u in place."""
+  for k, v in u.items():
+    if isinstance(v, dict) and isinstance(d.get(k), dict):
+      _recursive_update(d[k], v)
+    else:
+      d[k] = v
+  return d
+
+
 def load_orbax_checkpoint(config) -> dict:
-  """Loads a full Orbax checkpoint from disk with unsharded arrays.
+  """Loads Orbax checkpoints from Base and/or LoRA paths in config.
 
   Args:
     config: MaxText config containing checkpoint storage settings
 
   Returns:
-    Dictionary containing the full checkpoint structure
+    Dictionary containing all weights merged into a single structure.
   """
   # Create Orbax checkpointer
   ckptr = ocp.Checkpointer(
@@ -801,10 +883,6 @@ def load_orbax_checkpoint(config) -> dict:
       )
   )
 
-  # Get checkpoint metadata
-  checkpoint_path = epath.Path(config.load_parameters_path)
-  metadata = ckptr.metadata(checkpoint_path)
-
   # Create a mesh with all devices for unsharded restoration
   devices = np.array(jax.devices()).reshape((-1,))
   single_device_mesh = jax.sharding.Mesh(devices, ("x",))
@@ -812,20 +890,128 @@ def load_orbax_checkpoint(config) -> dict:
   def create_restore_args(tree_metadata):
     """Create restore args for unsharded restoration."""
     if hasattr(tree_metadata, "shape"):
-      return ocp.ArrayRestoreArgs(sharding=jax.sharding.NamedSharding(single_device_mesh, jax.sharding.PartitionSpec()))
+      restore_dtype = None
+      if hasattr(tree_metadata, "dtype") and tree_metadata.dtype is not None:
+        try:
+          orig_dtype = jnp.dtype(tree_metadata.dtype)
+          if jnp.issubdtype(orig_dtype, jnp.floating) and getattr(config, "weight_dtype", None) is not None:
+            restore_dtype = jnp.dtype(config.weight_dtype)
+          else:
+            restore_dtype = orig_dtype
+        except (TypeError, ValueError):
+          restore_dtype = None
+      return ocp.ArrayRestoreArgs(
+          sharding=jax.sharding.NamedSharding(single_device_mesh, jax.sharding.PartitionSpec()),
+          dtype=restore_dtype,
+      )
     elif isinstance(tree_metadata, dict):
       return {k: create_restore_args(v) for k, v in tree_metadata.items()}
     else:
       return None
 
-  restore_args = jax.tree_util.tree_map(
-      lambda x: create_restore_args(x) if hasattr(x, "shape") else None,
-      metadata.item_metadata.tree,
-      is_leaf=lambda x: hasattr(x, "shape"),
-  )
+  lora_path = config.lora.lora_restore_path
+  paths = [p for p in [config.load_parameters_path, lora_path] if p]
 
-  # Restore the entire checkpoint
-  return ckptr.restore(checkpoint_path, restore_args=restore_args)
+  merged_dict = {}
+  for i, path in enumerate(paths):
+    checkpoint_path = epath.Path(path)
+    metadata = ckptr.metadata(checkpoint_path)
+    checkpoint_tree = metadata.item_metadata.tree
+    if isinstance(checkpoint_tree, dict):
+      if "params" in checkpoint_tree:
+        checkpoint_tree = {"params": checkpoint_tree["params"]}
+        max_logging.log(f"Filtering checkpoint to only load 'params' from {path}")
+      else:
+        filtered_tree = {k: v for k, v in checkpoint_tree.items() if k not in ("opt_state", "optimizer")}
+        if len(filtered_tree) < len(checkpoint_tree):
+          checkpoint_tree = filtered_tree
+          max_logging.log(f"Filtering checkpoint to exclude optimizer keys from {path}")
+
+    restore_args = jax.tree_util.tree_map(
+        lambda x: create_restore_args(x) if hasattr(x, "shape") else None,
+        checkpoint_tree,
+        is_leaf=lambda x: hasattr(x, "shape"),
+    )
+    restored = ckptr.restore(
+        checkpoint_path,
+        args=ocp.args.PyTreeRestore(item=checkpoint_tree, restore_args=restore_args, partial_restore=True),
+    )
+
+    if i == 0:
+      merged_dict = restored
+    else:
+      # Recursively update base checkpoint with LoRA adapter checkpoint keys to avoid overwriting
+      _recursive_update(merged_dict, restored)
+
+  return merged_dict
+
+
+def save_adapter_files(output_dir, weights, config, found_modules, model_id):
+  """Saves HF LoRA adapter weights and config."""
+  os.makedirs(output_dir, exist_ok=True)
+  adapter_file = os.path.join(output_dir, "adapter_model.safetensors")
+  numpy_save_file(weights, adapter_file)
+
+  # Create PEFT adapter_config.json
+  adapter_config = {
+      "base_model_name_or_path": model_id,
+      "peft_type": "LORA",
+      "task_type": "CAUSAL_LM",
+      "r": config.lora.lora_rank,
+      "lora_alpha": config.lora.lora_alpha,
+      "target_modules": list(found_modules),
+      "lora_dropout": 0.0,
+      "bias": "none",
+      "inference_mode": True,
+  }
+  config_file = os.path.join(output_dir, "adapter_config.json")
+  with open(config_file, "w", encoding="utf-8") as f:
+    json.dump(adapter_config, f, indent=4)
+
+
+def param_key_parts_from_path(path_tuple) -> list[str]:
+  """Convert a JAX tree path into MaxText dash-joined key segments.
+
+  Normalizes two NNX storage artifacts so the result follows the MaxText-Linen
+  naming convention and matches the param-mapping tables (e.g.
+  ``params-decoder-layers_0-self_attention-query-kernel``):
+
+  * ``nnx.List`` layer stacks flatten to an *integer* path key
+    (``decoder -> layers -> 0 -> ...``), which Orbax may restore as a numeric
+    *string* (``"0"``). Either form is folded into the preceding segment as
+    ``<name>_<idx>`` (``layers_0``), matching Linen's ``layers_0`` name. (A pure
+    integer key would otherwise raise ``TypeError: sequence item N: expected str
+    instance, int found`` when joined; a string ``"0"`` would mismatch the
+    ``layers_0`` mapping.)
+  * ``nnx.Variable`` leaves flatten with a trailing ``value`` key
+    (``...-kernel -> value``). That wrapper segment is dropped, since MaxText-Linen
+    param keys have no such suffix.
+
+  Scanned / plain Linen string paths (no integer key, no trailing ``value``) are
+  returned unchanged.
+
+  Args:
+    path_tuple: A path produced by ``jax.tree_util.tree_flatten_with_path`` or
+      ``tree_leaves_with_path`` (a sequence of ``DictKey`` / ``SequenceKey`` /
+      ``GetAttrKey`` / ``FlattenedIndexKey`` entries).
+
+  Returns:
+    The list of string key segments, e.g. ``["decoder", "layers_0", "kernel"]``.
+  """
+  parts: list[str] = []
+  for entry in path_tuple:
+    key = getattr(entry, "key", getattr(entry, "idx", getattr(entry, "name", entry)))
+    # Fold a layer/expert index (an int, or a numeric string after an Orbax
+    # round-trip) into the preceding segment: ["layers", 0] -> "layers_0".
+    if (isinstance(key, int) or (isinstance(key, str) and key.isdigit())) and parts:
+      parts[-1] = f"{parts[-1]}_{key}"
+    else:
+      parts.append(str(key))
+  # Drop the trailing ``value`` segment that NNX adds for each ``nnx.Variable``
+  # leaf (``...-kernel -> value``); MaxText-Linen param keys have no such wrapper.
+  if parts and parts[-1] == "value":
+    parts.pop()
+  return parts
 
 
 def extract_nnx_weights(weights_dict: dict) -> dict[str, np.ndarray]:
@@ -843,13 +1029,10 @@ def extract_nnx_weights(weights_dict: dict) -> dict[str, np.ndarray]:
   result = {}
   leaves_with_paths = jax.tree_util.tree_leaves_with_path(weights_dict)
   for path_tuple, leaf_value in leaves_with_paths:
-    path_keys = [k.key for k in path_tuple]
+    path_keys = param_key_parts_from_path(path_tuple)
     # Skip NNX RNG state variables (not model weights)
-    if "to_nnx__rngs" in path_keys or any(k.endswith("_rngs") for k in path_keys):
+    if "to_nnx__rngs" in path_keys or any(k == "rngs" or k.endswith("_rngs") for k in path_keys):
       continue
-    # Skip if this is the "value" key itself - we want the parent path
-    if path_keys[-1] == "value":
-      path_keys = path_keys[:-1]
     maxtext_param_key = "params-" + "-".join(path_keys)
     if not isinstance(leaf_value, (jax.Array, np.ndarray)):
       raise ValueError(f"Leaf value for {maxtext_param_key} is not an array. Type: {type(leaf_value)}.")
@@ -857,7 +1040,7 @@ def extract_nnx_weights(weights_dict: dict) -> dict[str, np.ndarray]:
   return result
 
 
-def extract_linen_weights(weights_dict: dict) -> dict[str, np.ndarray]:
+def extract_linen_weights(weights_dict: dict, prefix: str = "params-") -> dict[str, np.ndarray]:
   """Extract weights from Linen checkpoint structure.
 
   Linen checkpoints have structure: {'params': {'decoder': {'decoder_norm': {'scale': array}}}}
@@ -865,6 +1048,7 @@ def extract_linen_weights(weights_dict: dict) -> dict[str, np.ndarray]:
 
   Args:
     weights_dict: Linen checkpoint weights dictionary
+    prefix: Prefix for parameter keys (defaults to "params-")
 
   Returns:
     Dictionary mapping parameter names to weight arrays
@@ -872,9 +1056,8 @@ def extract_linen_weights(weights_dict: dict) -> dict[str, np.ndarray]:
   result = {}
   leaves_with_paths = jax.tree_util.tree_leaves_with_path(weights_dict)
   for path_tuple, leaf_value in leaves_with_paths:
-    path_keys = [k.key for k in path_tuple]
-    # Construct maxtext_param_key from path_tuple
-    maxtext_param_key = "params-" + "-".join(path_keys)
+    path_keys = param_key_parts_from_path(path_tuple)
+    maxtext_param_key = prefix + "-".join(path_keys)
     if not isinstance(leaf_value, (jax.Array, np.ndarray)):
       raise ValueError(f"Leaf value for {maxtext_param_key} is not an array. Type: {type(leaf_value)}.")
     result[maxtext_param_key] = leaf_value
@@ -916,24 +1099,54 @@ def detect_and_extract_checkpoint(checkpoint_dict: dict) -> dict[str, np.ndarray
   else:
     # Linen checkpoint: check if there's a nested 'params' key
     if isinstance(actual_weights_dict, dict) and "params" in actual_weights_dict:
-      actual_weights_dict = actual_weights_dict["params"]
-      max_logging.log("Detected Linen checkpoint structure")
+      extra_collections = [k for k in actual_weights_dict if k != "params"]
+      if extra_collections:
+        max_logging.log(
+            f"Detected multi-collection Linen checkpoint structure with collections: {list(actual_weights_dict.keys())}"
+        )
+        result = {}
+        for col_name, col_dict in actual_weights_dict.items():
+          result.update(extract_linen_weights(col_dict, prefix=f"{col_name}-"))
+        return result
+      else:
+        actual_weights_dict = actual_weights_dict["params"]
+        max_logging.log("Detected Linen checkpoint structure")
     else:
       max_logging.log("Detected Linen checkpoint structure (single params layer)")
     return extract_linen_weights(actual_weights_dict)
 
 
-def load_hf_dict_from_transformers(model_id: str, token: str, revision: str = None, dtype: str = "auto"):
+def load_hf_dict_from_transformers(model_id: str, token: str, revision: str | None = None, dtype: str = "auto"):
   """Loads the HuggingFace model based on model_id (Eager mode only), used in to_maxtext"""
+
+  # 1. Handle special cases requiring specific model classes
   if model_id in ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]:
     from transformers import Qwen3OmniMoeForConditionalGeneration  # pylint: disable=import-outside-toplevel
 
-    model_class = Qwen3OmniMoeForConditionalGeneration
+    model_classes = [Qwen3OmniMoeForConditionalGeneration]
+  # 2. For all other models, use AutoModel cascade logic
   else:
-    model_class = AutoModelForCausalLM
+    from transformers import AutoModel  # pylint: disable=import-outside-toplevel
+    # Fallback cascade:
+    # 1. AutoModelForCausalLM (Standard text-only LLMs)
+    # 2. Base AutoModel (Final fallback)
+    model_classes = [AutoModelForCausalLM, AutoModel]
 
   # Note: transformers deprecates `torch_dtype` in favor of standard `dtype` in model loading
-  hf_model = model_class.from_pretrained(model_id, token=token, revision=revision, dtype=dtype)
+  last_exception = None
+  for model_class in model_classes:
+    try:
+      hf_model = model_class.from_pretrained(model_id, token=token, revision=revision, dtype=dtype)
+      break
+    except (ValueError, OSError, RuntimeError, ImportError) as e:
+      max_logging.log(f"Failed to load using {model_class.__name__}: {e!r}")
+      last_exception = e
+  else:
+    # This else block is executed if the loop completes without a break.
+    error_message = (
+        f"Could not load HuggingFace model {model_id} with any of the attempted classes. " f"Last error: {last_exception}"
+    )
+    raise ValueError(error_message) from last_exception
 
   return hf_model.state_dict()
 
@@ -956,7 +1169,7 @@ def load_hf_dict_from_safetensors(model_id_or_path, token, revision, framework="
         revision=revision,
     )
   # load safetensors
-  ckpt_paths = sorted(pathlib.Path(local_path).glob("[!.]*.safetensors"))
+  ckpt_paths = sorted(pathlib.Path(local_path).rglob("[!.]*.safetensors"))
   hf_state_dict = {}
   max_logging.log(f"Loading {len(ckpt_paths)} checkpoints")
   for ckpt_path in tqdm(ckpt_paths, total=len(ckpt_paths)):
@@ -964,3 +1177,152 @@ def load_hf_dict_from_safetensors(model_id_or_path, token, revision, framework="
       for key in f.keys():
         hf_state_dict[key] = f.get_tensor(key)
   return hf_state_dict
+
+
+def shard_jax_weights(jax_weights, device_count, mem_info):
+  """Shards the checkpoint weights across the simulated devices.
+
+  Args:
+    jax_weights: Pytree of model weights (numpy arrays).
+    device_count: The number of simulated devices.
+    mem_info: Process object to track memory usage.
+
+  Returns:
+    Pytree of sharded JAX arrays.
+  """
+  # Setup mesh & sharding specs
+  if len(jax.devices()) != device_count:
+    max_logging.log(
+        "WARNING: hardware/simulated device mismatch. "
+        f"Actual JAX devices: {len(jax.devices())}, Requested count: {device_count}."
+    )
+  max_logging.log(f"Shard weights across {len(jax.devices())} devices")
+  max_logging.log("Note: Axis 0 sharding is the default and will not be logged individually.")
+  # Pre-define sharding specs
+  mesh = jax.sharding.Mesh(jax.devices(), "checkpoint_sharding_axis")
+  # No sharding (replicated specifically for 0D scalars)
+  s0 = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+  # Sharding along axis 0
+  s1 = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("checkpoint_sharding_axis"))
+  # Sharding along axis 1
+  s2 = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None, "checkpoint_sharding_axis"))
+  # No sharding (replicated)
+  s3 = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None))
+
+  def checkpoint_device_put(arr):
+    """Determines correct sharding spec based on shape and shards the input array.
+
+    Args:
+      arr: A numpy array (or jax array).
+
+    Returns:
+      A sharded jax array.
+    """
+    if not isinstance(arr, (np.ndarray, jax.Array)):
+      # materialize lazy tensor
+      arr = np.array(arr)
+
+    if len(arr.shape) == 0:
+      max_logging.log("0D scalar detected, replicating")
+      return jax.device_put(arr, device=s0)
+    elif arr.shape[0] % device_count == 0:
+      # Sharding axis 0: Omit log for brevity per the summary log above.
+      return jax.device_put(arr, device=s1)
+    elif len(arr.shape) > 1 and arr.shape[1] % device_count == 0:
+      max_logging.log(f"Sharding axis 1. Tensor shape {arr.shape}")
+      return jax.device_put(arr, device=s2)
+    else:
+      max_logging.log(f"Not sharding. Tensor shape {arr.shape}")
+      return jax.device_put(arr, device=s3)
+
+  # Weight sharding
+  start = time.time()
+  # convert all weights to jax.numpy with sharding if applicable
+  jax_weights_flat, jax_weights_struct = tree.flatten(jax_weights)
+  del jax_weights
+  gc.collect()
+
+  jax_weights_new = []
+  jax_weights_flat.reverse()
+  num_weights = len(jax_weights_flat)
+  for _ in tqdm(range(num_weights)):
+    jax_weight = jax_weights_flat.pop()
+    jax_weights_new.append(checkpoint_device_put(jax_weight))
+    del jax_weight
+    gc.collect()
+    logging.debug("Memory usage: %f GB", mem_info.memory_info().rss / (1024**3))
+
+  jax_weights = tree.unflatten(jax_weights_struct, jax_weights_new)
+  max_logging.log(f"Elapse for checkpoint sharding: {(time.time() - start) / 60:.2f} min")
+
+  return jax_weights
+
+
+def save_weights_to_checkpoint(
+    maxtext_model_path: str,
+    jax_weights: dict,
+    device_count: int,
+    use_ocdbt: bool,
+    use_zarr3: bool,
+    config=None,
+):
+  """Saves model weights to a MaxText-compatible checkpoint with optional sharding.
+
+  This function handles the conversion of NumPy weights into sharded JAX arrays
+  across a specified number of simulated devices. If the device count is 1,
+  the sharding and JAX conversion steps are skipped.
+
+  Args:
+      maxtext_model_path: The destination directory or URI for the MaxText checkpoint.
+      jax_weights: A dictionary mapping parameter names to weight arrays (typically NumPy).
+      device_count: The number of simulated devices to shard across. If 1, weights
+          are saved in their original format.
+      use_ocdbt: If True, enables the Optimized Checkpoint Database with Transactions
+          (OCDBT) format for improved metadata handling.
+      use_zarr3: If True, uses the Zarr3 storage format for the underlying array data.
+      config: Optional config to save along with checkpoint metadata.
+  """
+  mem_info = psutil.Process()
+  logging.debug("Memory usage: %f GB", mem_info.memory_info().rss / (1024**3))
+  gc.collect()
+
+  # Weight sharding
+  if device_count > 1:
+    jax_weights = shard_jax_weights(jax_weights, device_count, mem_info)
+  else:
+    # If number of simulated devices is 1, SKIP sharding and SKIP jax conversion.
+    max_logging.log("Single device: Skip sharding")
+
+  # Save checkpoint
+  start = time.time()
+  # dummy configs for the checkpoint_manager
+  step_number_to_save_new_ckpt = 0
+  enable_checkpointing = True
+  async_checkpointing = False
+  save_interval_steps = 1
+
+  checkpoint_manager = checkpointing.create_orbax_checkpoint_manager(
+      maxtext_model_path,
+      enable_checkpointing,
+      async_checkpointing,
+      save_interval_steps,
+      use_ocdbt=use_ocdbt,
+      use_zarr3=use_zarr3,
+      # Sets Orbax-V1 I/O write timeout to 60 minutes (up from 20-minute default) to facilitate large model saving.
+      enable_continuous_checkpointing=True,
+  )
+  if checkpoint_manager is None:
+    raise RuntimeError("Failed to create Orbax checkpoint manager.")
+
+  params = jax_weights if (isinstance(jax_weights, dict) and "params" in jax_weights) else {"params": jax_weights}
+  state_new = train_state.TrainState(
+      step=step_number_to_save_new_ckpt, apply_fn=None, params=params, tx=None, opt_state={}  # type: ignore
+  )
+
+  logging.debug("Memory usage: %f GB", mem_info.memory_info().rss / (1024**3))
+  if checkpointing.save_checkpoint(checkpoint_manager, step_number_to_save_new_ckpt, state_new, config=config):
+    max_logging.log(f"saved a checkpoint at step {step_number_to_save_new_ckpt}")
+  # Upon preemption, exit when and only when all ongoing saves are complete.
+  checkpointing.wait_until_finished(checkpoint_manager)
+
+  max_logging.log(f"Elapse for checkpoint save: {(time.time() - start) / 60:.2f} min")

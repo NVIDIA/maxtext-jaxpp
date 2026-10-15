@@ -1,0 +1,1 @@
+mlperf-logging @ https://github.com/mlcommons/logging/archive/refs/tags/6.1.0-rc1.zip

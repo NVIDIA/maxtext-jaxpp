@@ -9,17 +9,22 @@ bucket.
 
 ## Checkpoint loading priority
 
-The system follows a specific order when deciding which checkpoint to load at startup. The first valid condition met is the one executed:
+The system follows a specific order when deciding which checkpoint to load at
+startup. The first valid condition met is the one executed:
 
 1. **Resume Current Run**: If a checkpoint already exists for the current
    `run_name`, the system loads the latest fully-saved checkpoint. This is the
    default behavior to ensure minimal state loss when resuming after an
    interruption.
 2. **Load from Specific Path**: The system checks for a user-specified path.
-   - If `load_parameters_path` is set, we load a parameter only checkpoint from that path..
-   - If `load_full_state_path` is set, we load a full state checkpoint from that path.
-   - **Note**: These two options are mutually exclusive and will cause an error if both are set.
-3. **Initialize from Scratch**: We don't load a checkpoint and initialize state instead.
+   - If `load_parameters_path` is set, we load a parameter only checkpoint
+     from that path..
+   - If `load_full_state_path` is set, we load a full state checkpoint from
+     that path.
+   - **Note**: These two options are mutually exclusive and will cause an
+     error if both are set.
+3. **Initialize from Scratch**: We don't load a checkpoint and initialize state
+   instead.
 
 ### MaxText configuration
 
@@ -29,6 +34,8 @@ The system follows a specific order when deciding which checkpoint to load at st
 | `async_checkpointing`                  | When set to (`True`), this flag makes checkpoint saving asynchronous. The training step is only blocked for the minimal time needed to capture the model's state, and the actual writing to storage happens in a background thread. This is highly recommended for performance. It's enabled by default.                                    | `boolean` | `True`          |
 | `checkpoint_period`                    | The interval, in training steps, for how often a checkpoint is saved.                                                                                                                                                                                                                                                                       | `integer` | `10000`         |
 | `enable_single_replica_ckpt_restoring` | If `True`, one replica reads the checkpoint from storage and then broadcasts it to all other replicas. This can significantly speed up restoration on multi-host systems by reducing redundant reads from storage.<br>**Note**: This feature is only compatible with training jobs that utilize a Distributed Data Parallel (DDP) strategy. | `boolean` | `False`         |
+| `checkpoint_todelete_subdir`           | Subdirectory to move checkpoints to before deletion. For example: `".todelete"` (Ignored if directory is prefixed with `gs://`)                                                                                                                                                                                                             | `string`  | `""`            |
+| `checkpoint_todelete_full_path`        | Full path to move checkpoints to before deletion.                                                                                                                                                                                                                                                                                           | `string`  | `""`            |
 | `load_parameters_path`                 | Specifies a path to a checkpoint directory to load a parameter only checkpoint.<br>**Example**: `"gs://my-bucket/my-previous-run/checkpoints/items/1000"`                                                                                                                                                                                   | `string`  | `""` (disabled) |
 | `load_full_state_path`                 | Specifies a path to a checkpoint directory to load a full checkpoint including optimizer state and step count from a specific directory.<br>**Example**: `"gs://my-bucket/my-interrupted-run/checkpoints/items/500"`                                                                                                                        | `string`  | `""` (disabled) |
 | `lora_input_adapters_path`             | Specifies a parent directory containing LoRA (Low-Rank Adaptation) adapters.                                                                                                                                                                                                                                                                | `string`  | `""` (disabled) |
@@ -36,7 +43,8 @@ The system follows a specific order when deciding which checkpoint to load at st
 
 ## Storage and format configuration
 
-These settings control the underlying storage mechanism ([Orbax](https://orbax.readthedocs.io)) for performance and compatibility.
+These settings control the underlying storage mechanism
+([Orbax](https://orbax.readthedocs.io)) for performance and compatibility.
 
 | Flag                                             | Description                                                                                                                                                                                                                                                 | Type                 | Default             |
 | :----------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------- | :------------------ |

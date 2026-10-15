@@ -2,42 +2,56 @@
 
 Choose your environment and orchestration method to run MaxText.
 
-::::\{grid} 1 2 2 2
+::::{grid} 1 2 2 2
 :gutter: 2
 
-:::\{grid-item-card} 💻 Localhost / Single VM
+:::{grid-item-card} 💻 Localhost / Single VM
 :link: run_maxtext/run_maxtext_localhost
 :link-type: doc
 
 Get started quickly on a single machine. Clone the repo, install dependencies, and run your first training job on a single TPU or GPU VM.
 :::
 
-:::\{grid-item-card} 🎮 Single-host GPU
+:::{grid-item-card} 🎮 Single-host GPU
 :link: run_maxtext/run_maxtext_single_host_gpu
 :link-type: doc
 
 Run MaxText on single-host NVIDIA GPUs (e.g., A3 High/Mega). Includes Docker setup, NVIDIA Container Toolkit installation, and 1B/7B model training examples.
 :::
 
-:::\{grid-item-card} 🏗️ At scale with XPK (GKE)
+:::{grid-item-card} 🚀 At scale with Cluster Toolkit (GKE)
+:link: run_maxtext/run_maxtext_via_cluster_toolkit
+:link-type: doc
+
+Deploy to Google Kubernetes Engine (GKE) using Cluster Toolkit's `gcluster` CLI. Package and run multi-host JAX workloads with on-the-fly container builds.
+:::
+
+:::{grid-item-card} 🏗️ Legacy: At scale with XPK (GKE)
 :link: run_maxtext/run_maxtext_via_xpk
 :link-type: doc
 
-Deploy to Google Kubernetes Engine (GKE) using XPK. Orchestrate large-scale training jobs on TPU or GPU clusters with simple CLI commands.
+Deprecated. Retained for older deployments only. New GKE workloads should use Cluster Toolkit instead.
 :::
 
-:::\{grid-item-card} 🌐 Multi-host via Pathways
+:::{grid-item-card} 🌐 Multi-host via Pathways
 :link: run_maxtext/run_maxtext_via_pathways
 :link-type: doc
 
 Run large-scale JAX jobs on TPUs using Pathways. Supports batch and headless (interactive) workloads on GKE.
 :::
 
-:::\{grid-item-card} 🔌 Decoupled Mode
+:::{grid-item-card} 🔌 Decoupled Mode
 :link: run_maxtext/decoupled_mode
 :link-type: doc
 
 Run tests and local development without Google Cloud dependencies (no `gcloud`, GCS, or Vertex AI required).
+:::
+
+:::{grid-item-card} ♻️ Elastic training (demo)
+:link: run_maxtext/run_maxtext_elastic_training
+:link-type: doc
+
+Demonstrate fault-tolerant training with Pathways on GKE: lose a TPU slice mid-run and recover in-process from the last checkpoint, no job restart.
 :::
 ::::
 
@@ -48,7 +62,9 @@ maxdepth: 1
 ---
 run_maxtext/run_maxtext_localhost.md
 run_maxtext/run_maxtext_single_host_gpu.md
+run_maxtext/run_maxtext_via_cluster_toolkit.md
 run_maxtext/run_maxtext_via_xpk.md
 run_maxtext/run_maxtext_via_pathways.md
 run_maxtext/decoupled_mode.md
+run_maxtext/run_maxtext_elastic_training.md
 ```

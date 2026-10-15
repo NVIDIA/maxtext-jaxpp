@@ -14,6 +14,7 @@
 
 """General utility functions for multimodal processing."""
 
+import io
 import os
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -62,7 +63,13 @@ class PreprocessorOutput:
 
 def convert_to_RGB(image):
   """Convert image to RGB format."""
-  if image.mode != "RGB":
+  if isinstance(image, dict) and "bytes" in image and image["bytes"] is not None:
+    image = Image.open(io.BytesIO(image["bytes"]))
+  elif isinstance(image, bytes):
+    image = Image.open(io.BytesIO(image))
+  elif isinstance(image, str):
+    image = Image.open(image)
+  if hasattr(image, "mode") and image.mode != "RGB":
     image = image.convert("RGB")
   return image
 
@@ -161,9 +168,19 @@ def merge_mm_embeddings(
       # This handles cases where token_masks is already (B, ...)
       flat_tile_masks = token_masks.reshape(batch_size, -1)
 
-    # Expand the tile-level mask to a token-level mask to match the embeddings.
-    # A mask of shape (B, N*T) becomes (B, N*T*K) by repeating each element K times.
-    flat_token_masks_processed = jnp.repeat(flat_tile_masks, repeats=num_toks_per_token, axis=1)
+    if flat_tile_masks.shape[1] == flat_multimodal_embeddings.shape[1]:
+      # Qwen padded video supplies one validity value per projected token.
+      flat_token_masks_processed = flat_tile_masks
+    else:
+      # Tiled image models supply one validity value per tile. Expand each tile
+      # validity value over the tokens produced by that tile.
+      expected_tile_count = flat_multimodal_embeddings.shape[1] // num_toks_per_token
+      if flat_tile_masks.shape[1] != expected_tile_count:
+        raise ValueError(
+            "token_masks must contain either one value per multimodal token or one value per tile. "
+            f"Got {flat_tile_masks.shape[1]} mask values for {flat_multimodal_embeddings.shape[1]} embeddings."
+        )
+      flat_token_masks_processed = jnp.repeat(flat_tile_masks, repeats=num_toks_per_token, axis=1)
 
   # Vmap the inner merge function over the batch dimension
   return jax.vmap(
@@ -180,27 +197,20 @@ def _merge_mm_embeddings_inner(
 ) -> jnp.ndarray:
   """`merge_mm_embeddings` without batch dimension."""
 
+  multimodal_embeddings = multimodal_embeddings.astype(text_embeddings.dtype)
+
   if token_mask is not None:
     # This logic packs valid multimodal tokens to the front of the array.
     # It correctly handles cases where some multimodal tokens are just padding.
     sort_indices = jnp.argsort(-token_mask)  # Sorts descending, putting 1s first
     multimodal_embeddings = multimodal_embeddings[sort_indices]
 
-  # Find positions in the text sequence to place the multimodal embeddings.
-  # The `size` argument ensures a fixed shape for JIT compilation.
-  target_pos = jnp.nonzero(mask, size=multimodal_embeddings.shape[0])
-  target_pos = target_pos[0]  # jnp.nonzero returns a tuple of arrays
-
-  # Save the embedding at the first position.
-  first_pos_embedding = text_embeddings[0]
-
-  # Perform the insertion.
-  merged = text_embeddings.at[target_pos, :].set(multimodal_embeddings)
-
-  # Restore the first position's embedding, in case it was overwritten.
-  merged = merged.at[0].set(first_pos_embedding)
-
-  return merged
+  cumsum_mask = jnp.cumsum(mask != 0)
+  mask_bool = (mask != 0) & (cumsum_mask <= multimodal_embeddings.shape[0])
+  mask_expanded = mask_bool[:, jnp.newaxis]
+  mm_token_idx = jnp.clip(cumsum_mask - 1, 0, multimodal_embeddings.shape[0] - 1)
+  mm_aligned = multimodal_embeddings[mm_token_idx, :]
+  return jnp.where(mask_expanded, mm_aligned, text_embeddings)
 
 
 # Following audio functions derived from the HuggingFace implementation
@@ -452,7 +462,7 @@ def spectrogram(
   # center pad the waveform
   if center:
     padding = [(int(frame_length // 2), int(frame_length // 2))]
-    waveform = np.pad(waveform, padding, mode=pad_mode)
+    waveform = np.pad(waveform, padding, mode=pad_mode)  # pyrefly: ignore[no-matching-overload]
 
   # promote to float64, since np.fft uses float64 internally
   waveform = waveform.astype(np.float64)
@@ -545,7 +555,9 @@ def hertz_to_mel(freq: Union[float, np.ndarray], mel_scale: str = "htk") -> Unio
 
   if isinstance(freq, np.ndarray):
     log_region = freq >= min_log_hertz
-    mels[log_region] = min_log_mel + np.log(freq[log_region] / min_log_hertz) * logstep
+    mels[log_region] = (  # pyrefly: ignore[unsupported-operation]
+        min_log_mel + np.log(freq[log_region] / min_log_hertz) * logstep
+    )  # pyrefly: ignore[unsupported-operation]
   elif freq >= min_log_hertz:
     mels = min_log_mel + np.log(freq / min_log_hertz) * logstep
 
@@ -603,7 +615,9 @@ def mel_to_hertz(mels: Union[float, np.ndarray], mel_scale: str = "htk") -> Unio
 
   if isinstance(mels, np.ndarray):
     log_region = mels >= min_log_mel
-    freq[log_region] = min_log_hertz * np.exp(logstep * (mels[log_region] - min_log_mel))
+    freq[log_region] = min_log_hertz * np.exp(  # pyrefly: ignore[unsupported-operation]
+        logstep * (mels[log_region] - min_log_mel)
+    )  # pyrefly: ignore[unsupported-operation]
   elif mels >= min_log_mel:
     freq = min_log_hertz * np.exp(logstep * (mels - min_log_mel))
 
@@ -688,11 +702,11 @@ def mel_filter_bank(
     # frequencies of FFT bins in Hz
     fft_freqs = np.linspace(0, sampling_rate // 2, num_frequency_bins)
 
-  mel_filters = _create_triangular_filter_bank(fft_freqs, filter_freqs)
+  mel_filters = _create_triangular_filter_bank(fft_freqs, filter_freqs)  # pyrefly: ignore[bad-argument-type]
 
   if norm is not None and norm == "slaney":
     # Slaney-style mel is scaled to be approx constant energy per channel
-    enorm = 2.0 / (filter_freqs[2 : num_mel_filters + 2] - filter_freqs[:num_mel_filters])
+    enorm = 2.0 / (filter_freqs[2 : num_mel_filters + 2] - filter_freqs[:num_mel_filters])  # pyrefly: ignore[bad-index]
     mel_filters *= np.expand_dims(enorm, 0)
 
   if (mel_filters.max(axis=0) == 0.0).any():

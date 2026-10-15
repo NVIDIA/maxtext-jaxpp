@@ -13,15 +13,18 @@
 # limitations under the License.
 
 # pylint: disable=bare-except, consider-using-generator, too-many-positional-arguments
-""" Utils that are only interesting to MaxText. """
+"""Utils that are only interesting to MaxText."""
 
 import re
 import jax
 import jax.numpy as jnp
 
 import optax
-from optax.contrib._muon import muon
+from optax.contrib._muon import muon as optax_muon
+from maxtext.common.common_types import DecoderBlockType
+from maxtext.optimizers.muon import muon as maxtext_muon
 from maxtext.utils.muon_utils import get_muon_weight_dimension_numbers
+from maxtext.utils.maxtext_muon_utils import get_maxtext_muon_weight_dimension_numbers
 
 
 def _get_path_mask_fn(patterns, match_returns_true=True):
@@ -48,7 +51,124 @@ def get_adamw_mask(config):
   return _get_path_mask_fn(getattr(config, "adamw_mask", None), match_returns_true=False)
 
 
-def get_optimizer(config, learning_rate_schedule, model=None):
+def _compute_rolling_stats(arr: jax.Array, count: jax.Array, interval: int):
+  """Computes mean and unbiased std (Bessel's correction) over a rolling window."""
+  valid_elements = jnp.minimum(count, interval)
+  safe_elements = jnp.maximum(1, valid_elements)
+  mask = jnp.arange(interval) < valid_elements
+
+  mean = jnp.sum(jnp.where(mask, arr, 0.0)) / safe_elements
+  sq_diff = jnp.where(mask, (arr - mean) ** 2, 0.0)
+
+  # Use Bessel's correction (N - 1) for unbiased variance to align with torch.std
+  variance = jnp.sum(sq_diff) / jnp.maximum(1, valid_elements - 1)
+  std = jnp.sqrt(variance)
+  return mean, std
+
+
+def skip_step_on_spikes(
+    inner_opt: optax.GradientTransformation, interval: int, scaling_factor: float
+) -> optax.GradientTransformationExtraArgs:
+  """Wrapper that skips updates when loss or grad_norm spike.
+
+  This wrapper calculates a rolling mean and standard deviation (using
+  Bessel's correction) over the last `interval` steps for both the loss
+  and the gradient norm. If the current step's loss or gradient norm
+  exceeds `mean + scaling_factor * std`, the update is zeroed and the
+  optimizer state is not advanced, effectively skipping the step.
+
+  Reference implementation:
+  https://github.com/allenai/OLMo-core/blob/c757b7c3c15197154c753d883330afbfa4869dcc/src/olmo_core/optim/skip_step_optimizer.py#L12
+
+  Args:
+    inner_opt: The inner Optax gradient transformation to wrap.
+    interval: The number of recent steps to use for calculating mean and std.
+    scaling_factor: The multiplier for standard deviation to set the spike threshold.
+
+  Returns:
+    An optax.GradientTransformationExtraArgs that skips spikes.
+  """
+
+  def init_fn(params):
+    return {
+        "inner_state": inner_opt.init(params),
+        "losses": jnp.zeros(interval, dtype=jnp.float32),
+        "grad_norms": jnp.zeros(interval, dtype=jnp.float32),
+        "count": jnp.zeros((), dtype=jnp.int32),
+        "is_skipped": jnp.array(False, dtype=jnp.bool_),
+    }
+
+  def update_fn(updates, state, params=None, **extra_args):
+    # Using `pop()` removes `loss` and `grad_norm` from `extra_args` before they are
+    # passed downstream to `inner_opt.update()`. This prevents `TypeError` if the
+    # inner optimizer doesn't explicitly accept these as `kwargs`.
+    loss = extra_args.pop("loss", None)
+    grad_norm = extra_args.pop("grad_norm", None)
+
+    # Fallback to standard update if loss is not provided
+    if loss is None:
+      inner_updates, new_inner_state = inner_opt.update(updates, state["inner_state"], params, **extra_args)
+      return inner_updates, {
+          "inner_state": new_inner_state,
+          "losses": state["losses"],
+          "grad_norms": state["grad_norms"],
+          "count": state["count"],
+          "is_skipped": jnp.array(False, dtype=jnp.bool_),
+      }
+
+    count = state["count"]
+    losses = state["losses"]
+    grad_norms = state["grad_norms"]
+
+    # Compute rolling stats
+    loss_mean, loss_std = _compute_rolling_stats(losses, count, interval)
+    grad_norm_mean, grad_norm_std = _compute_rolling_stats(grad_norms, count, interval)
+
+    # Check if the current metrics are within the allowed thresholds
+    is_loss_ok = (loss - loss_mean) <= scaling_factor * loss_std
+    if grad_norm is not None:
+      is_grad_norm_ok = (grad_norm - grad_norm_mean) <= scaling_factor * grad_norm_std
+      is_ok = jnp.logical_and(is_loss_ok, is_grad_norm_ok)
+    else:
+      is_ok = is_loss_ok
+
+    # Only enforce skip if we have at least half the interval filled (or 2 elements minimum)
+    min_history = max(2, interval // 2)
+    is_warmup = (count + 1) < min_history
+    is_ok = jnp.logical_or(is_warmup, is_ok)
+
+    # Conditionally execute the inner optimizer to prevent momentum poisoning
+    def do_update():
+      return inner_opt.update(updates, state["inner_state"], params, **extra_args)
+
+    def skip_update():
+      # b/500923599: Investigate logging compatible with jax.jit, jax.lax.cond, and Pathway
+      inner_updates = jax.tree_util.tree_map(jnp.zeros_like, updates)
+      return inner_updates, state["inner_state"]
+
+    inner_updates, new_inner_state = jax.lax.cond(is_ok, do_update, skip_update)
+
+    # Update rolling buffers (append even if skipped so spikes can become the new baseline)
+    idx = count % interval
+    new_losses = losses.at[idx].set(loss)
+
+    new_grad_norms = grad_norms
+    if grad_norm is not None:
+      new_grad_norms = grad_norms.at[idx].set(grad_norm)
+
+    new_state = {
+        "inner_state": new_inner_state,
+        "losses": new_losses,
+        "grad_norms": new_grad_norms,
+        "count": count + 1,
+        "is_skipped": jnp.logical_not(is_ok),
+    }
+    return inner_updates, new_state
+
+  return optax.GradientTransformationExtraArgs(init_fn, update_fn)
+
+
+def get_optimizer(config, learning_rate_schedule, model=None, mesh=None):
   """Create optimizer."""
   if config.opt_type == "adamw":
     # Create AdamW Optimizer following Llama2's training details, see https://arxiv.org/pdf/2307.09288.pdf section 2.2
@@ -75,30 +195,67 @@ def get_optimizer(config, learning_rate_schedule, model=None):
   elif config.opt_type == "sgd":
     base_opt = optax.sgd(learning_rate_schedule)
   elif config.opt_type == "muon":
-    # extract muon dimension number from model structure
-    if model is not None:
-      muon_weight_dimension_numbers = get_muon_weight_dimension_numbers(model, config)
+    muon_type = getattr(config, "muon_type", "optax_muon")
+    if config.decoder_block == DecoderBlockType.DEEPSEEK4:
+      ns_coeffs = [(3.4445, -4.7750, 2.0315)] * 8 + [(2.0, -1.5, 0.5)] * 2
+      ns_steps = 10
     else:
-      raise ValueError("Please specify model to extract muon dimension number.")
+      ns_coeffs = (3.4445, -4.7750, 2.0315)
+      ns_steps = 5
+
     muon_kwargs = {
         # Shared parameters: "nesterov" uses default
         "learning_rate": learning_rate_schedule,
         "eps": config.adam_eps,
         "mu_dtype": config.mu_dtype,
-        # Muon-specific parameters: "ns_coeffs", "ns_steps", "weight_decay_mask", "adaptive" uses default
+        # Muon-specific parameters: "weight_decay_mask", "adaptive" uses default
         "beta": config.muon_beta,
         "weight_decay": config.muon_weight_decay,
-        "muon_weight_dimension_numbers": muon_weight_dimension_numbers,
         "consistent_rms": config.muon_consistent_rms,
+        "ns_coeffs": ns_coeffs,
+        "ns_steps": ns_steps,
         # AdamW-specific parameters
         "adam_b1": config.adam_b1,
         "adam_b2": config.adam_b2,
         "adam_eps_root": config.adam_eps_root,
         "adam_weight_decay": config.adam_weight_decay,
     }
-    base_opt = muon(**muon_kwargs)
+
+    if muon_type in ("optax", "optax_muon"):
+      assert not getattr(
+          config, "muon_use_all_to_all", False
+      ), "all-to-all communication in muon is only supported with maxtext_muon, not optax_muon."
+      if model is not None:
+        muon_weight_dimension_numbers = get_muon_weight_dimension_numbers(model, config)
+      else:
+        raise ValueError("Please specify model to extract muon dimension number.")
+      muon_kwargs = muon_kwargs | {"muon_weight_dimension_numbers": muon_weight_dimension_numbers}
+      base_opt = optax_muon(**muon_kwargs)  # pyrefly: ignore[bad-argument-type]
+    elif muon_type in ("maxtext", "maxtext_muon"):
+      if model is not None:
+        muon_weight_dimension_numbers = get_maxtext_muon_weight_dimension_numbers(model, config, mesh=mesh)
+      else:
+        raise ValueError("Please specify model to extract muon dimension number.")
+
+      use_all_to_all = getattr(config, "muon_use_all_to_all", True)
+      muon_kwargs = muon_kwargs | {
+          "muon_weight_dimension_numbers": muon_weight_dimension_numbers,
+          "use_all_to_all": use_all_to_all,
+      }
+      base_opt = maxtext_muon(**muon_kwargs)  # pyrefly: ignore[bad-argument-type]
+    else:
+      raise ValueError(
+          f"Unsupported muon_type: {muon_type}. Must be 'optax_muon' (or 'optax') or 'maxtext_muon' (or 'maxtext')."
+      )
   else:
     raise ValueError(f"{config.opt_type=} is not a supported.")
+
+  if getattr(config, "skip_step_on_spikes", False):
+    base_opt = skip_step_on_spikes(
+        base_opt,
+        interval=config.skip_step_interval,
+        scaling_factor=config.skip_step_scaling_factor,
+    )
 
   # If a whitelist of trainable parameters is provided, freeze everything else.
   # When trainable_parameters_mask is empty, freeze_mask_fn is None and all parameters are trained.
@@ -212,7 +369,9 @@ def adam_pax(
       else:
         updates = jax.tree_util.tree_map(lambda x, v: x + weight_decay * v, updates, params)
 
-    step_size = -1.0 * learning_rate_fn(count)
+    # learning_rate_fn may be a callable schedule or a scalar (e.g. when wrapped
+    # by optax.inject_hyperparams, it is passed as a pre-evaluated scalar).
+    step_size = -1.0 * (learning_rate_fn(count) if callable(learning_rate_fn) else learning_rate_fn)
     # Finally, fold in step size.
     updates = jax.tree_util.tree_map(lambda x: step_size * x, updates)
 

@@ -18,8 +18,6 @@ Set DECOUPLE_GCLOUD=TRUE in the environment to disable optional Google Cloud / J
 integrations while still allowing local unit tests to import modules. This module provides:
 
 - is_decoupled(): returns True if decoupled flag set.
-- cloud_diagnostics(): tuple(diagnostic, debug_configuration, diagnostic_configuration, stack_trace_configuration)
-  providing either real objects or lightweight stubs.
 - jetstream(): returns a namespace-like object exposing Engine, Devices, ResultTokens etc. or stubs.
 - gcs_storage(): returns google.cloud.storage module or stub namespace with Client/Blob/Bucket.
 - goodput_modules(): returns (goodput, monitoring, is_stub) for ml_goodput_measurement integration or stubs.
@@ -71,79 +69,6 @@ def _import_or_stub(
       print(f"{prefix} {label}: dependency missing; using stub. ({type(exc).__name__})")
       return stub_fn()
     raise
-
-
-# ---------------- Cloud Diagnostics -----------------
-
-
-def _cloud_diag_stubs():
-  """Return lightweight stubs for cloud TPU diagnostics."""
-  import contextlib  # pylint: disable=import-outside-toplevel
-
-  class _StubDiag:
-    """Stub diagnostic object returning skip metadata."""
-
-    def run(self, *_a, **_k):
-      return {"status": "skipped"}
-
-    def diagnose(self, *_a, **_k):
-      """Return a context manager that swallows diagnostic errors in stub mode."""
-
-      @contextlib.contextmanager
-      def _graceful_diagnose():
-        try:
-          yield
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-          print("Warning: using stubs for cloud_diagnostics diagnose() - " f"caught: {exc}")
-
-      return _graceful_diagnose()
-
-  class _StubDebugConfig:
-    """Stub debug configuration."""
-
-    def __init__(self, *a, **k):  # pylint: disable=unused-argument
-      pass
-
-  class _StubStackTraceConfig:
-    """Stub stack trace configuration."""
-
-    def __init__(self, *a, **k):  # pylint: disable=unused-argument
-      pass
-
-  class _StubDiagnosticConfig:
-    """Stub diagnostic configuration wrapper."""
-
-    def __init__(self, *a, debug_config=None, **k):  # pylint: disable=unused-argument
-      del a, k
-      self.debug_config = debug_config
-
-  return (
-      _StubDiag(),
-      SimpleNamespace(DebugConfig=_StubDebugConfig, StackTraceConfig=_StubStackTraceConfig),
-      SimpleNamespace(DiagnosticConfig=_StubDiagnosticConfig),
-      SimpleNamespace(StackTraceConfig=_StubStackTraceConfig),
-  )
-
-
-def cloud_diagnostics():
-  """Return real cloud diagnostics modules or stubs.
-
-  If a dependency is missing and we are decoupled, return stubs. Otherwise
-  re-raise the import error so callers fail fast.
-  """
-
-  def _import():
-    from cloud_tpu_diagnostics import diagnostic  # type: ignore  # pylint: disable=import-outside-toplevel
-    from cloud_tpu_diagnostics.configuration import (  # type: ignore  # pylint: disable=import-outside-toplevel
-        debug_configuration,
-        diagnostic_configuration,
-        stack_trace_configuration,
-    )
-
-    return diagnostic, debug_configuration, diagnostic_configuration, stack_trace_configuration
-
-  # Only stub on import failures if running decoupled; otherwise fail fast.
-  return _import_or_stub(_import, _cloud_diag_stubs, label="cloud_diagnostics", stub_if_decoupled=False)
 
 
 # ---------------- JetStream -----------------
@@ -223,8 +148,9 @@ def jetstream():
       if importlib.util.find_spec(mod) is None:
         if is_decoupled():
           print("[DECOUPLED NO-OP] jetstream: dependency missing; using stubs.")
-          return _jetstream_stubs()
-        raise ModuleNotFoundError(mod)
+        else:
+          print("[NO-OP] jetstream: dependency missing; using stubs.")
+        return _jetstream_stubs()
     from jetstream.core import config_lib  # type: ignore  # pylint: disable=import-outside-toplevel
     from jetstream.engine import engine_api, token_utils, tokenizer_api  # type: ignore  # pylint: disable=import-outside-toplevel
     from jetstream.engine.tokenizer_pb2 import TokenizerParameters, TokenizerType  # type: ignore  # pylint: disable=import-outside-toplevel
@@ -248,11 +174,12 @@ def jetstream():
     token_params_ns = SimpleNamespace(TokenizerParameters=TokenizerParameters, TokenizerType=TokenizerType)
     setattr(token_params_ns, "_IS_STUB", False)
     return config_lib, engine_api, token_utils, tokenizer_api, token_params_ns
-  except ModuleNotFoundError:
+  except (ModuleNotFoundError, ImportError) as e:
     if is_decoupled():
       print("[DECOUPLED NO-OP] jetstream: dependency missing; using stubs.")
-      return _jetstream_stubs()
-    raise
+    else:
+      print(f"[NO-OP] jetstream: dependency missing ({e}); using stubs.")
+    return _jetstream_stubs()
 
 
 # ---------------- GCS -----------------
@@ -309,11 +236,30 @@ def _gcs_stubs():  # pragma: no cover - simple no-op placeholders
     def bucket(self, *a, **k):  # pylint: disable=unused-argument
       return _StubBucket()
 
-  return SimpleNamespace(Client=_StubClient, _IS_STUB=True)
+    def list_blobs(self, *a, **k):  # pylint: disable=unused-argument
+      return iter([])
+
+  def _stub_upload_many_from_filenames(*_a, **_k):
+    """No-op stub for transfer_manager.upload_many_from_filenames."""
+    return []
+
+  transfer_manager_stub = SimpleNamespace(
+      upload_many_from_filenames=_stub_upload_many_from_filenames,
+      _IS_STUB=True,
+  )
+
+  return SimpleNamespace(Client=_StubClient, transfer_manager=transfer_manager_stub, _IS_STUB=True)
 
 
 def gcs_storage():
-  """Return google.cloud.storage module or stub when decoupled or missing."""
+  """Return google.cloud.storage module (with transfer_manager attached) or stub.
+
+  The returned object always exposes both ``.Client`` and ``.transfer_manager``
+  so callers can use ``storage.transfer_manager.upload_many_from_filenames(...)``
+  without an extra import. ``transfer_manager`` is a submodule of
+  ``google.cloud.storage`` and is not auto-imported by ``from google.cloud
+  import storage``; we explicitly import and attach it here.
+  """
   # In decoupled mode always prefer the stub, even if the library is installed,
   # to avoid accidental GCS calls in tests or local runs.
   if is_decoupled():  # fast path
@@ -322,7 +268,9 @@ def gcs_storage():
 
   try:  # pragma: no cover - attempt real import when not decoupled
     from google.cloud import storage  # type: ignore  # pylint: disable=import-outside-toplevel
+    from google.cloud.storage import transfer_manager  # type: ignore  # pylint: disable=import-outside-toplevel
 
+    setattr(storage, "transfer_manager", transfer_manager)
     setattr(storage, "_IS_STUB", False)
     return storage
   except Exception:  # ModuleNotFoundError / ImportError for partial installs  # pylint: disable=broad-exception-caught
@@ -384,10 +332,11 @@ def goodput_modules():
       _goodput_stubs,
       label="ml_goodput_measurement",
       stub_if_decoupled=False,
+      stub_on_error_when_not_decoupled=True,
   )
 
 
-__all__ = ["is_decoupled", "cloud_diagnostics", "jetstream", "gcs_storage", "goodput_modules"]
+__all__ = ["is_decoupled", "jetstream", "gcs_storage", "goodput_modules"]
 
 # ---------------- Cloud Monitoring (monitoring_v3 / metric_pb2) -----------------
 
@@ -579,6 +528,9 @@ def _mldiagnostics_stub():  # pragma: no cover - simple placeholder
       """Return a stub context manager."""
       return _StubXprof()
 
+    def machinelearning_run(self, *a, **k):  # pylint: disable=unused-argument
+      """Do nothing: there is no run to register without the real package."""
+
   return _StubMldiag(), True
 
 
@@ -606,6 +558,29 @@ __all__.append("mldiagnostics_modules")
 
 # ------------------------- TensorBoardX --------------------------
 
+
+class StubSummaryWriter:
+  """Stubbed TensorBoardX SummaryWriter replacement."""
+
+  def __init__(self, *args, **kwargs):  # pylint: disable=unused-argument
+    del args, kwargs
+
+  def add_text(self, *args, **kwargs):
+    pass
+
+  def add_scalar(self, *args, **kwargs):
+    pass
+
+  def add_histogram(self, *args, **kwargs):
+    pass
+
+  def flush(self):
+    pass
+
+  def close(self):
+    pass
+
+
 try:
   if not is_decoupled():  # Only attempt real import when not decoupled
     from tensorboardX import writer  # type: ignore  # pylint: disable=import-outside-toplevel,unused-import
@@ -616,30 +591,10 @@ try:
 except Exception:  # pragma: no cover - provide stub fallback  # pylint: disable=broad-exception-caught
   _TENSORBOARDX_AVAILABLE = False
 
-  class _StubSummaryWriter:
-    """Stubbed TensorBoardX SummaryWriter replacement."""
-
-    def __init__(self, *args, **kwargs):  # pylint: disable=unused-argument
-      del args, kwargs
-
-    def add_text(self, *args, **kwargs):
-      pass
-
-    def add_scalar(self, *args, **kwargs):
-      pass
-
-    def add_histogram(self, *args, **kwargs):
-      pass
-
-    def flush(self):
-      pass
-
-    def close(self):
-      pass
-
   class writer:  # pylint: disable=too-few-public-methods
-    SummaryWriter = _StubSummaryWriter
+    SummaryWriter = StubSummaryWriter
 
 
 __all__.append("writer")
 __all__.append("_TENSORBOARDX_AVAILABLE")
+__all__.append("StubSummaryWriter")

@@ -19,7 +19,7 @@ Provides a utility to load and quantize a checkpoint layer by layer. Currently, 
 
 Example cmd:
 
-python3 -m MaxText.layerwise_quantization  src/maxtext/configs/base.yml \
+python3 -m maxtext.utils.layerwise_quantization  src/maxtext/configs/base.yml \
   tokenizer_path=${TOKENIZER_PATH?} load_parameters_path=${LOAD_PARAMS_PATH?} \
   model_name=deepseek2-16b ici_fsdp_parallelism=1 ici_autoregressive_parallelism=1 \
   ici_tensor_parallelism=-1 scan_layers=false weight_dtype=bfloat16 per_device_batch_size=1 \
@@ -36,18 +36,18 @@ from typing import Any, Sequence
 from absl import app
 from aqt.jax.v2 import aqt_tensor
 from flax import nnx
-from flax.linen import partitioning as nn_partitioning
+from flax.core.spmd import logical_axis_rules
 import jax
 import jax.numpy as jnp
 from maxtext.common import common_types
 from maxtext.common import checkpointing
 from maxtext.layers import quantizations
-from maxtext.models import deepseek, models
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
+from maxtext.utils import maxtext_utils_nnx
+from maxtext.utils import model_creation_utils
 import orbax.checkpoint as ocp
-from tqdm import tqdm
 from maxtext.configs import pyconfig
 
 IGNORE = ocp.PLACEHOLDER
@@ -163,118 +163,157 @@ class LayerwiseQuantization:
     self.config = config
     self.rng = rng
 
-    # TODO(ranlihao): Remove this assertion once the Layerwise quantization is supported for other decoder blocks.
-    assert (
-        config.decoder_block == common_types.DecoderBlockType.DEEPSEEK
-    ), f"Layerwise quantization is only supported for {common_types.DecoderBlockType.DEEPSEEK}\
-      , but got {config.decoder_block}."
     # Mesh definition
     devices_array = maxtext_utils.create_device_mesh(config=config)
     self._mesh = jax.sharding.Mesh(devices_array, config.mesh_axes)
 
-    # Model and quantization config
     self.quant = quantizations.configure_quantization(config)
-    model = models.transformer_as_linen(
-        config, mesh=self._mesh, quant=self.quant, model_mode=common_types.MODEL_MODE_TRAIN
-    )
-    self.unboxed_abstract_state, _, _ = maxtext_utils.get_abstract_state(
-        model, None, self.config, self.rng, self._mesh, False
-    )
+    # NNX builds the model via from_pretrained; no Linen abstract-state
+    # bookkeeping is needed here.
+    self.unboxed_abstract_state = None
 
   def load_and_quantize(self) -> None:
     """
     Load parameters layer by layer and quantize them.
     """
-    quantized_params = {}
-    quantized_params["params"] = {"decoder": {}}
-    quantized_params["aqt"] = {"decoder": {}}
+    self._load_and_quantize_nnx()
+
+  def _load_and_quantize_nnx(self) -> None:
+    """Whole-model NNX convert: load full-precision via TRAIN-mode `from_pretrained`,
+    transfer kernels into a fresh CONVERT-mode model, run a forward (the
+    `ToNNX(AqtDotGeneral)` bridge auto-captures `qrhs.frozen`), strip kernels at
+    quantized paths, and save the serve-mode-shaped state.
+
+    Two-step load: input checkpoints are typically full-precision (no AQT state
+    on disk), so we can't `from_pretrained(quant_mode_str="convert")` directly —
+    orbax would fail to find the missing `qrhs.frozen` leaves. Instead we load
+    in TRAIN mode (which has only kernels), then copy them into a randomly
+    initialized CONVERT model that already has the AQT variables provisioned.
+    """
     config = self.config
-    self.quant.quant_mode = quantizations.get_quant_mode("convert")
-    model_mode = common_types.MODEL_MODE_PREFILL
-    _, rng_quant_params = jax.random.split(self.rng)
-
-    layers = [
-        deepseek.DeepSeekDenseLayerToLinen(
-            config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode, rngs=nnx.Rngs(self.rng)
-        ),
-        deepseek.DeepSeekMoELayerToLinen(
-            config=config, mesh=self._mesh, quant=self.quant, model_mode=model_mode, rngs=nnx.Rngs(self.rng)
-        ),
-    ]
-    layer_prefixes = [
-        "dense_layers",
-        "moe_layers",
-    ]
-    num_moe_layers = config.num_decoder_layers - config.first_num_dense_layers
-    num_layers_list = [
-        config.first_num_dense_layers,
-        num_moe_layers,
-    ]
-
-    def model_apply(_p, _rng, layer):
-      return layer.apply(
-          _p | {"aqt": {}},
-          jnp.ones((1, self.config.max_prefill_predict_length, self.config.base_emb_dim), dtype=jnp.int32),
-          None,
-          jnp.zeros((1, self.config.max_prefill_predict_length), dtype=jnp.int32),
-          True,
-          model_mode=model_mode,
-          rngs={"params": _rng},
-          mutable=True,
+    # MODEL_MODE_TRAIN avoids the PREFILL/AUTOREGRESSIVE cache plumbing — AQT
+    # layers populate `qrhs.frozen` regardless of model_mode, so train mode is
+    # simpler and faster.
+    max_logging.log("Loading full-precision NNX checkpoint in TRAIN mode...")
+    with self._mesh:
+      train_model = model_creation_utils.from_pretrained(
+          config,
+          mesh=self._mesh,
+          model_mode=common_types.MODEL_MODE_TRAIN,
+          quant_mode_str="train",
       )
 
-    for layer, num_layers, layer_prefix in zip(layers, num_layers_list, layer_prefixes):
-      for index in tqdm(range(num_layers)):
-        layer_name = f"{layer_prefix}_{index}"
-        max_logging.log(f"Processing layer: {layer_name}")
+    max_logging.log("Building CONVERT-mode model (random init) and copying kernels in...")
+    rngs = maxtext_utils_nnx.create_nnx_rngs(config, rng_key=self.rng)
+    with logical_axis_rules(config.logical_axis_rules):
+      convert_model = model_creation_utils.from_config(
+          config,
+          mesh=self._mesh,
+          rngs=rngs,
+          model_mode=common_types.MODEL_MODE_TRAIN,
+          quant_mode_str="convert",
+      )
+    self._copy_kernel_leaves_(convert_model, train_model)
+    del train_model
 
-        params = self._load_layer(layer_name)
-        params["params"] = params["params"]["decoder"][layer_name]
+    # Forward populates AqtDotGeneral_0.qrhs.frozen on every quantized layer.
+    L = config.max_target_length
+    decoder_input_tokens = jnp.zeros((1, L), dtype=jnp.int32)
+    decoder_positions = jnp.arange(L, dtype=jnp.int32)[None, :]
+    decoder_segment_ids = jnp.ones((1, L), dtype=jnp.int32)
+    max_logging.log("Running CONVERT-mode forward to populate AQT scale factors...")
+    with logical_axis_rules(config.logical_axis_rules):
+      _ = convert_model(
+          decoder_input_tokens,
+          decoder_positions,
+          decoder_segment_ids=decoder_segment_ids,
+          enable_dropout=False,
+          model_mode=common_types.MODEL_MODE_TRAIN,
+      )
 
-        _, new_vars = model_apply(params, rng_quant_params, layer)
+    # Convert-mode state has both `kernel` (full precision) and `AqtDotGeneral_0.qrhs.frozen`
+    # at every quantized DenseGeneral; the serve-mode reader expects only the latter.
+    # We filter out transient runtime state (RngState, Cache, Intermediate, BatchStat) so only persistent weights are saved.
+    convert_state = (
+        nnx.state(convert_model)
+        .filter(lambda path, var: not isinstance(var, (nnx.RngState, nnx.Cache, nnx.Intermediate, nnx.BatchStat)))
+        .to_pure_dict()
+    )
+    serve_state = self._strip_kernels_at_quantized_paths(convert_state)
 
-        if "aqt" not in new_vars:
-          max_logging.log(
-              f"Warning: 'aqt' not found in new_vars for {layer_name}. Skipping AQT processing for this layer."
-          )
-          quantized_params["params"]["decoder"][layer_name] = params["params"]  # Keep original params
+    if config.save_quantized_params_path:
+      max_logging.log(f"Saving NNX-format quantized checkpoint to {config.save_quantized_params_path}")
+
+      # Wrap each leaf in `{"value": <array>}` so the on-disk shape matches what
+      # `from_pretrained`'s NNX-detection branch reads back (it later does
+      # `tree.map(lambda v: v["value"], ...)` on each leaf). Save directly via
+      # orbax — `save_params_to_path` would add an outer `{"params": ...}` wrap
+      # that the NNX path doesn't expect.
+      def _wrap_value(node):
+        if isinstance(node, dict):
+          return {k: _wrap_value(v) for k, v in node.items()}
+        return {"value": node}
+
+      wrapped = _wrap_value(serve_state)
+      orbax_checkpointer = ocp.PyTreeCheckpointer(
+          use_ocdbt=config.checkpoint_storage_use_ocdbt,
+          use_zarr3=config.checkpoint_storage_use_zarr3,
+      )
+      orbax_checkpointer.save(config.save_quantized_params_path, wrapped, force=True)
+      max_logging.log(f"Saved NNX-format quantized checkpoint at: {config.save_quantized_params_path}")
+    else:
+      max_logging.log("Skipping save: save_quantized_params_path is null.")
+
+  @staticmethod
+  def _copy_kernel_leaves_(dst_model, src_model):
+    """Copy the full-precision parameter leaves (kernel/embedding/scale/bias)
+    from src into dst, leaving dst's AQT and RNG variables untouched.
+    """
+    src_dict = nnx.state(src_model).to_pure_dict()
+    dst_state = nnx.state(dst_model)
+    dst_dict = dst_state.to_pure_dict()
+
+    def walk(d_node, s_node):
+      if not (isinstance(d_node, dict) and isinstance(s_node, dict)):
+        return
+      for key, d_child in d_node.items():
+        if key not in s_node:
           continue
+        s_child = s_node[key]
+        if key in ("kernel", "embedding", "scale", "bias") and not isinstance(d_child, dict):
+          d_node[key] = s_child
+        elif isinstance(d_child, dict):
+          walk(d_child, s_child)
 
-        aqt_vars = new_vars["aqt"]
+    walk(dst_dict, src_dict)
+    nnx.replace_by_pure_dict(dst_state, dst_dict)
+    nnx.update(dst_model, dst_state)
 
-        try:
-          removed_params = remove_quantized_params(params["params"], aqt_vars)
-          quantized_params["params"]["decoder"][layer_name] = removed_params
-        except Exception as e:
-          max_logging.log(f"ERROR: Failed to remove quantized params for {layer_name}: {e}")
-          max_logging.log(f"Dumping params['params'] keys for {layer_name}:")
-          jax.tree_util.tree_map_with_path(
-              lambda path, _: max_logging.log(f"  {jax.tree_util.keystr(path)}"), params["params"]
-          )
-          max_logging.log(f"Dumping new_vars['aqt'] keys for {layer_name}:")
-          jax.tree_util.tree_map_with_path(lambda path, _: max_logging.log(f"  {jax.tree_util.keystr(path)}"), aqt_vars)
-          raise
+  @staticmethod
+  def _strip_kernels_at_quantized_paths(state_dict):
+    """Drop `kernel` keys at any node that has a sibling `AqtDotGeneral_0`.
 
-        # Restructure the aqt_vars for this layer to match pure Linen format for saving
-        if layer_prefix == "moe_layers":
-          structured_aqt = insert_deepseekmoeblock_scope(aqt_vars)
-        else:
-          structured_aqt = aqt_vars
-        quantized_params["aqt"]["decoder"][layer_name] = structured_aqt
-
-    unquantized_layers = ["decoder_norm", "logits_dense"]
-    for unquantized_layer in unquantized_layers:
-      params = self._load_layer(unquantized_layer)
-      quantized_params["params"]["decoder"][unquantized_layer] = params["params"]["decoder"][unquantized_layer]
-    quantized_params["params"]["token_embedder"] = self._load_layer("token_embedder")["params"]["token_embedder"]
-
-    maxtext_utils.save_quantized_checkpoint_if_configured(self.config, quantized_params)
+    In convert mode each quantized DenseGeneral keeps both the full-precision
+    `kernel` (an nnx.Param) and the AQT-quantized `AqtDotGeneral_0.qrhs.frozen`
+    side-by-side. Serve mode (the on-disk shape `from_pretrained` reads back)
+    only carries the latter; the kernel is recreated as a dummy zero in
+    `linears.DenseGeneral.__call__`.
+    """
+    if not isinstance(state_dict, dict):
+      return state_dict
+    has_aqt = "AqtDotGeneral_0" in state_dict
+    out = {}
+    for k, v in state_dict.items():
+      if k == "kernel" and has_aqt:
+        continue
+      out[k] = LayerwiseQuantization._strip_kernels_at_quantized_paths(v) if isinstance(v, dict) else v
+    return out
 
   def _load_layer(self, layer_name):
     """Loads a specific layer's parameters from the checkpoint."""
 
     config = self.config
-    with nn_partitioning.axis_rules(config.logical_axis_rules):
+    with logical_axis_rules(config.logical_axis_rules):
 
       params = checkpointing.load_params_from_path(
           config.load_parameters_path,

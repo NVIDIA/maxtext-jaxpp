@@ -1,0 +1,108 @@
+# Copyright 2023-2026 Google LLC
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+
+#     https://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This workflow will run unit and integration tests on MaxText Docker images.
+
+name: MaxText CI Tests on Docker Images
+
+on:
+  workflow_call:
+    inputs:
+      repository_name:
+        required: true
+        type: string
+      image_name:
+        required: true
+        type: string
+      image_tag:
+        required: true
+        type: string
+      device:
+        required: true
+        type: string
+      workflow:
+        required: true
+        type: string
+permissions:
+  contents: read
+
+jobs:
+  check_image:
+    name: Check Docker Image Existence
+    runs-on: linux-x86-n2-16-buildkit
+    container: google/cloud-sdk:524.0.0
+    outputs:
+      image_exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - name: Check if image exists
+        id: check
+        shell: bash
+        env:
+          PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          REPOSITORY_NAME: ${{ inputs.repository_name }}
+        run: |
+          if gcloud container images describe "us-docker.pkg.dev/${PROJECT_NAME}/${REPOSITORY_NAME}/${IMAGE_NAME}:${IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    name: CI Tests
+    needs: check_image
+    if: needs.check_image.outputs.image_exists == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: >-
+            ${{ fromJSON('{
+              "gpu-pre-training": ["gpu-unit", "gpu-integration"],
+              "tpu-post-training": ["tpu-post-training-unit", "tpu-post-training-integration", "cpu-post-training-unit", "cpu-post-training-integration"],
+              "tpu-pre-training": ["tpu-unit", "tpu-integration", "cpu-unit", "cpu-integration"]
+            }')[format('{0}-{1}', inputs.device, inputs.workflow)] }}
+    uses: ./.github/workflows/run_tests_coordinator.yml
+    with:
+      flavor: ${{ matrix.flavor }}
+      repository_name: ${{ inputs.repository_name }}
+      base_image: ${{ inputs.image_name }}:${{ inputs.image_tag }}
+      is_scheduled_run: true
+      maxtext_installed: true
+
+  tag_docker_image:
+    name: Tag Docker Image
+    needs: test
+    if: needs.test.result == 'success'
+    runs-on: linux-x86-n2-16-buildkit
+    container: google/cloud-sdk:524.0.0
+    steps:
+      - name: Configure Docker
+        run: gcloud auth configure-docker us-docker.pkg.dev -q
+      - name: Add tags
+        shell: bash
+        env:
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+          IMAGE_NAME_EXPR: ${{ inputs.image_name }}
+          IMAGE_TAG_EXPR: ${{ inputs.image_tag }}
+          REPOSITORY_NAME: ${{ inputs.repository_name }}
+        run: |
+          image_name="$IMAGE_NAME_EXPR"
+          image_tag="$IMAGE_TAG_EXPR"
+          SOURCE_IMAGE="us-docker.pkg.dev/${PROJECT_NAME}/${REPOSITORY_NAME}/${image_name}"
+
+          # Add the traceability tag to confirm it passed validation suite
+          gcloud container images add-tag "${SOURCE_IMAGE}:${image_tag}" \
+            "${SOURCE_IMAGE}:verified-ci-${image_tag}" --quiet

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" Common GCS Utils needed by multiple modules"""
+"""Common GCS Utils needed by multiple modules"""
 import shutil
 import json
 import os
@@ -20,6 +20,7 @@ import socket
 from pathlib import Path
 from etils import epath
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import yaml
 
@@ -168,6 +169,35 @@ def gcs_list_directories(directory_path):
   return directories
 
 
+def gcs_delete_directory(directory_path: str):
+  """Deletes a "directory" (all blobs with the prefix) from GCS.
+
+  Args:
+      directory_path: The GCS path (gs://...) representing the "directory" to delete.
+  """
+  if not _gcs_guard("gcs_delete_directory"):
+    return
+  storage_client = storage.Client()
+  bucket_name, directory_prefix = parse_gcs_bucket_and_prefix(directory_path)
+  bucket = storage_client.bucket(bucket_name)
+
+  # Ensures the prefix has a trailing slash to avoid deleting more than intended.
+  if not directory_prefix.endswith("/"):
+    directory_prefix += "/"
+
+  blobs = list(bucket.list_blobs(prefix=directory_prefix))
+  if blobs:
+    # Uses a ThreadPoolExecutor to delete blobs in parallel to match gsutil -m performance.
+    def _delete_blob(blob):
+      try:
+        blob.delete()
+      except Exception as e:  # pylint: disable=broad-except
+        max_logging.log(f"Error deleting blob {blob.name}: {e}")
+
+    with ThreadPoolExecutor(max_workers=32) as executor:
+      executor.map(_delete_blob, blobs)
+
+
 def gcs_glob_pattern(pattern):
   """
   Globs GCS files and returns a list of full GCS paths.
@@ -261,7 +291,8 @@ def mkdir_and_check_permissions(path: str | epath.Path) -> epath.Path:
   if isinstance(path, str):
     path = epath.Path(path)
 
-  if path.as_posix().startswith("gs://"):
+  is_gcs = path.as_posix().startswith("gs://")
+  if is_gcs:
     if len(path.parts) < 3:
       raise ValueError(f"Invalid GCS path (missing bucket name): '{path}'")
     bucket_name = path.parts[2]
@@ -271,7 +302,10 @@ def mkdir_and_check_permissions(path: str | epath.Path) -> epath.Path:
     except Exception as e:
       raise FileNotFoundError(f"GCS bucket 'gs://{bucket_name}' not found or accessible.") from e
   path.mkdir(exist_ok=True, parents=True)
-  if not path.exists():
+
+  # GCS directories are virtual: gcsfs makes mkdir a no-op, so exists() can return False.
+  # Only check exists() for local paths; rely on the write test below for GCS.
+  if not is_gcs and not path.exists():
     raise PermissionError(f"Failed to create the directory '{path}'. Please check that you have write access.")
 
   # Verify write permissions by creating and deleting a temporary file.

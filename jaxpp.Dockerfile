@@ -19,17 +19,23 @@ ARG JAX_INSTALL_URL
 COPY --chown=$USER_UID:$USER_GID . maxtext
 
 ARG JAXPP_PATH=/workdir/jaxpp
+# Build TE against the installed CUDA13 JAX, not its isolated CUDA12 build environment.
 RUN JAXPP_JAX_VERSION=$(python -c \
         'from importlib.metadata import version; print(version("jax"))') && \
-    uv pip install --no-cache-dir \
-        -e '/workdir/maxtext[cuda13]' \
-        -e "${JAXPP_PATH}" \
-        "jax[cuda13]==${JAXPP_JAX_VERSION}" \
-        --resolution=lowest && \
     if [ -z "${VIRTUAL_ENV}" ]; then \
         echo "[failed] VIRTUAL_ENV variable is not set."; \
         exit 1; \
     fi && \
-    "${VIRTUAL_ENV}/bin/pip" install --no-build-isolation transformer-engine[jax]==2.16.0 && \
+    uv pip install --no-cache-dir --resolution=lowest \
+        "nvidia-cudnn-frontend>=1.29.0" "pybind11[global]>=2.13.6" && \
+    "${VIRTUAL_ENV}/bin/pip" install --no-build-isolation \
+        'transformer-engine[core-cu13,jax]==2.19.0' && \
+    uv pip install --no-cache-dir \
+        -e '/workdir/maxtext[cuda13]' \
+        -e "${JAXPP_PATH}" \
+        "jax[cuda13]==${JAXPP_JAX_VERSION}" \
+        --no-build-isolation-package transformer-engine-jax \
+        --resolution=lowest && \
+    python -c 'from pathwaysutils.elastic import elastic, manager' && \
     uv pip install triton==3.7.1 && \
     if [[ -n "$JAX_INSTALL_URL" ]]; then uv pip install $JAX_INSTALL_URL; fi

@@ -93,7 +93,10 @@ def run_config_validation(config_file_path: str):
     # Step 2: Attempt to instantiate the Pydantic model.
     # This is where validation happens. If there are extra fields,
     # missing fields, or type mismatches, a ValidationError is raised.
-    pydantic_instance = pydantic_types.MaxTextConfig(**config_dict)
+    if "rl.yml" in config_file_path:
+      pydantic_instance = pydantic_types.RLConfig(**config_dict)
+    else:
+      pydantic_instance = pydantic_types.MaxTextConfig(**config_dict)
 
     # Step 3: Test the "emit" part by dumping the model back to a dict.
     dumped_config = pydantic_instance.model_dump()
@@ -140,6 +143,8 @@ GEMMA_CONFIGS = [
     os.path.join(CONFIGS_DIR, "models", "gemma3-4b.yml"),
     os.path.join(CONFIGS_DIR, "models", "gemma3-12b.yml"),
     os.path.join(CONFIGS_DIR, "models", "gemma3-27b.yml"),
+    os.path.join(CONFIGS_DIR, "models", "gemma4-e2b.yml"),
+    os.path.join(CONFIGS_DIR, "models", "gemma4-e4b.yml"),
 ]
 
 
@@ -241,6 +246,9 @@ QWEN_CONFIGS = [
     os.path.join(CONFIGS_DIR, "models", "qwen3-480b-a35b.yml"),
     os.path.join(CONFIGS_DIR, "models", "qwen3-next-80b-a3b.yml"),
     os.path.join(CONFIGS_DIR, "models", "qwen3-omni-30b-a3b.yml"),
+    os.path.join(CONFIGS_DIR, "models", "qwen3.5-35b-a3b.yml"),
+    os.path.join(CONFIGS_DIR, "models", "qwen3.5-35b-a3b-fp8.yml"),
+    os.path.join(CONFIGS_DIR, "models", "qwen3.5-397b-a17b-fp8.yml"),
 ]
 
 

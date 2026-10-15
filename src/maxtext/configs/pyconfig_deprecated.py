@@ -30,7 +30,7 @@ import omegaconf
 
 from maxtext.utils import accelerator_to_spec_map
 from maxtext.utils.globals import MAXTEXT_ASSETS_ROOT, MAXTEXT_REPO_ROOT, MAXTEXT_PKG_DIR
-from maxtext.common.common_types import AttentionType, DecoderBlockType, ShardMode
+from maxtext.common.common_types import AttentionType, DecoderBlockType, ReorderStrategy, ShardMode
 from maxtext.utils import gcs_utils
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
@@ -105,8 +105,8 @@ def validate_attention_kernel(s: str) -> None:
       "flash",
       "cudnn_flash_te",
       "cudnn_flash_jax",
-      "paged",
       "vllm_rpa",
+      "vllm_batched_rpa",
   )
   if s not in valid_attention_kernels:  # currently supported attention
     raise ValueError("Invalid attention kernel was passed. Valid options ", valid_attention_kernels)
@@ -119,7 +119,7 @@ def validate_attention_type(s: str) -> None:
 
 
 def validate_moba_attention(moba, attention) -> None:
-  if moba and attention in ("autoselected", "flash", "cudnn_flash_te", "cudnn_flash_jax", "paged"):
+  if moba and attention in ("autoselected", "flash", "cudnn_flash_te", "cudnn_flash_jax"):
     raise ValueError("MoBA is only supported dot_product attention")
 
 
@@ -194,11 +194,9 @@ def validate_expert_shard_attention_option(expert_shard_attention_option: str) -
     )
 
 
-def validate_vocab_tiling(num_vocab_tiling: int, per_device_batch_size: int, max_target_length: int, enable_nnx: bool):
+def validate_vocab_tiling(num_vocab_tiling: int, per_device_batch_size: int, max_target_length: int):
   if (per_device_batch_size * max_target_length) % num_vocab_tiling != 0:
     raise ValueError("Per device batch size times sequence length should be divisible by the number of vocab tiles.")
-  if num_vocab_tiling > 1 and enable_nnx:  # TODO (chengnuojin) enable vocab tiling on NNX after NNX migration
-    raise ValueError("We currently don't support vocab tiling on NNX module.")
 
 
 def validate_rampup_batch_size(batch_size_start, batch_size_end, batch_size_increment, global_rampup_samples):
@@ -240,9 +238,7 @@ def validate_keys(keys):
   validate_model_call_mode(keys["model_call_mode"])
   validate_prefill_and_target_lengths(keys["max_prefill_predict_length"], keys["max_target_length"])
   validate_rope_type(keys["rope_type"])
-  validate_vocab_tiling(
-      keys["num_vocab_tiling"], keys["per_device_batch_size"], keys["max_target_length"], keys["enable_nnx"]
-  )
+  validate_vocab_tiling(keys["num_vocab_tiling"], keys["per_device_batch_size"], keys["max_target_length"])
   if keys["enable_rampup_batch_size"]:
     validate_rampup_batch_size(
         keys["per_device_batch_size_start"],
@@ -252,8 +248,6 @@ def validate_keys(keys):
     )
 
   # TODO remove after b/435512699 resolved
-  if keys["context_parallel_size"] > 1 and keys["context_parallel_load_balance"] and keys["attention_type"] == "chunk":
-    raise ValueError("Currently load-balanced context parallelism is not supported for chunk attention.")
 
   validate_context_parallel_strategy_ring(
       keys["context_parallel_size"], keys["context_parallel_strategy"], keys["hardware"]
@@ -268,9 +262,11 @@ def validate_keys(keys):
         "Please disable MTP by setting mtp_num_layers=0 for inference."
     )
 
-  assert (keys["load_parameters_path"] == "" and keys["load_full_state_path"] == "") or keys[
-      "enable_checkpointing"
-  ], "You must set enable_checkpointing to load a checkpoint"
+  # Kept in sync with `types.MaxTextConfig`: only a full-state resume reads through the
+  # CheckpointManager. `load_parameters_path` warm starts through its own `ocp.Checkpointer`.
+  assert (
+      keys["load_full_state_path"] == "" or keys["enable_checkpointing"]
+  ), "You must set enable_checkpointing to resume from load_full_state_path"
   assert (
       keys["load_parameters_path"] == "" or keys["load_full_state_path"] == ""
   ), "At most one of `load_parameters_path` or `load_full_state_path` should be set"
@@ -683,7 +679,6 @@ class _HyperParameters:
           os.path.dirname(MAXTEXT_ASSETS_ROOT),
           os.path.join(MAXTEXT_REPO_ROOT, "assets"),
           MAXTEXT_REPO_ROOT,
-          os.path.join(MAXTEXT_REPO_ROOT, "src", "MaxText"),
           MAXTEXT_PKG_DIR,
           os.path.dirname(config_name),
       ):
@@ -818,11 +813,6 @@ class _HyperParameters:
       )
       raw_keys["shardy"] = False
 
-    if raw_keys["pagedattn_max_pages_per_group"] <= 0:
-      raw_keys["pagedattn_max_pages_per_group"] = (
-          raw_keys["max_target_length"] + raw_keys["pagedattn_tokens_per_page"] - 1
-      ) // raw_keys["pagedattn_tokens_per_page"]
-
     raw_keys["num_slices"] = max_utils.get_num_slices(raw_keys)
     raw_keys["quantization_local_shard_count"] = get_quantization_local_shard_count(raw_keys)
     raw_keys["context_parallel_size"] = get_context_parallel_size(raw_keys)
@@ -856,6 +846,7 @@ class _HyperParameters:
 
     raw_keys["decoder_block"] = DecoderBlockType(raw_keys["decoder_block"])
     raw_keys["shard_mode"] = ShardMode(raw_keys["shard_mode"])
+    raw_keys["context_parallel_reorder_strategy"] = ReorderStrategy(raw_keys["context_parallel_reorder_strategy"])
 
   @staticmethod
   def configure_gpt3_task(raw_keys):
@@ -927,7 +918,6 @@ def create_parallelisms_list(raw_keys):
       raw_keys["ici_context_parallelism"],
       raw_keys["ici_context_autoregressive_parallelism"],
       raw_keys["ici_tensor_parallelism"],
-      raw_keys["ici_tensor_transpose_parallelism"],
       raw_keys["ici_tensor_sequence_parallelism"],
       raw_keys["ici_expert_parallelism"],
       raw_keys["ici_autoregressive_parallelism"],
@@ -941,7 +931,6 @@ def create_parallelisms_list(raw_keys):
       raw_keys["dcn_context_parallelism"],
       raw_keys["dcn_context_autoregressive_parallelism"],
       raw_keys["dcn_tensor_parallelism"],
-      raw_keys["dcn_tensor_transpose_parallelism"],
       raw_keys["dcn_tensor_sequence_parallelism"],
       raw_keys["dcn_expert_parallelism"],
       raw_keys["dcn_autoregressive_parallelism"],
@@ -1038,7 +1027,6 @@ def set_and_validate_pipeline_config(raw_keys):
           raw_keys["ici_context_parallelism"],
           raw_keys["ici_context_autoregressive_parallelism"],
           raw_keys["ici_tensor_parallelism"],
-          raw_keys["ici_tensor_transpose_parallelism"],
           raw_keys["ici_tensor_sequence_parallelism"],
           raw_keys["ici_expert_parallelism"],
           raw_keys["ici_autoregressive_parallelism"],
@@ -1052,7 +1040,6 @@ def set_and_validate_pipeline_config(raw_keys):
           raw_keys["dcn_context_parallelism"],
           raw_keys["dcn_context_autoregressive_parallelism"],
           raw_keys["dcn_tensor_parallelism"],
-          raw_keys["dcn_tensor_transpose_parallelism"],
           raw_keys["dcn_tensor_sequence_parallelism"],
           raw_keys["dcn_expert_parallelism"],
           raw_keys["dcn_autoregressive_parallelism"],
@@ -1066,7 +1053,6 @@ def set_and_validate_pipeline_config(raw_keys):
           "context",
           "context_autoregressive",
           "tensor",
-          "tensor_transpose",
           "tensor_sequence",
           "expert",
           "autoregressive",
@@ -1081,7 +1067,6 @@ def set_and_validate_pipeline_config(raw_keys):
               "context",
               "context_autoregressive",
               "tensor",
-              "tensor_transpose",
               "tensor_sequence",
               "expert",
               "autoregressive",
@@ -1173,9 +1158,10 @@ def validate_mlp_dim(raw_keys):
   base_mlp_dim = raw_keys["base_mlp_dim"]
   base_moe_mlp_dim = raw_keys["base_moe_mlp_dim"]
   if is_fully_moe_model and (base_mlp_dim != base_moe_mlp_dim):
-    raise ValueError(
-        f"For a fully MoE model, base_mlp_dim must be equal to base_moe_mlp_dim. Received base_mlp_dim={base_mlp_dim} and base_moe_mlp_dim={base_moe_mlp_dim}."
-    )
+    if raw_keys.get("decoder_block") != "gemma4":
+      raise ValueError(
+          f"For a fully MoE model, base_mlp_dim must be equal to base_moe_mlp_dim. Received base_mlp_dim={base_mlp_dim} and base_moe_mlp_dim={base_moe_mlp_dim}."
+      )
 
 
 def validate_gpt_oss_moe(raw_keys):
@@ -1225,9 +1211,7 @@ def validate_shard_expert_on_fsdp(raw_keys):
   if raw_keys["shard_exp_on_fsdp"] and raw_keys["num_experts"] % raw_keys["ici_fsdp_parallelism"] != 0:
     raise ValueError("shard_exp_on_fsdp requires num_experts is divisiable by ici_fsdp_parallelism.")
   if raw_keys["shard_exp_on_fsdp"] and (using_tensor_parallelism(raw_keys) or using_expert_parallelism(raw_keys)):
-    raise ValueError(
-        "shard_exp_on_fsdp requires ici_expert_parallelism = 1 and ici_tensor_parallelism/ici_tensor_transpose_parallelism = 1."
-    )
+    raise ValueError("shard_exp_on_fsdp requires ici_expert_parallelism = 1 and ici_tensor_parallelism = 1.")
 
 
 def validate_ragged_dot(raw_keys):

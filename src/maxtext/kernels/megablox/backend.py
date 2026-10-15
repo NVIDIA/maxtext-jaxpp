@@ -298,18 +298,20 @@ LutFn = Callable[[int, int, int], Optional[tuple[int, int, int]]]
         "tiling",
         "transpose_rhs",
         "interpret",
+        "varying_axes",
     ],
 )
 def gmm(
     lhs: jnp.ndarray | qpl.QArray,
     rhs: jnp.ndarray | qpl.QArray,
     group_sizes: jnp.ndarray,
-    preferred_element_type: jnp.dtype = jnp.float32,
+    preferred_element_type: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
     tiling: tuple[int, int, int] | LutFn | None = (128, 128, 128),
     group_offset: jnp.ndarray | None = None,
     existing_out: jnp.ndarray | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
+    varying_axes: tuple[str, ...] = (),
 ) -> jnp.ndarray:
   """Compute lhs[sizes[i-1]:sizes[i], :] @ rhs for each group 'i'.
 
@@ -343,7 +345,7 @@ def gmm(
     group_offset = group_offset[None]
   num_current_groups = rhs.shape[0]
   num_total_groups = group_sizes.shape[0]
-  group_sizes = _validate_args(lhs=lhs, rhs=rhs, group_sizes=group_sizes)
+  group_sizes = _validate_args(lhs=lhs, rhs=rhs, group_sizes=group_sizes)  # pyrefly: ignore[bad-argument-type]
 
   # Gather shape information.
   m, k, n = (lhs.shape[0], lhs.shape[1], rhs.shape[2])
@@ -522,7 +524,9 @@ def gmm(
   }
   call_gmm = qpl.pallas_call(
       kernel,
-      out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
+      out_shape=jax.ShapeDtypeStruct(
+          (m, n), preferred_element_type, manual_axis_type=jax.sharding.ManualAxisType(varying=frozenset(varying_axes))
+      ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=2,
           in_specs=[
@@ -565,18 +569,20 @@ def gmm(
         "tiling",
         "num_actual_groups",
         "interpret",
+        "varying_axes",
     ],
 )
 def tgmm(
     lhs: jnp.ndarray | qpl.QArray,
     rhs: jnp.ndarray | qpl.QArray,
     group_sizes: jnp.ndarray,
-    preferred_element_type: jnp.dtype = jnp.float32,
+    preferred_element_type: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
     tiling: tuple[int, int, int] | LutFn | None = (128, 128, 128),
     group_offset: jnp.ndarray | None = None,
     num_actual_groups: int | None = None,
     existing_out: jnp.ndarray | None = None,
     interpret: bool = False,
+    varying_axes: tuple[str, ...] = (),
 ) -> jnp.ndarray:
   """Compute lhs[:, sizes[i-1]:sizes[i]] @ rhs[sizes[i-1]:sizes[i], :].
 
@@ -601,7 +607,9 @@ def tgmm(
     group_offset = jnp.array([0], dtype=jnp.int32)
   else:
     group_offset = group_offset[None]
-  group_sizes = _validate_args(lhs=lhs, rhs=rhs, group_sizes=group_sizes, expected_rhs_dims=2)
+  group_sizes = _validate_args(
+      lhs=lhs, rhs=rhs, group_sizes=group_sizes, expected_rhs_dims=2  # pyrefly: ignore[bad-argument-type]
+  )  # pyrefly: ignore[bad-argument-type]
 
   # Gather shape information.
   k, m, n = (lhs.shape[0], lhs.shape[1], rhs.shape[1])
@@ -775,7 +783,11 @@ def tgmm(
   }
   call_gmm = qpl.pallas_call(
       kernel,
-      out_shape=jax.ShapeDtypeStruct((num_actual_groups, k, n), preferred_element_type),
+      out_shape=jax.ShapeDtypeStruct(
+          (num_actual_groups, k, n),
+          preferred_element_type,
+          manual_axis_type=jax.sharding.ManualAxisType(varying=frozenset(varying_axes)),
+      ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=2,
           in_specs=[

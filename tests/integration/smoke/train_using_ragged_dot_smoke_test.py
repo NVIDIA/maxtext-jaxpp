@@ -19,9 +19,8 @@ import tempfile
 
 from absl.testing import absltest
 from absl.testing import parameterized
-
-from tests.utils.test_helpers import get_test_config_path
 from maxtext.trainers.pre_train import train
+from tests.utils.test_helpers import get_test_config_path
 
 train_main = train.main
 gettempdir = tempfile.gettempdir
@@ -38,7 +37,7 @@ class Train(parameterized.TestCase):
     test_tmpdir = os.environ.get("TEST_TMPDIR", gettempdir())
     outputs_dir = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR", test_tmpdir)
     train_main(
-        [
+        [  # pyrefly: ignore[bad-argument-type]  # pyrefly: ignore[bad-argument-type]
             None,
             get_test_config_path(),
             f"base_output_directory={test_tmpdir}",
@@ -55,12 +54,14 @@ class Train(parameterized.TestCase):
             "decoder_block=deepseek",
             "attention_type=mla",
             "num_experts=2",
+            "shared_experts=1",
             # Enable sparse_matmul.
             "sparse_matmul=True",
             # Enable ragged_dot.
             "megablox=False",
             f'quantization="{quantization}"',
             "use_qwix_quantization=True",
+            "sharding_tolerance=0.15",
             "per_device_batch_size=2",
             "max_target_length=1024",
             "dataset_type=synthetic",

@@ -42,7 +42,7 @@ if hasattr(flax_config, "flax_always_shard_variable"):
   flax_config.update("flax_always_shard_variable", False)
 
 
-def is_vanilla_variable(vs: variablelib.VariableState) -> bool:
+def is_vanilla_variable(vs: variablelib.Variable) -> bool:
   """A variables state is vanilla if its metadata is essentially blank.
 
   Returns False only if it has non-empty hooks or any non-built-in attribute.
@@ -56,16 +56,16 @@ def is_vanilla_variable(vs: variablelib.VariableState) -> bool:
   return True
 
 
-def to_linen_var(vs: variablelib.VariableState) -> meta.AxisMetadata:
+def to_linen_var(vs: variablelib.Variable) -> meta.AxisMetadata:
   metadata = vs.get_metadata()
   if "linen_meta_type" in metadata:
     linen_type = metadata["linen_meta_type"]
     if hasattr(linen_type, "from_nnx_metadata"):
-      return linen_type.from_nnx_metadata({"value": vs.value, **metadata})
-    return linen_type(vs.value, **metadata)
+      return linen_type.from_nnx_metadata({"value": vs.get_value(), **metadata})
+    return linen_type(vs.get_value(), **metadata)
   if is_vanilla_variable(vs):
-    return vs.value
-  return nnx.bridge.NNXMeta(vs.type, vs.value, metadata)
+    return vs.get_value()
+  return nnx.bridge.NNXMeta(vs.type, vs.get_value(), metadata)
 
 
 def get_col_name(keypath: tp.Sequence[Any]) -> str:
@@ -125,14 +125,14 @@ def nnx_attrs_to_linen_vars(nnx_attrs: dict) -> dict:
   """Convert a dict of NNX variables (or variable states) to Linen-style variables."""
   linen_structured = {}
   for kp, v in nnx.traversals.flatten_mapping(nnx_attrs).items():
-    if isinstance(v, variablelib.Variable):
-      col_name = variablelib.variable_name_from_type(type(v))
-      v = to_linen_var(v.to_state())
-    elif isinstance(v, variablelib.VariableState):
-      col_name = variablelib.variable_name_from_type(v.type)
-      v = to_linen_var(v)
-    else:
-      raise ValueError(f"Cannot infer collection name from value: {v}")
+    if not isinstance(v, variablelib.Variable):
+      # Plain (non-Variable) attributes aren't Linen collections, so they have no
+      # place in the variables dict passed to the wrapped module's apply(). Qwix
+      # attaches bookkeeping attrs like qwix_path/qwix_rngs/disable_quant_stats_update
+      # to the module during interception; leave them on the module and skip them here.
+      continue
+    col_name = variablelib.variable_name_from_type(v.type)
+    v = to_linen_var(v)
     linen_structured[(col_name, *kp)] = v
   variables = nnx.traversals.unflatten_mapping(linen_structured)
   return variables
@@ -141,7 +141,7 @@ def nnx_attrs_to_linen_vars(nnx_attrs: dict) -> dict:
 def _set_initializing(module: Module, initializing: bool):
   for _, value in graph.iter_graph(module):
     if isinstance(value, Pytree):
-      value._object__state._initializing = initializing  # pylint: disable=protected-access
+      value._pytree__state._initializing = initializing  # pylint: disable=protected-access
 
 
 def lazy_init(fn: Module | tp.Callable[..., tp.Any], *args, **kwargs):
@@ -168,6 +168,18 @@ def current_linen_module() -> linen.Module | None:
   if linen.module._context.module_stack:  # pylint: disable=W0212
     return linen.module._context.module_stack[-1]  # pylint: disable=W0212
   return None
+
+
+def is_linen_initializing() -> bool:
+  """Returns True if currently inside a Linen ``init()`` call.
+
+  Used by NNX pipeline modules to short-circuit the scan during init,
+  where only the output shape/dtype is needed.
+  """
+  module = current_linen_module()
+  if module is not None and hasattr(module, "is_initializing") and callable(module.is_initializing):
+    return module.is_initializing()
+  return False
 
 
 class ToNNX(Module):
@@ -219,13 +231,21 @@ class ToNNX(Module):
     """A shortcut of calling `nnx.bridge.lazy_init()` upon this module."""
     return lazy_init(self, *args, **kwargs)
 
+  def release_rngs(self):
+    """Drops the forked ``Rngs`` so it stops being part of the model state.
+
+    Safe only after the wrapped module is initialized, and only if it never calls
+    ``make_rng`` at apply time.
+    """
+    self.to_nnx__rngs = None
+
   def __getattr__(self, name: str):
     if hasattr(super(), name):
       return super().__getattribute__(name)
     maybe_method = getattr(type(self.to_nnx__module), name, None)
     if callable(maybe_method):
       method = partial(self.__call__, method=maybe_method)
-      method.__self__ = self
+      method.__self__ = self  # pyrefly: ignore[missing-attribute]
       return method
     return super().__getattribute__(name)
 
@@ -249,7 +269,7 @@ class ToNNX(Module):
     # rename default to params
     if "params" not in _rngs and "default" in _rngs:
       _rngs["params"] = _rngs.pop("default")
-    if self._object__state.initializing:
+    if self._pytree__state.initializing:
       out, updates = self.to_nnx__module.init_with_output(_rngs, *args, method=method, **kwargs)
     else:
       nnx_attrs = {
@@ -262,14 +282,18 @@ class ToNNX(Module):
       # Get `mutable` from top level bridge.Module context if any
       if mutable is not None:
         pass
-      elif (m := bdg_module.current_module()) is not None:
+      elif getattr(bdg_module.MODULE_CONTEXT, "module_stack", None) and (m := bdg_module.current_module()) is not None:
         assert m.scope is not None
         mutable = m.scope.mutable
       elif (m := current_linen_module()) is not None:
         assert m.scope is not None
         mutable = m.scope.mutable
       else:
-        mutable = False
+        # Safe fallback mutability: when running functionally isolated inside standard JAX transforms,
+        # we determine which collections (such as "stats" or "amax_history") are present and mark them mutable.
+        mutable = [k for k in variables.keys() if k != "params"]
+        if not mutable:
+          mutable = False
 
       out = self.to_nnx__module.apply(variables, *args, rngs=_rngs, method=method, mutable=mutable, **kwargs)
 
@@ -295,6 +319,57 @@ class ToNNX(Module):
           setattr(self, attr_name, nnx.data(value))
 
     return out
+
+  def get_layers(self) -> list[Any]:
+    """Returns all decoder layer modules in execution order."""
+    layers = []
+    seen = set()
+
+    def _add(module):
+      if module is not None and id(module) not in seen:
+        seen.add(id(module))
+        layers.append(module)
+
+    def _append_unscanned(prefix):
+      i = 0
+      while hasattr(self, f"{prefix}_{i}"):
+        _add(getattr(self, f"{prefix}_{i}"))
+        i += 1
+
+    def _append_scanned(name):
+      if hasattr(self, name):
+        val = getattr(self, name)
+        if name == "layers_remainder" and getattr(val, "num_of_layers", 0) == 0:
+          return
+        _add(val)
+
+    _append_scanned("dense_layers")
+    _append_unscanned("dense_layers")
+
+    _append_scanned("moe_layers")
+    _append_unscanned("moe_layers")
+
+    _append_scanned("moe_layers_outside_pipeline")
+    _append_unscanned("moe_layers_outside_pipeline")
+
+    if hasattr(self, "pipeline_module"):
+      _add(getattr(self.pipeline_module, "layers", None))
+
+    _append_scanned("scanned_blocks")  # Gemma 4
+    _append_scanned("layers")
+    _append_unscanned("layers")
+
+    _append_scanned("layers_remainder")  # Gemma 3/4
+
+    _append_scanned("layers_outside_pipeline")
+    _append_unscanned("layers_outside_pipeline")
+
+    if not layers:
+      for k, m in vars(self).items():
+        if k.startswith(("dense_layers", "moe_layers", "layers", "scanned_blocks")):
+          _add(m)
+
+    return layers
 
 
 def linen_rngs_dict(linen_module: linen.Module, add_default: bool = False):
@@ -345,26 +420,36 @@ def _fix_for_qwix_quantization(module: Module):
       if not linen.module._context.module_stack:  # pylint: disable=W0212
         return call_fn(*args, **kwargs)
       nn_module = linen.module._context.module_stack[-1]  # pylint: disable=W0212
-      old_path = nn_module.path
+      old_path = nn_module.path  # pyrefly: ignore[missing-attribute]
       # We modify the path of the current nn module in place. This is a little
       # bit hacky but should be good as a temporary solution.
-      nn_module.scope.path += (name,)
+      nn_module.scope.path += (name,)  # pyrefly: ignore[missing-attribute]
       try:
         return call_fn(*args, **kwargs)
       finally:
-        nn_module.scope.path = old_path
+        nn_module.scope.path = old_path  # pyrefly: ignore[missing-attribute]
 
     return wrapped
 
+  def wrap_setattr(old_setattr):
+    def wrapped_setattr(self, name: str, value: Any):
+      if name.startswith("dot_general") and not isinstance(value, (nnx.Variable, nnx.Module, nnx.Dict, nnx.List)):
+        value = nnx.data(value)
+      old_setattr(self, name, value)
+
+    return wrapped_setattr
+
   for path, node in nnx.iter_graph(module):
-    # Only enable it on non-root nnx modules.
-    if path and isinstance(node, nnx.Module):
+    if isinstance(node, nnx.Module):
+      methods = {
+          "__setattr__": wrap_setattr(node.__class__.__setattr__),
+      }
+      if path:
+        methods["__call__"] = wrap(node.__class__.__call__, str(path[-1]))
       node.__class__ = type(
           node.__class__.__name__,
           (node.__class__,),
-          {
-              "__call__": wrap(node.__class__.__call__, str(path[-1])),
-          },
+          methods,
       )
 
   # Set the correct weight names. We call QtProvider.process_model_inputs here
@@ -415,7 +500,10 @@ class ToLinen(linen.Module):
   args: tp.Sequence = ()
   kwargs: tp.Mapping[str, tp.Any] = FrozenDict({})
   skip_rng: bool = False
-  metadata_fn: tp.Callable[[variablelib.VariableState], tp.Any] | None = to_linen_var
+  metadata_fn: tp.Callable[[variablelib.Variable], tp.Any] | None = to_linen_var
+
+  # generic function to augment original nnx module (i.e for learn-to-init distillation)
+  nnx_module_augment_fn: tp.Callable[[Module, str | None], Module] | None = None
 
   @linen.compact
   def __call__(self, *args, nnx_method: tp.Callable[..., Any] | str | None = None, **kwargs):
@@ -429,6 +517,10 @@ class ToLinen(linen.Module):
     # init codepath
     if self.is_initializing():
       module = self.nnx_class(*self.args, **_module_kwargs())
+
+      if self.nnx_module_augment_fn is not None:
+        module = self.nnx_module_augment_fn(module, self.name)
+
       # TODO: add lazy_init here in case there's an `ToNNX` submodule under `module`.
       # update linen variables before call module to save initial state
       self._update_variables(module)
@@ -439,6 +531,11 @@ class ToLinen(linen.Module):
 
     # create the nnx module
     module = self.nnx_class(*self.args, **_module_kwargs())
+
+    # Modify the nnx structure BEFORE loading the state
+    # This ensures the tree structure matches the state we are about to inject
+    if self.nnx_module_augment_fn is not None:
+      module = self.nnx_module_augment_fn(module, self.name)
 
     # update nnx module from linen variables
     def maybe_unbox(x):
@@ -464,9 +561,41 @@ class ToLinen(linen.Module):
       for path, _ in unknown_state_flat.items():
         paths_str += f"\n  - {'/'.join(map(str, path))}"
 
-      warnings.warn(f"Found unknown module paths in incoming state:{paths_str}")
+        # Dynamically reconstruct the unknown variables
+        curr = module
+        for p in path[:-1]:
+          if isinstance(curr, dict):
+            if p not in curr:
+              curr[p] = nnx.Module()
+            curr = curr[p]
+          elif isinstance(curr, list):
+            if not isinstance(p, int):
+              raise TypeError(f"Expected int index for list, got {type(p)}: {p}")
+            while len(curr) <= p:
+              curr.append(nnx.Module())
+            curr = curr[p]
+          elif isinstance(curr, tuple):
+            raise ValueError(f"Cannot dynamically reconstruct elements within a tuple at path {path}.")
+          else:
+            if not isinstance(p, str):
+              p = str(p)
+            if not hasattr(curr, p):
+              setattr(curr, p, nnx.Module())
+            curr = getattr(curr, p)
 
-    nnx.update(module, new_state)
+      warnings.warn(
+          f"Found unknown module paths in incoming state:{paths_str}. Intermediate modules have been reconstructed."
+      )
+
+      # Filter out unknown paths so we don't try to assign them to static attributes
+      filtered_state_flat = {k: v for k, v in new_state_flat.items() if k not in unknown_state_flat}
+      new_state = nnx.State(nnx.traversals.unflatten_mapping(filtered_state_flat))
+
+    # Rebind the module to the current trace via split / update / merge.
+    # nnx.update directly on the live module can leave stale tracers.
+    graphdef, full_state = nnx.split(module)
+    nnx.update(full_state, new_state)
+    module = nnx.merge(graphdef, full_state)
 
     _fix_for_qwix_quantization(module)
     method_fn = _get_module_method(module, nnx_method)
@@ -482,7 +611,7 @@ class ToLinen(linen.Module):
     maybe_method = getattr(self.nnx_class, name, None)
     if callable(maybe_method):
       method = partial(self.__call__, nnx_method=maybe_method)
-      method.__self__ = self
+      method.__self__ = self  # pyrefly: ignore[missing-attribute]
       return method
     return super().__getattribute__(name)
 
@@ -494,7 +623,7 @@ class ToLinen(linen.Module):
 
     # group state by collection
     for path, leaf in nnx.to_flat_state(state):
-      type_ = leaf.type if isinstance(leaf, nnx.VariableState) else type(leaf)
+      type_ = leaf.type if isinstance(leaf, nnx.Variable) else type(leaf)
       collection = variablelib.variable_name_from_type(type_, allow_register=True)
       if collection not in collection_flat_state:
         collection_flat_state[collection] = []
@@ -505,18 +634,18 @@ class ToLinen(linen.Module):
       if self.is_mutable_collection(collection):
 
         def _to_linen_var(x):
-          if isinstance(x, nnx.VariableState):
+          if isinstance(x, nnx.Variable):
             if self.metadata_fn is not None:
               return self.metadata_fn(x)  # pylint: disable=too-many-function-args
             else:
-              return x.value
+              return x.get_value()
           return x
 
         collection_state = nnx.traversals.unflatten_mapping(flat_state)
         collection_state = jax.tree.map(
             _to_linen_var,
             collection_state,
-            is_leaf=lambda x: isinstance(x, nnx.VariableState),
+            is_leaf=lambda x: isinstance(x, nnx.Variable),
         )
         for k, v in collection_state.items():
           self.put_variable(collection, k, v)
@@ -532,7 +661,7 @@ _MISSING = _Missing()
 def to_linen(
     nnx_class: tp.Callable[..., Module],
     *args,
-    metadata_fn: tp.Callable[[variablelib.VariableState], tp.Any] | None = to_linen_var,
+    metadata_fn: tp.Callable[[variablelib.Variable], tp.Any] | None = to_linen_var,
     name: str | None = None,
     skip_rng: bool = False,
     abstract_init: bool = True,
@@ -551,8 +680,9 @@ def to_linen(
 
 def to_linen_class(
     base_nnx_class: type[M],
-    base_metadata_fn: tp.Callable[[variablelib.VariableState], tp.Any] | None = to_linen_var,
+    base_metadata_fn: tp.Callable[[variablelib.Variable], tp.Any] | None = to_linen_var,
     base_skip_rng: bool = False,
+    nnx_module_augment_fn: tp.Callable[[Module, str | None], Module] | None = None,
     **partial_kwargs: tp.Any,
 ) -> type[ToLinen]:
   """A dynamically created Linen Module that wraps a specific NNX Module.
@@ -595,6 +725,7 @@ def to_linen_class(
       metadata_fn=None,
       name=_MISSING,
       parent=_MISSING,
+      nnx_module_augment_fn=nnx_module_augment_fn,
       **other_kwargs,
   ):
     linen_kwargs = {}
@@ -609,16 +740,28 @@ def to_linen_class(
         metadata_fn=metadata_fn or base_metadata_fn,
         skip_rng=skip_rng or base_skip_rng,
         kwargs=FrozenDict({**partial_kwargs, **(kwargs or {}), **other_kwargs}),
+        nnx_module_augment_fn=nnx_module_augment_fn,
         **linen_kwargs,
     )
+
+  # Set the class name correctly to avoid issues like ScanToLinenPartial_0
+  # Instead of ToLinenPartial_0, we can use the base class name + 'ToLinen'
+  if isinstance(base_nnx_class, partial):
+    class_name = f"{base_nnx_class.func.__name__}ToLinen"
+  else:
+    class_name = f"{base_nnx_class.__name__}ToLinen"
 
   class ToLinenPartial(ToLinen):
     """A dynamically created Linen Module that wraps a specific NNX Module."""
 
     def __init_subclass__(cls, **kwargs):
       super().__init_subclass__(**kwargs)
-      cls.__init__ = __init__
+      cls.__init__ = __init__  # pyrefly: ignore[bad-assignment]
 
-  ToLinenPartial.__init__ = __init__
+  ToLinenPartial.__name__ = class_name
+  ToLinenPartial.__qualname__ = class_name
+
+  ToLinenPartial.__init__ = __init__  # pyrefly: ignore[bad-assignment]
+  ToLinenPartial.module_class = base_nnx_class
 
   return ToLinenPartial

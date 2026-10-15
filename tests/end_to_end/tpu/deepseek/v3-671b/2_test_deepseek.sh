@@ -12,14 +12,16 @@
 
 set -ex
 
+# Ensure JetStream and dependencies are installed for inference.decode
+if ! python3 -c "import jetstream" &>/dev/null; then
+    python3 -m src.dependencies.scripts.install_pre_train_extra_deps --with-tf
+fi
+
 export MODEL_NAME='deepseek3-671b'
 export TOKENIZER_PATH='deepseek-ai/DeepSeek-V3'
 
 # Installing torch for checkpoint conversion and forward_pass_logit_checker.py
 python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-# e.g., $HOME/maxtext/src/maxtext
-export MAXTEXT_PKG_DIR="${MAXTEXT_PKG_DIR:-${MAXTEXT_REPO_ROOT:-$PWD}/src/maxtext}"
 
 if [ -z "${BASE_OUTPUT_PATH}" ]; then
   # Non-Googlers please remember to point `BASE_OUTPUT_PATH` to GCS buckets that you own, this script uses internal buckets for testing.

@@ -157,7 +157,7 @@ def convert(base_model_path, maxtext_model_path, model_size):
   for i, ckpt_path in enumerate(ckpt_paths):
     print(f"Loading checkpoint {i+1} of {len(ckpt_paths)} ...")
 
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     pytorch_vars[int(ckpt_path.name.split(".", maxsplit=2)[1])] = checkpoint
     print("memory usage in GB: ", psutil.Process().memory_info().rss / (1024 * 1024))
 
@@ -314,8 +314,8 @@ def convert(base_model_path, maxtext_model_path, model_size):
     if checkpointing.save_checkpoint(checkpoint_manager, step_number_to_save_new_ckpt, state_new):
       max_logging.log(f"saved a checkpoint at step {step_number_to_save_new_ckpt}")
     # Upon preemption, exit when and only when all ongoing saves are complete.
-    if checkpoint_manager.reached_preemption(0):
-      checkpoint_manager.wait_until_finished()
+    if checkpointing.reached_preemption(checkpoint_manager, 0):
+      checkpointing.wait_until_finished(checkpoint_manager)
       sys.exit()
 
 

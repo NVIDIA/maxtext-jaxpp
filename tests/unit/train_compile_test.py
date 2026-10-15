@@ -19,21 +19,33 @@ model configurations and parallelism strategies can be successfully compiled
 for different hardware topologies.
 """
 
-import unittest
+from absl.testing import parameterized
+import jax
+from jax.experimental.serialize_executable import serialize
+import os
 import os.path
-from tempfile import gettempdir
-
+import pickle
+from jax.experimental.compilation_cache import compilation_cache
 import pytest
+from tempfile import gettempdir, NamedTemporaryFile
+
 
 from maxtext.trainers.pre_train.train_compile import main as train_compile_main
+from maxtext.utils.globals import MAXTEXT_ASSETS_ROOT
 from tests.utils.test_helpers import get_test_config_path
+
+# Enable JAX compilation cache for testing to speed up AOT compilation
+try:
+  if os.getenv("JAX_PLATFORMS") != "proxy":
+    compilation_cache.set_cache_dir(os.path.join(gettempdir(), "jax_compile_test_cache"))
+except Exception:  # pylint: disable=broad-exception-caught
+  pass
 
 
 @pytest.mark.tpu_backend
-class TrainCompile(unittest.TestCase):
+class TrainCompile(parameterized.TestCase):
   """Tests for the Ahead of Time Compilation functionality, train_compile.py"""
 
-  @pytest.mark.cpu_only
   def test_save_compiled_v4(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_compiled_v4.pickle")
@@ -50,7 +62,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_save_compiled_v5e(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_compiled_v5e.pickle")
@@ -69,7 +80,6 @@ class TrainCompile(unittest.TestCase):
 
   # TODO (b/366200617) : This tests fails in AOT, but config works fine on real hardware
   @pytest.mark.skip(reason="Issue w/ kernels_test. Error: The TPU is already in use by process...")
-  @pytest.mark.cpu_only
   def test_minimal_offloaded_v5e(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_compiled_v5e_offload.pickle")
@@ -92,7 +102,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_save_flash(self):
     compiled_trainstep_file = "/tmp/test_save_flash"
     train_compile_main(
@@ -108,7 +117,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_save_compiled_v5p_two_slices(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_compiled_v5p_two_slices.pickle")
@@ -125,7 +133,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_save_compiled_v6e(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_compiled_v6e.pickle")
@@ -142,7 +149,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_save_compiled_tpu7x(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_compiled_tpu7x.pickle")
@@ -160,7 +166,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_save_compiled_tpu7x_two_slices(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_compiled_tpu7x_two_slices.pickle")
@@ -180,26 +185,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
-  def test_sequence_parallelism(self):
-    temp_dir = gettempdir()
-    compiled_trainstep_file = os.path.join(temp_dir, "test_compiled.pickle")
-    train_compile_main(
-        (
-            "",
-            get_test_config_path(),
-            f"compiled_trainstep_file={compiled_trainstep_file}",
-            "compile_topology=v5p-64",
-            "use_iota_embed=true",
-            "compile_topology_num_slices=1",
-            "ici_sequence_parallelism=16",
-            "global_parameter_scale=32",
-            "per_device_batch_size=0.0625",
-            "max_target_length=65536",
-        )
-    )
-
-  @pytest.mark.cpu_only
   def test_remat_save_dot_except_mlpwi(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_remat_save_dot_except_mlpwi.pickle")
@@ -222,7 +207,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_remat_save_dot_except_mlp(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_remat_save_dot_except_mlp.pickle")
@@ -245,7 +229,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_remat_save_qkv_proj(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_remat_save_qkv_proj.pickle")
@@ -268,7 +251,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_remat_full(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_remat_full.pickle")
@@ -291,7 +273,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_custom_64x4_mesh(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_custom_64x4_mesh.pickle")
@@ -303,7 +284,7 @@ class TrainCompile(unittest.TestCase):
             "compile_topology=v6e-256",
             "use_iota_embed=true",
             "compile_topology_num_slices=1",
-            "ici_sequence_parallelism=4",
+            "ici_context_parallelism=4",
             "global_parameter_scale=32",
             "per_device_batch_size=0.25",
             "max_target_length=65536",
@@ -333,7 +314,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_custom_32x8_mesh(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_custom_32x8_mesh.pickle")
@@ -358,7 +338,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_moe_dropping_bf16(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_moe_dropping_bf16.pickle")
@@ -381,7 +360,6 @@ class TrainCompile(unittest.TestCase):
     )
 
   @pytest.mark.skip(reason="b/400476456 Tests are currently flaking / failing due to JAX 0.5.1 upgrade")
-  @pytest.mark.cpu_only
   def test_moe_dropping_int8(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_moe_dropping_int8.pickle")
@@ -405,7 +383,6 @@ class TrainCompile(unittest.TestCase):
     )
 
   # TODO(b/388572320): Add int8 quantization test once this bug is fixed.
-  @pytest.mark.cpu_only
   def test_moe_megablox_bf16(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_moe_megablox_bf16.pickle")
@@ -427,7 +404,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_moe_megablox_ring_ep_random(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_moe_megablox_ring_ep_random.pickle")
@@ -440,6 +416,7 @@ class TrainCompile(unittest.TestCase):
             "use_iota_embed=true",
             "compile_topology_num_slices=1",
             "model_name=deepseek3-test",
+            "ici_expert_parallelism=4",
             "sparse_matmul=True",
             "megablox=True",
             "per_device_batch_size=4",
@@ -451,7 +428,65 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
+  def test_moe_x_sorted_device(self):
+    """moe_x_sorted=device under the custom remat policy on the ring-of-experts sparse_matmul path."""
+    temp_dir = gettempdir()
+    compiled_trainstep_file = os.path.join(temp_dir, "test_moe_x_sorted_device.pickle")
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-16",
+            "use_iota_embed=true",
+            "compile_topology_num_slices=1",
+            "model_name=deepseek3-test",
+            "ici_expert_parallelism=4",
+            "sparse_matmul=True",
+            "megablox=True",
+            "per_device_batch_size=4",
+            "max_target_length=128",
+            "use_ring_of_experts=True",
+            "use_random_routing=True",
+            "attention=flash",
+            "dtype=bfloat16",
+            "remat_policy=custom",
+            "moe_x_sorted=device",
+        )
+    )
+
+  def test_moe_x_sorted_rejects_emb_chunking(self):
+    """moe_x_sorted != remat is rejected with num_moe_emb_chunks > 0, whose path does not tag the routed input."""
+    temp_dir = gettempdir()
+    compiled_trainstep_file = os.path.join(temp_dir, "test_moe_x_sorted_emb_chunking.pickle")
+    with self.assertRaisesRegex(ValueError, "moe_x_sorted=device is not supported with num_moe_emb_chunks"):
+      train_compile_main(
+          (
+              "",
+              get_test_config_path(),
+              f"compiled_trainstep_file={compiled_trainstep_file}",
+              "compile_topology=v5p-8",
+              "use_iota_embed=true",
+              "compile_topology_num_slices=1",
+              "model_name=deepseek3-test",
+              "ici_expert_parallelism=4",
+              "sparse_matmul=True",
+              "megablox=False",
+              "use_tokamax_gmm=True",
+              "use_gmm_v2=True",
+              "num_moe_emb_chunks=7",
+              "use_ring_of_experts=True",
+              "per_device_batch_size=2",
+              "max_target_length=1024",
+              "attention=flash",
+              "dtype=bfloat16",
+              "weight_dtype=bfloat16",
+              "scan_layers=True",
+              "remat_policy=custom",
+              "moe_x_sorted=device",
+          )
+      )
+
   def test_moe_ragged_dot_bf16(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_moe_ragged_dot_bf16.pickle")
@@ -473,7 +508,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_moe_dense_bf16(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_moe_dense_bf16.pickle")
@@ -496,7 +530,6 @@ class TrainCompile(unittest.TestCase):
     )
 
   @pytest.mark.skip(reason="b/400476456 Tests are currently flaking / failing due to JAX 0.5.1 upgrade")
-  @pytest.mark.cpu_only
   def test_moe_dense_int8(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_moe_dense_int8.pickle")
@@ -519,8 +552,8 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_moe_pp_bf16(self):
+    pytest.skip("Pipeline parallelism is not supported for the NNX decoder.")
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_moe_pp_bf16.pickle")
     train_compile_main(
@@ -543,7 +576,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_moe_deepseek_scanned_bf16(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_moe_deepseek_scanned_bf16.pickle")
@@ -567,8 +599,63 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.skip(reason="Fix sharding issue of all layers of DeepSeek")
-  @pytest.mark.cpu_only
+  def test_moe_emb_chunking(self):
+    temp_dir = gettempdir()
+    compiled_trainstep_file = os.path.join(temp_dir, "test_moe_emb_chunking.pickle")
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-8",
+            "use_iota_embed=true",
+            "compile_topology_num_slices=1",
+            "model_name=deepseek3-test",
+            "ici_expert_parallelism=4",
+            "sparse_matmul=True",
+            "megablox=False",
+            "use_tokamax_gmm=True",
+            "use_gmm_v2=True",
+            "num_moe_emb_chunks=7",
+            "use_ring_of_experts=True",
+            "per_device_batch_size=2",
+            "max_target_length=1024",
+            "attention=flash",
+            "dtype=bfloat16",
+            "weight_dtype=bfloat16",
+            "scan_layers=True",
+        )
+    )
+
+  def test_moe_emb_chunking_with_mlp_bias(self):
+    temp_dir = gettempdir()
+    compiled_trainstep_file = os.path.join(temp_dir, "test_moe_emb_chunking_bias.pickle")
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-8",
+            "use_iota_embed=true",
+            "compile_topology_num_slices=1",
+            "model_name=deepseek3-test",
+            "ici_expert_parallelism=4",
+            "sparse_matmul=True",
+            "megablox=False",
+            "use_tokamax_gmm=True",
+            "use_gmm_v2=True",
+            "num_moe_emb_chunks=7",
+            "use_ring_of_experts=True",
+            "mlp_bias=True",
+            "per_device_batch_size=2",
+            "max_target_length=1024",
+            "attention=flash",
+            "dtype=bfloat16",
+            "weight_dtype=bfloat16",
+            "scan_layers=True",
+        )
+    )
+
   def test_moe_deepseek_unscanned_bf16(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_moe_deepseek_unscanned_bf16.pickle")
@@ -592,7 +679,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_moe_deepseek_with_device_limit(self):
     compiled_trainstep_file = "/tmp/test_moe_deepseek_with_device_limit.pickle"
     train_compile_main(
@@ -616,8 +702,8 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_moe_deepseek_pipeline_subset(self):
+    pytest.skip("Pipeline parallelism is not supported for the NNX decoder.")
     compiled_trainstep_file = "/tmp/test_moe_deepseek_pipeline_subset.pickle"
     train_compile_main(
         (
@@ -639,8 +725,8 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_pipeline_subset(self):
+    pytest.skip("Not supported for the NNX decoder.")
     compiled_trainstep_file = "/tmp/test_pipeline_subset.pickle"
     train_compile_main(
         (
@@ -659,7 +745,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_moe_llama4_17b_16e(self):
     compiled_trainstep_file = "/tmp/test_moe_llama4_17b_16e.pickle"
     train_compile_main(
@@ -680,7 +765,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_moe_gpt_oss_20b_sparse_matmul(self):
     compiled_trainstep_file = "/tmp/test_moe_gpt_oss_20b_sparse_matmul.pickle"
     train_compile_main(
@@ -702,7 +786,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_moe_gpt_oss_20b_dense_matmul(self):
     compiled_trainstep_file = "/tmp/test_moe_gpt_oss_20b_dense_matmul.pickle"
     train_compile_main(
@@ -724,7 +807,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_gpt3_6b(self):
     compiled_trainstep_file = "/tmp/test_gpt3_6b"
     train_compile_main(
@@ -732,14 +814,13 @@ class TrainCompile(unittest.TestCase):
             "",
             get_test_config_path(),
             f"compiled_trainstep_file={compiled_trainstep_file}",
-            "compile_topology=v5p-256",
+            "compile_topology=v5p-8",
             "compile_topology_num_slices=1",
             "model_name=gpt3-6b",
             "per_device_batch_size=1",
         )
     )
 
-  @pytest.mark.cpu_only
   def test_qwen3_qk_norm(self):
     """AOT test for non-llama qk norm models"""
     compiled_trainstep_file = "/tmp/test_qwen3_qk_norm"
@@ -755,7 +836,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_qwen3_next(self):
     """AOT test for qwen3-next and GatedDeltaNet implementation"""
     compiled_trainstep_file = "/tmp/test_qwen3_next"
@@ -764,7 +844,7 @@ class TrainCompile(unittest.TestCase):
             "",
             get_test_config_path(),
             f"compiled_trainstep_file={compiled_trainstep_file}",
-            "compile_topology=v5p-256",
+            "compile_topology=v5p-64",
             "compile_topology_num_slices=1",
             "model_name=qwen3-next-80b-a3b",
             "per_device_batch_size=1",
@@ -772,7 +852,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_deepseek32(self):
     # test deepseek3.2 with sparse attention
     compiled_trainstep_file = "/tmp/test_deepseek32.pickle"
@@ -794,13 +873,58 @@ class TrainCompile(unittest.TestCase):
             "use_tokamax_splash=True",
             "dtype=bfloat16",
             "weight_dtype=bfloat16",
-            # without_device_limit
-            "n_routing_groups=-1",
-            "topk_routing_group=-1",
         )
     )
 
+  @parameterized.named_parameters(
+      {
+          "testcase_name": "scanned_dot_product",
+          "scan_layers": "true",
+          "attention": "dot_product",
+      },
+      {
+          "testcase_name": "scanned_flash",
+          "scan_layers": "true",
+          "attention": "flash",
+      },
+  )
   @pytest.mark.cpu_only
+  def test_deepseek4(
+      self,
+      scan_layers,
+      attention="dot_product",
+  ):
+    # test deepseek4 compile.
+    compiled_trainstep_file = f"/tmp/test_deepseek4_{scan_layers}_{attention}.pickle"
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-256",
+            "use_iota_embed=true",
+            "compile_topology_num_slices=1",
+            "model_name=deepseek4-284b",
+            "per_device_batch_size=1",
+            "max_target_length=1024",
+            f"scan_layers={scan_layers}",
+            f"attention={attention}",
+            "use_tokamax_splash=True",
+            "sa_block_q=128",
+            "sa_block_kv=128",
+            "sa_block_kv_compute=128",
+            "sa_block_q_dkv=128",
+            "sa_block_kv_dkv=128",
+            "sa_block_kv_dkv_compute=128",
+            "sa_block_q_dq=128",
+            "sa_block_kv_dq=128",
+            "dtype=bfloat16",
+            "weight_dtype=bfloat16",
+            "routed_bias=False",
+            "override_model_config=True",
+        )
+    )
+
   def test_indexer_dense_warmup(self):
     # test deepseek3.2 with sparse attention
     compiled_trainstep_file = "/tmp/test_indexer_dense_warmup.pickle"
@@ -817,6 +941,8 @@ class TrainCompile(unittest.TestCase):
             "max_target_length=1024",
             "attention=flash",
             "use_tokamax_splash=True",
+            # override
+            "override_model_config=True",
             "engram_layers=[]",
             # dense warmup
             "indexer_sparse_training=False",
@@ -825,7 +951,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_indexer_sparse_training(self):
     # test deepseek3.2 with sparse attention
     compiled_trainstep_file = "/tmp/test_indexer_sparse_training.pickle"
@@ -842,6 +967,8 @@ class TrainCompile(unittest.TestCase):
             "max_target_length=1024",
             "attention=flash",
             "use_tokamax_splash=True",
+            # override
+            "override_model_config=True",
             "engram_layers=[]",
             # sparse training
             "indexer_sparse_training=True",
@@ -849,7 +976,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_olmo3_7b(self):
     """AOT test for Olmo3 7B implementation"""
     compiled_trainstep_file = "/tmp/test_olmo3_7b"
@@ -867,9 +993,8 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_mhc_integration(self):
-    """AOT test for Manifold-onstrained Hyper Connection implementation"""
+    """AOT test for Manifold-constrained Hyper Connection implementation"""
     compiled_trainstep_file = "/tmp/test_mhc_integration"
     train_compile_main(
         (
@@ -881,15 +1006,16 @@ class TrainCompile(unittest.TestCase):
             "model_name=deepseek-custom",
             "per_device_batch_size=4",
             "scan_layers=True",
-            "max_target_length=1024",
-            "mhc_expansion_rate=4",
             "attention=flash",
             "use_tokamax_splash=True",
+            "max_target_length=1024",
+            # override
+            "override_model_config=True",
+            "mhc_expansion_rate=4",
             "engram_layers=[]",
         )
     )
 
-  @pytest.mark.cpu_only
   def test_engram_integration(self):
     """AOT test for Engram implementation"""
     compiled_trainstep_file = "/tmp/test_engram_integration"
@@ -912,8 +1038,8 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
   def test_circular_pipeline_ag_per_repeat_ep_ds(self):
+    pytest.skip("Pipeline parallelism is not supported for the NNX decoder.")
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_circular_pipeline_ag_per_repeat_ep_ds.pickle")
     train_compile_main(
@@ -938,9 +1064,12 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.cpu_only
-  def test_qk_clip(self):
-    """AOT test for qk-clip with DeepSeek3 Tiny model"""
+  @parameterized.named_parameters(
+      {"testcase_name": "dot_product", "attention": "dot_product"},
+      {"testcase_name": "tokamax_splash", "attention": "flash"},
+  )
+  def test_qk_clip(self, attention):
+    """AOT test for AdamW optimizer with QK clip for DeepSeek3 Tiny model"""
     compiled_trainstep_file = "/tmp/test_qk_clip.pickle"
     train_compile_main(
         (
@@ -954,14 +1083,382 @@ class TrainCompile(unittest.TestCase):
             "sparse_matmul=True",
             "megablox=True",
             "use_tokamax_gmm=False",
-            # TODO(agagik): update to flash after support
-            "attention=dot_product",
-            "use_tokamax_splash=True",
             "max_target_length=128",
             "per_device_batch_size=1",
             "dtype=bfloat16",
             "weight_dtype=float32",
+            # attention
+            f"attention={attention}",
+            "use_tokamax_splash=True",
+            # qk clip
             "use_qk_clip=true",
             "qk_clip_threshold=100",
+        )
+    )
+
+  @parameterized.named_parameters(
+      {"testcase_name": "consistent_rms_scaling", "muon_consistent_rms": 0.2},
+      {"testcase_name": "width_scaling", "muon_consistent_rms": None},
+  )
+  def test_muon(self, muon_consistent_rms):
+    """AOT test for Muon optimizer for DeepSeek3 Tiny model"""
+    compiled_trainstep_file = "/tmp/test_muon.pickle"
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-8",
+            "compile_topology_num_slices=1",
+            "model_name=deepseek3-tiny",
+            "scan_layers=True",
+            "sparse_matmul=True",
+            "megablox=True",
+            "use_tokamax_gmm=False",
+            "max_target_length=128",
+            "per_device_batch_size=1",
+            "dtype=bfloat16",
+            "weight_dtype=float32",
+            # tokamax splash attention
+            "attention=flash",
+            "use_tokamax_splash=True",
+            # muon optimizer
+            "opt_type=muon",
+            "muon_beta=0.95",
+            "muon_weight_decay=0.1",
+            f"muon_consistent_rms={muon_consistent_rms}",
+        )
+    )
+
+  def test_vocab_tiling_bf16(self):
+    """test vocab_tiling when weight_dtype=bfloat16"""
+    compiled_trainstep_file = "/tmp/test_vocab_tiling_bf16.pickle"
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-8",
+            "compile_topology_num_slices=1",
+            "base_num_decoder_layers=2",
+            "per_device_batch_size=2",
+            "max_target_length=1024",
+            "num_vocab_tiling=4",
+            "weight_dtype=bfloat16",
+        )
+    )
+
+  def test_qwen3_5(self):
+    """AOT test for qwen3-5"""
+    compiled_trainstep_file = "/tmp/test_qwen3_5"
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-512",
+            "compile_topology_num_slices=1",
+            "model_name=qwen3.5-397b-a17b",
+            "per_device_batch_size=1.0",
+            "max_target_length=1024",
+            "sparse_matmul=True",
+            "megablox=True",
+            "attention=flash",
+            "use_tokamax_splash=True",
+        )
+    )
+
+  def test_qwen3_next_explicit_sharding(self):
+    """AOT test for qwen3-next under explicit sharding, at FSDP 32 x expert 8.
+
+    `Qwen3NextScannableBlock` nests two `jax.lax.scan`s, whose carry layout has
+    to stay
+    invariant across iterations; that only holds if the decoder layer returns
+    the
+    layout it was handed.
+    """
+    compiled_trainstep_file = os.path.join(gettempdir(), "test_qwen3_next_explicit_sharding.pickle")
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-512",
+            "compile_topology_num_slices=1",
+            "model_name=qwen3-next-80b-a3b",
+            "per_device_batch_size=1.0",
+            "max_target_length=1024",
+            "ici_fsdp_parallelism=32",
+            "ici_expert_parallelism=8",
+            "sparse_matmul=True",
+            "megablox=True",
+            "attention=flash",
+            "use_tokamax_splash=True",
+            "shard_mode=explicit",
+        )
+    )
+
+  def test_qwen3_next_explicit_sharding_zero1(self):
+    """AOT test for qwen3-next under explicit sharding with ZeRO-1 and gradient accumulation."""
+    compiled_trainstep_file = os.path.join(gettempdir(), "test_qwen3_next_explicit_sharding_zero1.pickle")
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-256",
+            "compile_topology_num_slices=1",
+            "model_name=qwen3-next-80b-a3b",
+            "override_model_config=True",
+            "base_num_decoder_layers=4",
+            "per_device_batch_size=1.0",
+            "max_target_length=1024",
+            "sparse_matmul=True",
+            "megablox=True",
+            "attention=flash",
+            "use_tokamax_splash=True",
+            "shard_mode=explicit",
+            "ici_data_parallelism=-1",
+            "ici_fsdp_parallelism=1",
+            "gradient_accumulation_steps=4",
+            "shard_optimizer_over_data=True",
+        )
+    )
+
+  def test_qwen3_5_explicit_sharding(self):
+    """AOT test for qwen3-5 under explicit sharding, at FSDP 32 x expert 8.
+
+    Explicit sharding type-checks every operation's layout instead of letting
+    GSPMD
+    infer one, so a missing `out_sharding` fails the trace here rather than
+    silently
+    costing a collective at a scale a real test cannot reach.
+    """
+    compiled_trainstep_file = os.path.join(gettempdir(), "test_qwen3_5_explicit_sharding.pickle")
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-512",
+            "compile_topology_num_slices=1",
+            "model_name=qwen3.5-397b-a17b",
+            "per_device_batch_size=1.0",
+            "max_target_length=1024",
+            "ici_fsdp_parallelism=32",
+            "ici_expert_parallelism=8",
+            "sparse_matmul=True",
+            "megablox=True",
+            "attention=flash",
+            "use_tokamax_splash=True",
+            "shard_mode=explicit",
+            # Qwen3.5 defaults to a HuggingFace tokenizer that is not vendored.
+            "tokenizer_type=tiktoken",
+            (f"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}"),
+        )
+    )
+
+  def test_qwen3_5_explicit_sharding_zero1(self):
+    """AOT test for qwen3-5 under explicit sharding with ZeRO-1 and gradient accumulation.
+
+    ZeRO-1 shards the optimizer moments over "data", so the parameters are
+    all-gathered
+    in bf16 once before the accumulation scan rather than once per microbatch;
+    that
+    reshard only type-checks if the decoder pins its activation layouts. Four
+    layers is
+    one full `inhomogeneous_layer_cycle_interval`, which covers both attention
+    variants
+    while staying small enough to hold data-parallel replicas of the parameters.
+    """
+    compiled_trainstep_file = os.path.join(gettempdir(), "test_qwen3_5_explicit_sharding_zero1.pickle")
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-256",
+            "compile_topology_num_slices=1",
+            "model_name=qwen3.5-35b-a3b",
+            "override_model_config=True",
+            "base_num_decoder_layers=4",
+            "per_device_batch_size=1.0",
+            "max_target_length=1024",
+            "sparse_matmul=True",
+            "megablox=True",
+            "attention=flash",
+            "use_tokamax_splash=True",
+            "shard_mode=explicit",
+            "ici_data_parallelism=-1",
+            "ici_fsdp_parallelism=1",
+            "gradient_accumulation_steps=4",
+            "shard_optimizer_over_data=True",
+            "tokenizer_type=tiktoken",
+            (f"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}"),
+        )
+    )
+
+  def test_serialization_and_deserialization_formats(self):
+    """Tests that our custom binary save/load functions work securely and legacy fallback triggers warning."""
+
+    def load_serialized_compiled_test(save_name):
+      with open(save_name, "rb") as f:
+        return f.read()
+
+    @jax.jit
+    def add_one(x):
+      return x + 1
+
+    # Compile simply on CPU
+    compiled = add_one.lower(1).compile()
+    serialized, _, _ = serialize(compiled)
+
+    # 1. Save and load JAX compiled step using secure raw binary format
+    with NamedTemporaryFile() as f_secure:
+      with open(f_secure.name, "wb") as f:
+        f.write(serialized)
+
+      loaded_compiled = load_serialized_compiled_test(f_secure.name)
+
+      # Ensure it loaded the correct JAX serialization bytes
+      assert loaded_compiled == serialized
+
+    # 2. Save and load JAX compiled step using legacy pickle format
+    with NamedTemporaryFile() as f_legacy:
+      with open(f_legacy.name, "wb") as f:
+        pickle.dump(serialized, f)
+
+      loaded_legacy = load_serialized_compiled_test(f_legacy.name)
+
+      # Ensure it loaded raw pickled bytes (starting with pickle protocol marker)
+      # and did NOT unpickle them into JAX serialization bytes.
+      assert loaded_legacy.startswith(b"\x80")
+      assert loaded_legacy != serialized
+
+  def test_zero1_optimizer_sharding(self):
+    """AOT test for Zero-1 optimizer sharding (shard_optimizer_over_data)"""
+    temp_dir = gettempdir()
+    compiled_trainstep_file = os.path.join(temp_dir, "test_zero1_optimizer_sharding.pickle")
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-8",
+            "compile_topology_num_slices=1",
+            "base_emb_dim=256",
+            "base_mlp_dim=256",
+            "base_num_decoder_layers=2",
+            "ici_data_parallelism=-1",
+            "ici_fsdp_parallelism=1",
+            "shard_optimizer_over_data=true",
+            "shard_mode=explicit",
+        )
+    )
+
+  def test_qwen2_explicit_sharding_zero1(self):
+    """AOT test for Qwen2 under explicit sharding with ZeRO-1 and gradient accumulation.
+
+    Explicit sharding type-checks every operation's layout rather than letting GSPMD infer
+    one, so a missing `out_sharding` in the Qwen2 decoder fails the trace here rather than
+    silently costing a collective at a scale we cannot reach in a test.
+    """
+    compiled_trainstep_file = os.path.join(gettempdir(), "test_qwen2_explicit_sharding_zero1.pickle")
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-256",
+            "compile_topology_num_slices=1",
+            "model_name=qwen2.5-7b",
+            "override_model_config=True",
+            "per_device_batch_size=1",
+            "max_target_length=4096",
+            "attention=flash",
+            "shard_mode=explicit",
+            # ZeRO-1 needs a "data" axis to shard the moments over, and MaxTextConfig
+            # rejects combining it with FSDP.
+            "ici_data_parallelism=-1",
+            "ici_fsdp_parallelism=1",
+            "gradient_accumulation_steps=4",
+            "shard_optimizer_over_data=True",
+            # The Qwen2.5 configs default to a HuggingFace tokenizer that is not vendored.
+            "tokenizer_type=tiktoken",
+            f"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}",
+        )
+    )
+
+  def test_kimi_k2_explicit_sharding(self):
+    """AOT test for Kimi-K2 at full size under explicit sharding.
+
+    Kimi-K2 runs on the deepseek decoder block, so this is the large-scale explicit-sharding
+    check for MLA attention and the shared-expert, sigmoid-routed MoE. The mesh is FSDP 64 x
+    expert 8, both of which have to divide the v5p-1024 physical mesh.
+    """
+    compiled_trainstep_file = os.path.join(gettempdir(), "test_kimi_k2_explicit_sharding.pickle")
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-1024",
+            "compile_topology_num_slices=1",
+            "model_name=kimi-k2-1t",
+            "per_device_batch_size=1",
+            "max_target_length=4096",
+            "ici_fsdp_parallelism=64",
+            "ici_expert_parallelism=8",
+            "sparse_matmul=True",
+            "megablox=True",
+            "attention=flash",
+            "shard_mode=explicit",
+            # Kimi-K2 defaults to a HuggingFace tokenizer that is not vendored.
+            "tokenizer_type=tiktoken",
+            f"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}",
+        )
+    )
+
+  def test_vocab_tiling_bf16_nnx(self):
+    """AOT compile vocab tiling on the NNX path (vocab_tiling_nnx_loss + custom_vjp)."""
+    compiled_trainstep_file = "/tmp/test_vocab_tiling_bf16_nnx.pickle"
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-8",
+            "compile_topology_num_slices=1",
+            "base_num_decoder_layers=2",
+            "per_device_batch_size=2",
+            "max_target_length=1024",
+            "num_vocab_tiling=4",
+            "weight_dtype=bfloat16",
+        )
+    )
+
+  @parameterized.named_parameters(
+      {"testcase_name": "scanned", "scan_layers": "true"},
+  )
+  @pytest.mark.cpu_only
+  def test_envy(self, scan_layers):
+    # test envy compile.
+    compiled_trainstep_file = f"/tmp/test_envy_{scan_layers}.pickle"
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-256",
+            "use_iota_embed=true",
+            "compile_topology_num_slices=1",
+            "model_name=envy-switch-base",
+            "per_device_batch_size=1",
+            "max_target_length=8192",
+            f"scan_layers={scan_layers}",
+            "attention=dot_product",
+            "dtype=bfloat16",
+            "weight_dtype=bfloat16",
+            "override_model_config=True",
         )
     )

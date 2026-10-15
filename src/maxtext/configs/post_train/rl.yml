@@ -15,18 +15,15 @@
 # RL Configuration
 # This config consolidates common parameters for RL training across different model sizes
 
-base_config: "../base.yml"
-
 # ====== Hardware =====
 trainer_devices_fraction: 0.5
 sampler_devices_fraction: 0.5
 chips_per_vm: 4  # depends on hardware, for v5p this is 4
 num_trainer_slices: -1
 num_samplers_slices: -1
-# Only specify rollout_data_parallelism when you would like to use more than one model
-# replicas in rollout. If not specified, rollout_tensor_parallelism will be auto-determined.
+# If rollout_data_parallelism is not specified, it will be auto-determined.
 rollout_data_parallelism: -1
-rollout_tensor_parallelism: -1
+rollout_tensor_parallelism: 1
 rollout_expert_parallelism: 1
 
 # ====== Reproducibility ======
@@ -54,6 +51,24 @@ rl:
   grpo_epsilon: 0.2
   loss_algo: 'grpo' # grpo or gspo-token
 
+  # Specifies the method for aggregating loss across the batch.
+  loss_agg_mode: 'sequence-mean-token-mean'  # 'token-mean' | 'sequence-mean' | 'sequence-mean-token-mean'
+
+  # ====== Agentic Rollout ======
+  # If true, uses the async AgenticGRPOLearner, which overlaps rollout generation
+  # with training for faster throughput via online vLLM inference.
+  use_agentic_rollout: false
+  # Max concurrent rollout requests when using agentic rollout.
+  max_concurrency: 256
+  # Number of off-policy steps tolerated before requiring a policy update.
+  off_policy_steps: 0
+  # System prompt injected into the agent at rollout time.
+  system_prompt: ''
+  # Upper-bound clipping epsilon for GRPO loss; defaults to grpo_epsilon when null.
+  epsilon_high: null
+  # Number of model keys to chunk for resharding tensors between trainer and rollout devices.
+  # If null, the entire model is resharded at once.
+  reshard_chunk_size: null
 
 # ====== Models ======
 # for MaxText
@@ -77,17 +92,19 @@ decoder_layer_input: 'offload'
 query_proj: 'offload'
 key_proj: 'offload'
 value_proj: 'offload'
-checkpoint_storage_use_ocdbt: False # For Pathways
-checkpoint_storage_use_zarr3: False # For Pathways
-use_pathways: True
+use_pathways: true
 log_period: 20
 
+# ====== Checkpointing configs ======
+checkpoint_storage_use_ocdbt: false # For Pathways
+checkpoint_storage_use_zarr3: false # For Pathways
+convert_checkpoint_if_possible: true
+
 # ====== Debugging ======
-debug:
-  rl: True
-# If True, Tunix-managed metrics measurement will be enabled. The metrics will be
+debug: false
+# If true, Tunix-managed metrics measurement will be enabled. The metrics will be
 # uploaded to tensorboard.
-enable_tunix_perf_metrics: False
+enable_tunix_perf_metrics: false
 
 # ====== Training ======
 batch_size: 1
@@ -96,10 +113,18 @@ batch_size: 1
 num_batches: 4
 # A batch can be split into multiple micro batches for memory management
 # and/or async sampling and training.
-micro_batch_size: -1
+train_micro_batch_size: -1
+rollout_micro_batch_size: -1
+max_seq_token_per_tpu: 0  # > 0 packs sequences into rows of this many tokens for training; 0 = one padded row per sequence
 # Keep `num_test_batches` low so that evaluation runs quickly. It can be
 # increased to a max. of 330 (if batch size is 4).
 num_test_batches: 5  # 200
+# Optional override: batch size used during post-train RL evaluation. -1 (default)
+# = use `batch_size`. Set higher (e.g. 32-128) to feed vLLM bigger batches during
+# greedy eval — otherwise eval is bottlenecked by training batch_size, which is
+# small for GRPO (e.g. 4 prompts × 8 generations per step). Total eval examples
+# = num_test_batches * eval_batch_size, so adjust num_test_batches accordingly.
+eval_batch_size: -1
 test_batch_start_index: 0
 train_fraction: 1.0
 
@@ -129,8 +154,9 @@ generation_configs:
     eval_top_p: 1.0
 
 num_eval_passes: 1 # Number of generation passes during evaluation
-eval_corr_lst: False # If True, only include correct responses in the list during evaluation
-eval_make_lst: False # If True, return a list of (question, answer, responses) during evaluation
+eval_corr_lst: false # If true, only include correct responses in the list during evaluation
+eval_make_lst: false # If true, return a list of (question, answer, responses) during evaluation
+eval_mode: "pass" # Evaluation mode ("pass" for pass@K, "maj" for majority voting maj@K, "pass_at_1" for pass@1 estimation)
 
 # ====== Inference ======
 # === Generation during GRPO training ===
@@ -140,6 +166,15 @@ max_target_length: 1024
 kv_cache_buffer: 256
 hbm_utilization_vllm: 0.72
 swap_space_vllm_gb: 2
+# Maps to tunix RolloutConfig.rollout_vllm_free_kv_cache_during_weight_sync -> VllmConfig.free_kv_cache_during_weight_sync
+# (effective once the tunix pin declares it; until then the setting is ignored and the trainer logs that).
+# The weight sync materializes a second copy of the sampler weights on HBM while the new values are resharded in;
+# freeing the KV cache first makes room for that copy. false keeps the pool (hbm_utilization_vllm of each chip)
+# allocated across the sync and only resets its prefix-cache entries, which saves the free + re-allocation
+# (about 2 s per step on a colocated Qwen3-0.6B run at hbm_utilization_vllm=0.3). With false the sync runs out of
+# HBM when that second copy does not fit next to the pool, so check the headroom before disabling: the default
+# hbm_utilization_vllm above leaves far less room than 0.3, and colocated setups have the least.
+free_kv_cache_during_weight_sync: true
 # Generation Configuration During Training
 # Important to keep a high-ish temperature for varied, diverse responses during
 # training.
@@ -147,23 +182,27 @@ decode_sampling_temperature: 0.9
 decode_sampling_top_k: 50
 decode_sampling_nucleus_p: 1.0
 # Optional sharding configuration for samplers
-enable_dp_attention: False
+enable_dp_attention: false
 # Performance tuning for samplers
 max_num_batched_tokens: null
 max_num_seqs: null
-# If True, enables asynchronous scheduling in vLLM for faster generation
-async_scheduling: True
+vllm_block_size: null  # KV-cache page size; null lets the backend choose
+# If true, enables asynchronous scheduling in vLLM for faster generation
+async_scheduling: true
 # stop generation when any of these strings is generated
 stop_strings: null
+# Record each MoE layer's routing decisions during rollout as `expert_indices`, so the
+# sampler's routing can be replayed on the trainer. Off by default so rollouts do not pay
+# for the extra top-k.
+return_routed_experts: false
 
 # ====== Checkpoint Configuration ======
-enable_checkpointing: True
-async_checkpointing: False
+enable_checkpointing: true
+async_checkpointing: false
 checkpoint_period: 50
 max_num_checkpoints_to_keep: 10
 
 # ====== Reward ======
-
 reward_exact_answer: 1.0
 reward_white_space_format_match: 1.0
 reward_exact_format_match: 0.1
@@ -172,19 +211,140 @@ reward_ratio_guess_to_answer_high:  0.0
 reward_ratio_guess_to_answer_low: 0.0
 penalty_incorrect_format: 0.0
 penalty_incorrect_answer: 0.0
+# Optional: path to a user-provided Python file with custom reward functions,
+# AND a comma-separated list of function names to import from that file.
+# Each function signature: fn(prompts, completions, tmvp_config, **kwargs) -> list[float].
+# When both are set, the built-in [match_format_exactly, match_format_approximately,
+# check_numbers] reward list is REPLACED entirely.
+reward_functions_path: ''
+reward_functions: ''
+
+# ====== Tunix runtime knobs ======
+# Run a full host gc.collect() after each trainer->sampler weight sync
+# (tunix ClusterConfig.gc_collect_after_weight_sync; effective once the tunix pin declares it).
+# Each sync leaves another copy of the weights on HBM until Python's garbage collector releases it;
+# with this disabled the copies accumulate and the run can OOM over time. The collection costs about
+# one second per step on a colocated setup, so disable it only when there is enough HBM headroom.
+gc_collect_after_weight_sync: true
+
+# Worker processes tunix uses to evaluate the reward functions over the batch
+# (tunix GrpoConfig.reward_num_workers; effective once the tunix pin declares it).
+# 0 = evaluate reward functions serially in the trainer process (default); -1 = one worker per CPU.
+reward_num_workers: 0
+# Seconds to wait for one reward-function chunk in a worker before falling back to the parent process.
+reward_worker_timeout_seconds: 180.0
+
+# ====== Configuration for math_verify Pool ======
+# Global timeout (seconds) for math_verify calls across all examples in a batch
+math_verify_timeout: 120
+# Max worker processes for the math_verify pool. null ⇒ min(batch_size, cpu_count())
+math_verify_num_procs: null
 
 # ====== Special tokens/templates for GSM8K reasoning ======
 reasoning_start_token: '<reasoning>'
 reasoning_end_token: '</reasoning>'
+reasoning_start_token_in_prompt: false
 solution_start_token: '<answer>'
 solution_end_token: '</answer>'
-chat_template_path: 'maxtext/examples/chat_templates/gsm8k_rl.json'
-skip_jax_distributed_system: True
+data_template_path: 'maxtext/examples/chat_templates/gsm8k_rl.json'
+skip_jax_distributed_system: true
 
-# # TODO(@mazumdera): fix this
-# Dataset Configuration
-dataset_name: 'gsm8k' # huggingface:open-r1/DAPO-Math-17k-Processed
-eval_dataset_name: 'gsm8k' # huggingface:BytedTsinghua-SIA/AIME-2024
+# ====== Dataset Configuration ======
+# Supported values for dataset_name:
+#   ['openai/gsm8k', 'nvidia/OpenMathInstruct-2', 'nvidia/OpenMathReasoning', 'open-r1/OpenR1-Math-220k', 'bethgelab/CuratedThoughts']
+#
+# Scenarios:
+#   1. dataset_name='openai/gsm8k' and eval_dataset_name='openai/gsm8k'
+#      Loads the train and test splits of GSM8K directly.
+#
+#   2. Datasets other than 'gsm8k' with same eval: dataset_name=eval_dataset_name=<dataset>
+#      The dataset has no separate test split, so the training data is
+#      automatically split into train and test sets internally.
+#
+#   3. Train and evaluation on different datasets: dataset_name=<train_dataset>, eval_dataset_name=<eval_dataset>
+#      Loads separate dataset for training and evaluation (e.g., train on OpenMathInstruct-2, eval on GSM8K).
+dataset_name: 'openai/gsm8k'
+eval_dataset_name: 'openai/gsm8k'
+# Optional: path to a user-provided Python file with a custom `process_data`
+# function. Signature: process_data(dataset_name, model_tokenizer, template_config,
+# tmvp_config, x) -> dict with keys {prompts, question, answer}. When empty
+# (default), the built-in utils_rl.process_data is used.
+dataset_processor_path: ''
 train_split: 'train'
 eval_split: 'test'
-tokenizer_type: 'huggingface'
+hf_subset: 'main' # subset of Hugging Face dataset
+
+##### MaxText to VLLM Converter validation parameters
+vllm_load_format: dummy # Format to load the model for conversion. Options are "auto", "dummy"
+debug_converter: false # If true, run key coverage check, weight stats, and GCS upload then exit without generation.
+gcs_debug_path: "" # If set and debug_converter=true, upload converted layer-0 and global tensors as .npy to this GCS prefix.
+
+# Logical Axis Rules
+logical_axis_rules: [
+      ['circular_repeats', []],
+
+      # Vocabulary Embedding
+      ['activation_embed_and_logits_batch', ['data', 'stage', 'fsdp', 'fsdp_transpose', 'expert']],
+      ['activation_embed_and_logits_batch_sequence', ['data', 'stage', 'fsdp', 'fsdp_transpose', 'context', 'expert']],
+      ['activation_vocab', ['tensor', 'tensor_sequence']],
+      ['activation_vocab', ['tensor']],
+      ['activation_vocab', 'tensor_sequence'],
+      ['vocab', ['tensor', 'tensor_sequence', 'autoregressive']],
+      ['embed_vocab', ['fsdp', 'fsdp_transpose', 'context', 'expert']],
+
+      # Attention
+      ['activation_batch_attn', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
+      ['activation_heads', ['tensor', 'tensor_sequence', 'autoregressive']],
+      ['activation_kv_heads', ['tensor', 'tensor_sequence']],
+      ['activation_length_attn', ['context']],
+      ['activation_q_length', ['context']],
+      ['activation_kv_length', []],
+      ['activation_embed_attn', ['tensor']],
+      ['activation_kv', ['tensor', 'tensor_sequence']],
+      ['activation_kv_batch', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
+      ['activation_kv_head_dim', ['tensor', 'tensor_sequence']],
+      ['heads', ['tensor', 'tensor_sequence', 'autoregressive']],
+      ['q_heads', ['tensor', 'tensor_sequence', 'autoregressive']],
+      ['kv_heads', ['tensor', 'tensor_sequence', 'autoregressive']],
+      ['qkv', []],
+      ['kv', []],
+      ['kv_head_dim', []],
+      ['q_lora', ['fsdp', 'fsdp_transpose', 'context', 'expert']],
+      ['q_lora', ['fsdp', 'context', 'expert']],
+      ["q_lora_up_proj", []],
+      ['kv_lora', ['fsdp', 'fsdp_transpose', 'context', 'expert']],
+      ['kv_lora', ['fsdp', 'context', 'expert']],
+      ["kv_lora_up_proj", []],
+
+      # Mixture of Experts (MoE)
+      ['activation_batch_moe', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
+      ['activation_length_moe', ['context']],
+      ['activation_norm_length_moe', ['tensor_sequence', 'context']],
+      ['activation_embed_moe', ['tensor']],
+      ['activation_mlp_moe', ['tensor', 'tensor_sequence']],
+      ['activation_exp', ['expert']],
+      ['exp', 'expert'],
+      ['mlp_moe', ['fsdp_transpose', 'tensor', 'tensor_sequence', 'autoregressive']],
+      ['embed_moe', ['fsdp', 'fsdp_transpose', 'context']],
+      ['embed_moe', ['fsdp', 'context']],
+
+      # Standard MLP / Dense Layers / Model Structure
+      ['activation_mlp', ['tensor', 'tensor_sequence']],
+      ['activation_batch', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
+      ['activation_length', ['context']],
+      ['activation_norm_length', ['tensor_sequence', 'context']],
+      ['activation_embed', ['tensor']],
+      ['activation_stage', 'stage'],
+      ['mlp', ['fsdp_transpose', 'tensor', 'tensor_sequence', 'autoregressive']],
+      ['gdn_head', ['fsdp_transpose', 'tensor', 'tensor_sequence', 'autoregressive']],
+      ['embed', ['fsdp', 'fsdp_transpose', 'context', 'expert']],
+      ['embed', ['fsdp', 'context', 'expert']],
+      ['embed_attn', ['fsdp', 'context', 'expert']],
+      ['norm', ['tensor']],
+      ['layers', 'stage'],
+      ['diloco', 'diloco'],
+      ['engram_dim', ['tensor']],
+      ['dense_layers', []],
+      ['moe_layers', []],
+      ['mhc', []],
+  ]

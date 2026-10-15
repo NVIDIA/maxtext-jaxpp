@@ -24,9 +24,8 @@ import jax
 from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
 from jax.sharding import Mesh
-from maxtext.common.common_types import Config
-from maxtext.common.common_types import HyperConnectionType, MODEL_MODE_PREFILL
-from maxtext.inference import page_manager
+from maxtext.common.common_types import Config, AttentionType
+from maxtext.common.common_types import HyperConnectionType, MODEL_MODE_PREFILL, DecoderBlockType
 from maxtext.layers import attention_mla
 from maxtext.layers import initializers
 from maxtext.layers import linears
@@ -39,9 +38,11 @@ from maxtext.layers.engram import Engram
 from maxtext.layers.engram import NgramHashMapping
 from maxtext.layers.normalizations import RMSNorm
 from maxtext.models import deepseek_batchsplit
+from maxtext.models import deepseek_batchsplit_fp8
 from maxtext.utils import max_utils
 from maxtext.utils.sharding import create_sharding
 from maxtext.utils.sharding import maybe_shard_with_logical
+from maxtext.utils.sharding import get_logical_axis_rules
 
 import transformers
 
@@ -78,8 +79,10 @@ class DeepSeekGenericLayer(nnx.Module):
     batch_size, sequence_length = max_utils.get_batch_seq_len_for_mode(self.config, self.model_mode)
     self.dummy_inputs_shape = (batch_size, sequence_length, self.config.emb_dim)
 
-    self.out_sharding = create_sharding(self.mesh, self.logical_axis_names)
-    self.mlp_intermediate_sharding = create_sharding(self.mesh, self.mlp_logical_axis_names)
+    self.out_sharding = create_sharding(self.mesh, self.logical_axis_names, rules=get_logical_axis_rules())
+    self.mlp_intermediate_sharding = create_sharding(
+        self.mesh, self.mlp_logical_axis_names, rules=get_logical_axis_rules()
+    )
 
     self.pre_self_attention_layer_norm = RMSNorm(
         num_features=self.dummy_inputs_shape[-1],
@@ -136,37 +139,39 @@ class DeepSeekGenericLayer(nnx.Module):
       self.engram_layer_norm = None
       self.engram = None
 
-    self.self_attention = attention_mla.MLA(
-        config=self.config,
-        num_query_heads=self.config.num_query_heads,
-        num_kv_heads=self.config.num_kv_heads,
-        head_dim=self.config.head_dim,
-        max_target_length=self.config.max_target_length,
-        max_prefill_predict_length=self.config.max_prefill_predict_length,
-        attention_kernel=self.config.attention,
-        attention_type=self.config.attention_type,
-        inputs_q_shape=self.dummy_inputs_shape,
-        inputs_kv_shape=self.dummy_inputs_shape,
-        mesh=mesh,
-        dtype=self.config.dtype,
-        weight_dtype=self.config.weight_dtype,
-        dropout_rate=self.config.dropout_rate,
-        name="self_attention",
-        quant=quant,
-        kv_quant=quantizations.configure_kv_quant(config),
-        q_lora_rank=self.config.q_lora_rank,
-        kv_lora_rank=self.config.kv_lora_rank,
-        qk_nope_head_dim=self.config.qk_nope_head_dim,
-        qk_rope_head_dim=self.config.qk_rope_head_dim,
-        v_head_dim=self.config.v_head_dim,
-        max_position_embeddings=self.config.max_position_embeddings,
-        original_max_position_embeddings=self.config.original_max_position_embeddings,
-        mscale=self.config.mscale,
-        rope_factor=self.config.rope_factor,
-        model_mode=model_mode,
-        rngs=rngs,
-        attn_logits_soft_cap=self.config.attn_logits_soft_cap,
-    )
+    # DeepSeek V4 natively overrides this block with CompressedAttention.
+    if self.config.decoder_block != DecoderBlockType.DEEPSEEK4:
+      self.self_attention = attention_mla.MLA(
+          config=self.config,
+          num_query_heads=self.config.num_query_heads,
+          num_kv_heads=self.config.num_kv_heads,
+          head_dim=self.config.head_dim,
+          max_target_length=self.config.max_target_length,
+          max_prefill_predict_length=self.config.max_prefill_predict_length,
+          attention_kernel=self.config.attention,
+          attention_type=AttentionType(self.config.attention_type),
+          inputs_q_shape=self.dummy_inputs_shape,
+          inputs_kv_shape=self.dummy_inputs_shape,
+          mesh=mesh,
+          dtype=self.config.dtype,
+          weight_dtype=self.config.weight_dtype,
+          dropout_rate=self.config.dropout_rate,
+          name="self_attention",
+          quant=quant,
+          kv_quant=quantizations.configure_kv_quant(self.config),
+          q_lora_rank=self.config.q_lora_rank,
+          kv_lora_rank=self.config.kv_lora_rank,
+          qk_nope_head_dim=self.config.qk_nope_head_dim,
+          qk_rope_head_dim=self.config.qk_rope_head_dim,
+          v_head_dim=self.config.v_head_dim,
+          max_position_embeddings=self.config.max_position_embeddings,
+          original_max_position_embeddings=self.config.original_max_position_embeddings,
+          mscale=self.config.mscale,
+          rope_factor=self.config.rope_factor,
+          model_mode=model_mode,
+          rngs=rngs,
+          attn_logits_soft_cap=self.config.attn_logits_soft_cap,
+      )
 
     self.dropout = Dropout(rate=self.config.dropout_rate, broadcast_dims=(-2,), rngs=self.rngs)
     if self.is_mhc_enabled:
@@ -185,6 +190,7 @@ class DeepSeekGenericLayer(nnx.Module):
         shard_mode=self.config.shard_mode,
         debug_sharding=self.config.debug_sharding,
         extra_stack_level=1,
+        rules=get_logical_axis_rules(),
     )
 
   def dropout_op(self, x, deterministic):
@@ -205,8 +211,8 @@ class DeepSeekGenericLayer(nnx.Module):
       decoder_segment_ids,
       decoder_positions,
       deterministic,
+      model_mode,
       previous_chunk=None,
-      page_state: None | page_manager.PageState = None,
       slot: None | int = None,
   ):
     """Executes the attention layer."""
@@ -216,10 +222,9 @@ class DeepSeekGenericLayer(nnx.Module):
         decoder_positions,
         decoder_segment_ids=decoder_segment_ids,
         deterministic=deterministic,
-        model_mode=self.model_mode,
+        model_mode=model_mode,
         out_sharding=self.out_sharding,
         previous_chunk=previous_chunk,
-        page_state=page_state,
         slot=slot,
     )
     return self.with_logical_constraint(attention_result)
@@ -244,10 +249,19 @@ class DeepSeekGenericLayer(nnx.Module):
     if self.config.load_balance_loss_weight > 0.0 and load_balance_loss is not None:
       self.sow(nnx.Intermediate, "moe_lb_loss", load_balance_loss)
 
-    if self.config.routed_bias and self.config.routed_bias_update_rate > 0.0 and moe_bias_updates is not None:
+    if self.config.te_moe_block and moe_bias_updates is not None:
+      total_recv_tokens, recv_capacity_per_rank = moe_bias_updates
+      self.sow(nnx.Intermediate, "te_moe_total_recv_tokens", total_recv_tokens)
+      self.sow(nnx.Intermediate, "te_moe_recv_capacity_per_rank", recv_capacity_per_rank)
+      self.sow(
+          nnx.Intermediate,
+          "te_moe_capacity_overflow",
+          jnp.any(total_recv_tokens > recv_capacity_per_rank),
+      )
+    elif self.config.routed_bias and self.config.routed_bias_update_rate > 0.0 and moe_bias_updates is not None:
       self.sow(nnx.Intermediate, "moe_bias_updates", moe_bias_updates)
 
-    if self.config.record_internal_nn_metrics:
+    if getattr(self.config, "record_internal_nn_metrics", False):
       self.sow(nnx.Intermediate, "activation_mean", jnp.mean(layer_output))
       self.sow(nnx.Intermediate, "activation_stdev", jnp.std(layer_output))
       self.sow(
@@ -266,8 +280,8 @@ class DeepSeekGenericLayer(nnx.Module):
       decoder_segment_ids,
       decoder_positions,
       deterministic,
+      model_mode,
       previous_chunk=None,
-      page_state: None | page_manager.PageState = None,
       slot: None | int = None,
   ):
     """self-attention with normalization"""
@@ -280,10 +294,9 @@ class DeepSeekGenericLayer(nnx.Module):
           decoder_segment_ids=decoder_segment_ids,
           inputs_positions=decoder_positions,
           deterministic=deterministic,
-          model_mode=self.model_mode,
+          model_mode=model_mode,
           out_sharding=self.out_sharding,
           previous_chunk=previous_chunk,
-          page_state=page_state,
           slot=slot,
       )
     else:
@@ -293,8 +306,8 @@ class DeepSeekGenericLayer(nnx.Module):
           decoder_segment_ids,
           decoder_positions,
           deterministic,
+          model_mode,
           previous_chunk,
-          page_state,
           slot,
       )
       intermediate_inputs = inputs + attention_lnx
@@ -303,9 +316,9 @@ class DeepSeekGenericLayer(nnx.Module):
     return hidden_states, intermediate_inputs
 
   def engram_op(self, x, decoder_input_tokens):
-    normed_x = self.engram_layer_norm(x)
+    normed_x = self.engram_layer_norm(x)  # pyrefly: ignore[not-callable]
     hash_ids = self.ngram_hash_mapping(decoder_input_tokens)[self.layer_idx]
-    return self.engram(normed_x, hash_ids)
+    return self.engram(normed_x, hash_ids)  # pyrefly: ignore[not-callable]
 
 
 class DeepSeekDenseLayer(DeepSeekGenericLayer):
@@ -335,7 +348,7 @@ class DeepSeekDenseLayer(DeepSeekGenericLayer):
         rngs=self.rngs,
     )
 
-  def mlp_op(self, x, deterministic):
+  def mlp_op(self, x, deterministic, *args, **kwargs):
     mlp = self.mlp(x, deterministic, intermediate_sharding=self.mlp_intermediate_sharding, out_sharding=self.out_sharding)
     return self.with_logical_constraint(mlp)
 
@@ -347,7 +360,6 @@ class DeepSeekDenseLayer(DeepSeekGenericLayer):
       deterministic,
       model_mode,
       previous_chunk=None,
-      page_state: None | page_manager.PageState = None,
       slot: None | int = None,
       kv_cache=None,
       attention_metadata=None,
@@ -368,8 +380,8 @@ class DeepSeekDenseLayer(DeepSeekGenericLayer):
         decoder_segment_ids,
         decoder_positions,
         deterministic,
+        model_mode,
         previous_chunk,
-        page_state,
         slot,
     )
 
@@ -415,7 +427,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
     self.DeepSeekMoeBlock_0 = moe.RoutedAndSharedMoE(
         config=self.config,
         mesh=mesh,
-        kernel_init=initializers.nd_dense_init(1.0, "fan_in", "truncated_normal"),
+        kernel_init=initializers.nd_dense_init(self.config.dense_init_scale, "fan_in", "truncated_normal"),
         kernel_axes=("embed", None),
         dtype=self.config.dtype,
         weight_dtype=self.config.weight_dtype,
@@ -431,7 +443,6 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       deterministic,
       model_mode,
       previous_chunk=None,
-      page_state: None | page_manager.PageState = None,
       slot: None | int = None,
       kv_cache=None,
       attention_metadata=None,
@@ -447,11 +458,72 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
     # That is also why we can split/merge activations here as well as
     # in `Decoder`, since they will never be executed together.
     if self.config.use_batch_split_schedule:
+      # The older version of batch-split that fully uses qwix quantization.
+      if self.config.quantization and self.config.use_qwix_quantization and not self.config.use_manual_quantization:
+        activation_pspec = jax.sharding.PartitionSpec(
+            ("data", "fsdp", "fsdp_transpose", "expert", "context"),
+            None,
+            None,
+        )
+        inputs = jax.shard_map(
+            functools.partial(
+                deepseek_batchsplit_fp8.split,
+                split_factor=self.config.batch_split_factor,
+            ),
+            mesh=self.mesh,
+            in_specs=activation_pspec,
+            out_specs=[activation_pspec] * self.config.batch_split_factor,
+        )(inputs)
+        dpos = deepseek_batchsplit_fp8.split(decoder_positions, self.config.batch_split_factor)
+        dseg = deepseek_batchsplit_fp8.split(decoder_segment_ids, self.config.batch_split_factor)
+        weights = deepseek_batchsplit_fp8.fetch_weights(
+            nnx.to_pure_dict(nnx.state(self, (nnx.Param, moe.MoEBiasVar))), self.config.dtype
+        )
+        outputs = deepseek_batchsplit_fp8.batch_split_schedule(
+            inputs,
+            weights,
+            dpos,
+            dseg,
+            model_mode=model_mode,
+            mesh=self.mesh,
+            quant=self.quant,
+            cfg=self.config,
+        )
+        outputs = jax.shard_map(
+            functools.partial(
+                deepseek_batchsplit_fp8.merge,
+                split_factor=self.config.batch_split_factor,
+            ),
+            mesh=self.mesh,
+            in_specs=([activation_pspec] * self.config.batch_split_factor,),
+            out_specs=activation_pspec,
+        )(outputs)
+        return outputs, None
+
+      # bf16 and fp8 code path for pure-JAX batch-split.
+      # fp8 code path supports both manual quantization and qwix
+      # quantization.
+      input_sharding = jax.typeof(inputs).sharding
       activation_pspec = jax.sharding.PartitionSpec(
-          ("data", "fsdp", "fsdp_transpose", "expert", "context"),
+          ("data", "fsdp", "expert"),
           None,
           None,
       )
+      inputs = jax.reshard(inputs, jax.sharding.NamedSharding(self.mesh, activation_pspec))
+      yarn_freqs = deepseek_batchsplit.initialize_yarn_freqs(
+          decoder_positions,
+          embedding_dims=self.config.qk_rope_head_dim,
+          rope_theta=self.config.rope_max_timescale,
+          max_position_embeddings=self.config.max_position_embeddings,
+          original_max_position_embeddings=self.config.original_max_position_embeddings,
+          beta_fast=self.config.beta_fast,
+          beta_slow=self.config.beta_slow,
+          rope_factor=self.config.rope_factor,
+          mesh=self.mesh,
+          activation_pspec=activation_pspec,
+      )
+      yarn_mask = deepseek_batchsplit.initialize_yarn_mask(self.config.qk_rope_head_dim)
+      splash_kernel = deepseek_batchsplit.init_splash_kernel(self.config)
       inputs = jax.shard_map(
           functools.partial(
               deepseek_batchsplit.split,
@@ -461,18 +533,44 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
           in_specs=activation_pspec,
           out_specs=[activation_pspec] * self.config.batch_split_factor,
       )(inputs)
-      dpos = deepseek_batchsplit.split(decoder_positions, self.config.batch_split_factor)
-      dseg = deepseek_batchsplit.split(decoder_segment_ids, self.config.batch_split_factor)
-      weights = deepseek_batchsplit.fetch_weights(nnx.to_pure_dict(nnx.state(self, nnx.Param)), self.config.dtype)
-      outputs = deepseek_batchsplit.batch_split_schedule(
+      yarn_freqs = deepseek_batchsplit.split(yarn_freqs, self.config.batch_split_factor)
+
+      def extract_fn(x):
+        if isinstance(x, nnx.variablelib.Variable):
+          return maybe_shard_with_logical(
+              x.value,
+              x.sharding_names,
+              self.mesh,
+              shard_mode=self.config.shard_mode,
+              rules=get_logical_axis_rules(),
+          )
+        return x
+
+      weights = deepseek_batchsplit.fetch_weights(
+          nnx.to_pure_dict(nnx.state(self, (nnx.Param, moe.MoEBiasVar)), extract_fn), self.config.dtype
+      )
+      weights = deepseek_batchsplit.gather_weights(weights, self.mesh)
+      outputs, _ = deepseek_batchsplit.batch_split_schedule(
           inputs,
           weights,
-          dpos,
-          dseg,
-          model_mode=model_mode,
+          yarn_freqs,
           mesh=self.mesh,
-          quant=self.quant,
           cfg=self.config,
+          splash_kernel=splash_kernel,
+          activation_pspec=activation_pspec,
+          pairwise_swap_and_negate_mask=yarn_mask,
+      )
+      moe_inputs, routed_expert_out, shared_expert_out, selected_experts = outputs[1]
+      outputs[1], _ = deepseek_batchsplit.unroute_ubatch_shard_mapped(
+          moe_inputs,
+          routed_expert_out,
+          shared_expert_out,
+          selected_experts,
+          expert_axis_name="expert",
+          use_gather_mosaic_kernel=False,
+          target_length=self.config.max_target_length,
+          mesh=self.mesh,
+          activation_pspec=activation_pspec,
       )
       outputs = jax.shard_map(
           functools.partial(
@@ -483,6 +581,7 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
           in_specs=([activation_pspec] * self.config.batch_split_factor,),
           out_specs=activation_pspec,
       )(outputs)
+      outputs = jax.reshard(outputs, input_sharding)
       return outputs, None
 
     x = self.with_logical_constraint(inputs)
@@ -497,8 +596,8 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
         decoder_segment_ids,
         decoder_positions,
         deterministic,
+        model_mode,
         previous_chunk,
-        page_state,
         slot,
     )
 

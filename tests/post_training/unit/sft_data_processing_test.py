@@ -15,26 +15,28 @@
 """Data processing tests for SFT."""
 import pytest
 
-pytestmark = [pytest.mark.post_training, pytest.mark.cpu_only]
+pytestmark = [pytest.mark.post_training]
 
-import subprocess
 import unittest
 import os.path
 import numpy as np
 import jax
-import re
 from jax.sharding import Mesh
 from jax.experimental import mesh_utils
 from datasets import Dataset
 import transformers
 from parameterized import parameterized_class
-from unittest.mock import patch
 from maxtext.configs import pyconfig
 from maxtext.utils.globals import MAXTEXT_PKG_DIR, MAXTEXT_CONFIGS_DIR, MAXTEXT_ASSETS_ROOT
 from maxtext.input_pipeline import hf_data_processing
 from maxtext.input_pipeline import input_pipeline_interface
 from maxtext.input_pipeline.hf_data_processing import _get_pad_id
-from maxtext.input_pipeline.input_pipeline_utils import verify_chat_template_generation_prompt_logic
+from maxtext.input_pipeline.input_pipeline_utils import apply_chat_template, SFTPromptMasking, tokenization
+from tests.utils.test_helpers import ensure_tokenizer_downloaded
+
+QWEN3_TOKENIZER_PATH = os.path.join(MAXTEXT_ASSETS_ROOT, "tokenizers", "qwen3-tokenizer")
+GEMMA4_TOKENIZER_PATH = os.path.join(MAXTEXT_ASSETS_ROOT, "tokenizers", "gemma4-tokenizer")
+LLAMA2_TOKENIZER_PATH = os.path.join(MAXTEXT_ASSETS_ROOT, "tokenizers", "llama2-chat-tokenizer")
 
 PROMPT_DATA = [
     [
@@ -103,12 +105,12 @@ MESSAGES_DATA = [
 ]
 
 LLAMA2_DATA = {
-    "tokenizer_path": None,
+    "tokenizer_path": LLAMA2_TOKENIZER_PATH,
     "messages": {
         "truncated_exp1_inputs": (
-            "<s> [INST] <<SYS>>\nthe system prompt\n<</SYS>>\n\nexample one question one [/INST] "
+            "<s>[INST] <<SYS>>\nthe system prompt\n<</SYS>>\n\nexample one question one [/INST] "
             "example one answer one </s>"
-            "<s> [INST] example one question two [/INST] "
+            "<s>[INST] example one question two [/INST] "
             "example one answer two"
         ),
         "truncated_exp1_targets": (
@@ -122,11 +124,11 @@ LLAMA2_DATA = {
             "example one answer two<unk>"
         ),
         "packed_exp2_inputs": (
-            "<s> [INST] question two [/INST] "
+            "<s>[INST] question two [/INST] "
             "answer two </s>"
-            "<s> [INST] question three [/INST] "
+            "<s>[INST] question three [/INST] "
             "answer three </s>"
-            "<s> [INST] question four [/INST] "
+            "<s>[INST] question four [/INST] "
             "answer four </s>"
             "<unk><unk><unk><unk><unk><unk><unk><unk>"
         ),
@@ -149,11 +151,11 @@ LLAMA2_DATA = {
     },
     "prompt_completion": {
         "truncated_exp1_inputs": (
-            "<s> [INST] example one question one [/INST] "
+            "<s>[INST] example one question one [/INST] "
             "example one answer one </s>"
-            "<s> [INST] example one question two [/INST] "
+            "<s>[INST] example one question two [/INST] "
             "example one answer two </s>"
-            "<s> [INST] example one question three [/INST] "
+            "<s>[INST] example one question three [/INST] "
             "example one"
         ),
         "truncated_exp1_targets": (
@@ -173,11 +175,11 @@ LLAMA2_DATA = {
             "example one<unk>"
         ),
         "packed_exp2_inputs": (
-            "<s> [INST] question two [/INST] "
+            "<s>[INST] question two [/INST] "
             "answer two </s>"
-            "<s> [INST] question three [/INST]"
+            "<s>[INST] question three [/INST]"
             " answer three </s>"
-            "<s> [INST] question four [/INST]"
+            "<s>[INST] question four [/INST]"
             " answer four </s>"
             "<unk><unk><unk><unk><unk><unk><unk><unk>"
         ),
@@ -201,7 +203,7 @@ LLAMA2_DATA = {
 }
 
 QWEN_DATA = {
-    "tokenizer_path": "Qwen/Qwen3-4B",
+    "tokenizer_path": QWEN3_TOKENIZER_PATH,
     "messages": {
         "truncated_exp1_inputs": (
             "<|im_start|>system\nthe system prompt<|im_end|>\n"
@@ -322,24 +324,12 @@ class SFTDataProcessingTest(unittest.TestCase):
   @classmethod
   def setUpClass(cls):
     super().setUpClass()
-    exit_code = subprocess.call(
-        [
-            "gcloud",
-            "storage",
-            "cp",
-            "--recursive",
-            "gs://maxtext-dataset/hf/llama2-chat-tokenizer",
-            os.path.join(MAXTEXT_ASSETS_ROOT, ""),
-        ]
-    )
-    if exit_code != 0:
-      raise ValueError(f"Download tokenizer with gcloud storage cp failed with exit code: {exit_code}")
+    ensure_tokenizer_downloaded("qwen3-tokenizer", QWEN3_TOKENIZER_PATH, skip_test_on_failure=True)
+    ensure_tokenizer_downloaded("llama2-chat-tokenizer", LLAMA2_TOKENIZER_PATH, skip_test_on_failure=True)
 
   def setUp(self):
     super().setUp()
-    tokenizer_path = self.test_data.get("tokenizer_path")
-    if tokenizer_path is None:
-      tokenizer_path = os.path.join(MAXTEXT_ASSETS_ROOT, "llama2-chat-tokenizer")
+    tokenizer_path = self.test_data.get("tokenizer_path", LLAMA2_TOKENIZER_PATH)
 
     self.config = pyconfig.initialize(
         [os.path.join(MAXTEXT_PKG_DIR, "sft_trainer"), os.path.join(MAXTEXT_CONFIGS_DIR, "post_train", "sft.yml")],
@@ -380,6 +370,7 @@ class SFTDataProcessingTest(unittest.TestCase):
         dataloading_host_count=len(self.process_indices),
         global_mesh=self.mesh,
         dataset=train_ds,
+        config=self.config,
         data_column_names=data_columns,
         tokenize=self.config.tokenize_train_data,
         tokenizer_path=self.config.tokenizer_path,
@@ -488,48 +479,149 @@ class SFTDataProcessingTest(unittest.TestCase):
 
 @pytest.mark.external_training
 class SFTChatTemplateLogicTest(unittest.TestCase):
-  LLAMA_TOKENIZER_PATH = os.path.join(MAXTEXT_ASSETS_ROOT, "llama2-chat-tokenizer")
 
   @classmethod
   def setUpClass(cls):
     super().setUpClass()
-    if not os.path.exists(cls.LLAMA_TOKENIZER_PATH):
-      exit_code = subprocess.call(
-          [
-              "gsutil",
-              "cp",
-              "-r",
-              "gs://maxtext-dataset/hf/llama2-chat-tokenizer",
-              os.path.join(MAXTEXT_ASSETS_ROOT, ""),
-          ]
-      )
-      if exit_code != 0:
-        raise ValueError("Failed to download llama tokenizer")
+    ensure_tokenizer_downloaded("qwen3-tokenizer", QWEN3_TOKENIZER_PATH, skip_test_on_failure=True)
+    ensure_tokenizer_downloaded("llama2-chat-tokenizer", LLAMA2_TOKENIZER_PATH, skip_test_on_failure=True)
+    ensure_tokenizer_downloaded("gemma4-tokenizer", GEMMA4_TOKENIZER_PATH, skip_test_on_failure=True)
 
   def setUp(self):
     super().setUp()
-    self.qwen3_tokenizer = transformers.AutoTokenizer.from_pretrained("Qwen/Qwen3-4B")
-    self.llama2_tokenizer = transformers.AutoTokenizer.from_pretrained(self.LLAMA_TOKENIZER_PATH)
+    self.qwen3_tokenizer = transformers.AutoTokenizer.from_pretrained(QWEN3_TOKENIZER_PATH)
+    self.llama2_tokenizer = transformers.AutoTokenizer.from_pretrained(LLAMA2_TOKENIZER_PATH)
+    self.gemma4_tokenizer = transformers.AutoTokenizer.from_pretrained(GEMMA4_TOKENIZER_PATH)
 
-  def test_tokenizer_w_generation_prompt(self):
-    verify_chat_template_generation_prompt_logic(self.qwen3_tokenizer)
+  def _apply_chat_template(self, tokenizer):
+    """Helper function to apply the chat template to a sample input and return the result for testing."""
+    messages = [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "Q2"},
+        {"role": "assistant", "content": "A2"},
+    ]
+    example = {"messages": messages}
+    return apply_chat_template(example, tokenizer, "messages")
 
-  def test_tokenizer_wo_generation_prompt(self):
-    verify_chat_template_generation_prompt_logic(self.llama2_tokenizer)
+  def test_apply_chat_template_with_qwen3_tokenizer(self):
+    """Verifies that apply_chat_template correctly applies Qwen3's chat template."""
+    result = self._apply_chat_template(self.qwen3_tokenizer)
+    self.assertEqual(result["is_prompt"], [True, False, True, False])
+    self.assertEqual(len(result["messages"]), 4)
+    self.assertIn("<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n", result["messages"][0])
+    self.assertIn("<think>\n\n</think>\n\nA1<|im_end|>\n", result["messages"][1])
+    self.assertIn("<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n", result["messages"][2])
+    self.assertIn("<think>\n\n</think>\n\nA2<|im_end|>\n", result["messages"][3])
 
-  def test_failure_path_with_modified_template(self):
-    """Verifies the function correctly raises a ValueError on a bad template."""
-    # Replace the role within the existing add_generation_prompt block with a deliberately faulty one.
-    fault_chat_template = re.sub(
-        r"(\{%-?\s*if add_generation_prompt\s*%\}.*?<\|im_start\|>)assistant(.*?\{%-?\s*endif\s*%\})",
-        r"\1wrong_role\2",
-        self.qwen3_tokenizer.chat_template,
-        flags=re.DOTALL,
+  def test_apply_chat_template_with_llama2_tokenizer(self):
+    """Verifies that apply_chat_template correctly applies Llama2's chat template."""
+    result = self._apply_chat_template(self.llama2_tokenizer)
+    self.assertEqual(result["is_prompt"], [True, False, True, False])
+    self.assertEqual(len(result["messages"]), 4)
+    self.assertIn("<s>[INST] Q1 [/INST]", result["messages"][0])
+    self.assertIn("A1 </s>", result["messages"][1])
+    self.assertIn("<s>[INST] Q2 [/INST]", result["messages"][2])
+    self.assertIn("A2 </s>", result["messages"][3])
+
+  def test_apply_chat_template_with_gemma4_tokenizer(self):
+    """Verifies that apply_chat_template correctly applies Gemma4's chat template."""
+    result = self._apply_chat_template(self.gemma4_tokenizer)
+    self.assertEqual(result["is_prompt"], [True, False, True, False])
+    self.assertEqual(len(result["messages"]), 4)
+    self.assertIn("<|turn>user\nQ1<turn|>\n<|turn>model\n", result["messages"][0])
+    self.assertIn("A1<turn|>\n", result["messages"][1])
+    self.assertIn("<|turn>user\nQ2<turn|>\n<|turn>model\n", result["messages"][2])
+    self.assertIn("A2<turn|>\n", result["messages"][3])
+
+  def test_apply_chat_template_with_gemma4_reasoning(self):
+    """Verifies that apply_chat_template correctly handles Gemma4 with thinking/reasoning."""
+    example = {
+        "messages": [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "reasoning": "2+2 is 4.", "content": "4"},
+        ]
+    }
+    result = apply_chat_template(example, self.gemma4_tokenizer, "messages")
+    self.assertEqual(result["is_prompt"], [True, False])
+    self.assertIn("<|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\n<|channel>thought\n", result["messages"][0])
+    self.assertEqual(result["messages"][1], "2+2 is 4.\n<channel|>4<turn|>\n")
+
+
+@pytest.mark.external_training
+class SFTPromptMaskingTest(unittest.TestCase):
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    ensure_tokenizer_downloaded("qwen3-tokenizer", QWEN3_TOKENIZER_PATH, skip_test_on_failure=True)
+    ensure_tokenizer_downloaded("gemma4-tokenizer", GEMMA4_TOKENIZER_PATH, skip_test_on_failure=True)
+
+  def setUp(self):
+    super().setUp()
+    self.max_target_length = 50
+    self.qwen3_tokenizer = transformers.AutoTokenizer.from_pretrained(QWEN3_TOKENIZER_PATH)
+    self.gemma4_tokenizer = transformers.AutoTokenizer.from_pretrained(GEMMA4_TOKENIZER_PATH)
+
+  def _apply_prompt_masking(self, tokenizer, unk_id, completion_only=True):
+    """Helper function to apply the prompt masking to a sample input and return the result for testing."""
+    messages = [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "Q2"},
+        {"role": "assistant", "content": "A2"},
+    ]
+    example = {"messages": messages}
+    modified_example = apply_chat_template(example, tokenizer, "messages")
+    tokenized_example = tokenization(modified_example, tokenizer, False, self.max_target_length, ["messages"])
+    op = SFTPromptMasking(
+        text_column_name="messages",
+        completion_only=completion_only,
+        max_target_length=self.max_target_length,
+        unk_id=unk_id,
     )
-    with patch.object(self.qwen3_tokenizer, "chat_template", fault_chat_template):
-      # Verify that our function catches the mismatch and raises the expected error
-      with self.assertRaisesRegex(ValueError, "Chat template generation prompt mismatch!"):
-        verify_chat_template_generation_prompt_logic(self.qwen3_tokenizer)
+    return op.map({"messages": tokenized_example["messages"], "is_prompt": modified_example["is_prompt"]})
+
+  def _verify_prompt_masking(self, tokenizer, inputs, targets, unk_id):
+    """Helper function to verify that the prompt masking was applied correctly."""
+    # Unmasked positions must match inputs exactly
+    np.testing.assert_array_equal(inputs[targets != unk_id], targets[targets != unk_id])
+
+    # Some tokens must be masked
+    self.assertTrue(np.any(targets == unk_id))
+
+    # Decoding unmasked tokens yields completions, not prompts
+    completion = tokenizer.decode(targets[targets != unk_id], skip_special_tokens=False)
+    self.assertIn("A1", completion)
+    self.assertIn("A2", completion)
+    self.assertNotIn("Q1", completion)
+    self.assertNotIn("Q2", completion)
+
+  def test_sft_prompt_masking_with_qwen3_tokenizer(self):
+    """Verifies that SFTPromptMasking correctly applies masking for Qwen3's chat template."""
+    unk_id = _get_pad_id(self.qwen3_tokenizer)
+    result = self._apply_prompt_masking(self.qwen3_tokenizer, unk_id)
+    inputs, targets = result["inputs"], result["targets"]
+    self._verify_prompt_masking(self.qwen3_tokenizer, inputs, targets, unk_id)
+
+  def test_sft_prompt_masking_with_gemma4_tokenizer(self):
+    """Verifies that SFTPromptMasking correctly applies masking for Gemma4's chat template."""
+    unk_id = _get_pad_id(self.gemma4_tokenizer)
+    result = self._apply_prompt_masking(self.gemma4_tokenizer, unk_id)
+    inputs, targets = result["inputs"], result["targets"]
+    self._verify_prompt_masking(self.gemma4_tokenizer, inputs, targets, unk_id)
+
+  def test_sft_no_prompt_masking_with_qwen3_tokenizer(self):
+    """Verifies that prompt masking is not applied when completion_only=False with Qwen3 tokenizer."""
+    unk_id = _get_pad_id(self.qwen3_tokenizer)
+    result = self._apply_prompt_masking(self.qwen3_tokenizer, unk_id, completion_only=False)
+    np.testing.assert_array_equal(result["inputs"], result["targets"])
+
+  def test_sft_no_prompt_masking_with_gemma4_tokenizer(self):
+    """Verifies that prompt masking is not applied when completion_only=False with Gemma4 tokenizer."""
+    unk_id = _get_pad_id(self.gemma4_tokenizer)
+    result = self._apply_prompt_masking(self.gemma4_tokenizer, unk_id, completion_only=False)
+    np.testing.assert_array_equal(result["inputs"], result["targets"])
 
 
 if __name__ == "__main__":

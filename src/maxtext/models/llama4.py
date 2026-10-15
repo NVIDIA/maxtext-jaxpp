@@ -19,13 +19,13 @@ import math
 
 from flax import linen as nn
 from flax import nnx
+import jax
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
 from jax.sharding import Mesh
 from maxtext.common.common_types import Array, AttentionType, Config, MODEL_MODE_TRAIN
 from maxtext.common.common_types import MODEL_MODE_PREFILL
-from maxtext.inference import page_manager
 from maxtext.layers import initializers
 from maxtext.layers import linears
 from maxtext.layers import nnx_wrappers
@@ -50,7 +50,7 @@ class Llama4UnfoldConvolution(nnx.Module):
     config: Config containing model parameters
   """
 
-  def __init__(self, config: Config, *, rngs: nnx.Rngs = None):
+  def __init__(self, config: Config, *, rngs: nnx.Rngs = None):  # pyrefly: ignore[bad-function-definition]
     self.config = config
     self.rngs = rngs
     self.vit_unfold_linear = linears.DenseGeneral(
@@ -123,7 +123,7 @@ class Llama4VisionMLP(nnx.Module):
     config: Config containing model parameters
   """
 
-  def __init__(self, config: Config, *, rngs: nnx.Rngs = None):
+  def __init__(self, config: Config, *, rngs: nnx.Rngs = None):  # pyrefly: ignore[bad-function-definition]
     self.config = config
     self.rngs = rngs
     self.vit_encoder_layer_mlp_fc1 = linears.DenseGeneral(
@@ -157,7 +157,7 @@ class Llama4VisionMLP2(nnx.Module):
     config: Config containing model parameters
   """
 
-  def __init__(self, config: Config, *, rngs: nnx.Rngs = None):
+  def __init__(self, config: Config, *, rngs: nnx.Rngs = None):  # pyrefly: ignore[bad-function-definition]
     self.config = config
     self.rngs = rngs
     self.vit_pixel_shuffle_mlp_fc1 = linears.DenseGeneral(
@@ -196,7 +196,7 @@ class Llama4VisionPixelShuffleMLP(nnx.Module):
     config: Config containing model parameters
   """
 
-  def __init__(self, config: Config, *, rngs: nnx.Rngs = None):
+  def __init__(self, config: Config, *, rngs: nnx.Rngs = None):  # pyrefly: ignore[bad-function-definition]
     self.config = config
     self.rngs = rngs
     self.pixel_shuffle_ratio = self.config.pixel_shuffle_ratio_for_vit
@@ -221,7 +221,7 @@ class Llama4MultiModalProjector(nnx.Module):
     config: Config containing model parameters
   """
 
-  def __init__(self, config: Config, mesh: Mesh, *, rngs: nnx.Rngs = None):
+  def __init__(self, config: Config, mesh: Mesh, *, rngs: nnx.Rngs = None):  # pyrefly: ignore[bad-function-definition]
     self.config = config
     self.mesh = mesh
     self.rngs = rngs
@@ -251,17 +251,6 @@ class Llama4MultiModalProjector(nnx.Module):
     _, c, d = hidden_states.shape
     hidden_states = hidden_states.reshape(b, t, c, d)
     return hidden_states
-
-
-def llama4multimodalprojector_as_linen(config: Config, mesh: Mesh):
-  return nnx_wrappers.to_linen(
-      Llama4MultiModalProjector,
-      config=config,
-      mesh=mesh,
-      name="Llama4MultiModalProjector_0",
-      abstract_init=False,
-      metadata_fn=initializers.variable_to_logically_partitioned,
-  )
 
 
 def determine_is_nope_layer(layer_id: int, nope_layer_interval: int) -> bool:
@@ -403,7 +392,7 @@ class Llama4DecoderLayer(nnx.Module):
       self.Llama4MoEBlock_0 = RoutedAndSharedMoE(
           config=config,
           mesh=self.mesh,
-          kernel_init=initializers.nd_dense_init(1.0, "fan_in", "truncated_normal"),
+          kernel_init=initializers.nd_dense_init(config.dense_init_scale, "fan_in", "truncated_normal"),
           kernel_axes=("embed", None),
           dtype=config.dtype,
           weight_dtype=config.weight_dtype,
@@ -442,9 +431,8 @@ class Llama4DecoderLayer(nnx.Module):
       decoder_positions,
       deterministic,
       model_mode,
-      slot: None | int = None,
-      page_state: None | page_manager.PageState = None,
       previous_chunk=None,
+      slot: None | int = None,
       kv_cache=None,
       attention_metadata=None,
   ):
@@ -452,7 +440,13 @@ class Llama4DecoderLayer(nnx.Module):
     assert cfg.num_experts >= 1, "Expected the Llama4 config to have `num_experts > 1`."
 
     # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
-    if isinstance(inputs, tuple):
+    is_scan_carry = False
+    if isinstance(inputs, tuple) and len(inputs) == 3:
+      hidden_states, stacked_kv_cache, layer_idx = inputs
+      kv_cache = stacked_kv_cache[layer_idx]
+      inputs = hidden_states
+      is_scan_carry = True
+    elif isinstance(inputs, tuple):
       inputs = inputs[0]
     inputs = nn.with_logical_constraint(inputs, self.activation_axis_names)
     inputs = checkpoint_name(inputs, "decoder_layer_input")
@@ -469,7 +463,6 @@ class Llama4DecoderLayer(nnx.Module):
         deterministic=deterministic,
         model_mode=model_mode,
         slot=slot,
-        page_state=page_state,
         previous_chunk=previous_chunk,
         kv_cache=kv_cache,
         attention_metadata=attention_metadata,
@@ -493,18 +486,27 @@ class Llama4DecoderLayer(nnx.Module):
     layer_output = nn.with_logical_constraint(layer_output, self.activation_axis_names)
 
     if self.config.load_balance_loss_weight > 0.0 and load_balance_loss is not None:
-      self.sow("intermediates", "moe_lb_loss", load_balance_loss)
+      self.sow(nnx.Intermediate, "moe_lb_loss", load_balance_loss)
 
-    if cfg.record_internal_nn_metrics:
-      self.sow("intermediates", "activation_mean", jnp.mean(layer_output))
-      self.sow("intermediates", "activation_stdev", jnp.std(layer_output))
+    if getattr(cfg, "record_internal_nn_metrics", False):
+      self.sow(nnx.Intermediate, "activation_mean", jnp.mean(layer_output))
+      self.sow(nnx.Intermediate, "activation_stdev", jnp.std(layer_output))
       self.sow(
-          "intermediates",
+          nnx.Intermediate,
           "activation_fraction_zero",
           jnp.sum(layer_output == 0) / jnp.size(layer_output),
       )
 
-    if cfg.scan_layers:
+    if is_scan_carry:
+
+      def update_cache(cache, val):
+        if jnp.size(val) > 0:
+          return cache.at[layer_idx].set(val)
+        return cache
+
+      stacked_kv_cache = jax.tree_util.tree_map(update_cache, stacked_kv_cache, kv_cache)  # pyrefly: ignore[unbound-name]
+      return (layer_output, stacked_kv_cache, layer_idx + 1), None  # pyrefly: ignore[unbound-name]
+    elif cfg.scan_layers:
       return layer_output, None
     else:
       return layer_output, kv_cache
@@ -570,9 +572,10 @@ class Llama4ScannableBlock(nnx.Module):
       decoder_positions,
       deterministic,
       model_mode,
-      slot: None | int = None,
-      page_state: None | page_manager.PageState = None,
       previous_chunk=None,
+      slot: None | int = None,
+      kv_cache=None,
+      attention_metadata=None,
   ):
 
     cfg = self.config
@@ -588,8 +591,9 @@ class Llama4ScannableBlock(nnx.Module):
           deterministic,
           model_mode,
           previous_chunk=previous_chunk,
-          page_state=page_state,
           slot=slot,
+          kv_cache=kv_cache,
+          attention_metadata=attention_metadata,
       )
       if cfg.scan_layers:
         y = y[0]
@@ -608,7 +612,7 @@ Llama4ScannableBlockToLinen = nnx_wrappers.to_linen_class(
 class Llama4VisionEncoderLayer(nnx.Module):
   """Transformer encoder layer for Llama4 vision model."""
 
-  def __init__(self, config: Config, mesh: Mesh, *, rngs: nnx.Rngs = None):
+  def __init__(self, config: Config, mesh: Mesh, *, rngs: nnx.Rngs = None):  # pyrefly: ignore[bad-function-definition]
     self.config = config
     self.mesh = mesh
     self.rngs = rngs
@@ -627,7 +631,7 @@ class Llama4VisionEncoderLayer(nnx.Module):
         num_kv_heads=self.config.num_attention_heads_for_vit,
         head_dim=self.config.hidden_size_for_vit // self.config.num_attention_heads_for_vit,
         max_target_length=(self.config.image_size_for_vit // self.config.patch_size_for_vit) ** 2 + 1,
-        attention_kernel="dot_product",
+        attention_kernel=self.config.attention_for_vit,
         inputs_q_shape=self.hidden_states_shape,
         inputs_kv_shape=self.hidden_states_shape,
         float32_qk_product=self.config.float32_qk_product,
@@ -686,7 +690,7 @@ class Llama4VisionEncoder(nnx.Module):
     mesh: Mesh, JAX device mesh (used for sharding)
   """
 
-  def __init__(self, config: Config, mesh: Mesh, *, rngs: nnx.Rngs = None):
+  def __init__(self, config: Config, mesh: Mesh, *, rngs: nnx.Rngs = None):  # pyrefly: ignore[bad-function-definition]
     self.config = config
     self.mesh = mesh
     self.rngs = rngs
@@ -718,7 +722,7 @@ class Llama4VisionModel(nnx.Module):
     mesh: Mesh, JAX device mesh (used for sharding)
   """
 
-  def __init__(self, config: Config, mesh: Mesh, *, rngs: nnx.Rngs = None):
+  def __init__(self, config: Config, mesh: Mesh, *, rngs: nnx.Rngs = None):  # pyrefly: ignore[bad-function-definition]
     self.config = config
     self.mesh = mesh
     self.rngs = rngs
@@ -797,14 +801,3 @@ class Llama4VisionModel(nnx.Module):
     hidden_states = jnp.reshape(hidden_states, [b, t, patch_num, patch_dim])
 
     return hidden_states
-
-
-def llama4visionmodel_as_linen(config: Config, mesh: Mesh) -> nn.Module:
-  return nnx_wrappers.to_linen(
-      Llama4VisionModel,
-      config=config,
-      mesh=mesh,
-      name="Llama4VisionModel_0",
-      abstract_init=False,
-      metadata_fn=initializers.variable_to_logically_partitioned,
-  )

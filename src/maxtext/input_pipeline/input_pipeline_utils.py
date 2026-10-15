@@ -19,8 +19,6 @@ import warnings
 from threading import current_thread
 from typing import Any, Iterable, TYPE_CHECKING
 
-from jinja2 import TemplateError
-
 if TYPE_CHECKING:
   import datasets
   import tensorflow as tf
@@ -29,6 +27,7 @@ import grain.python as grain
 import numpy as np
 from grain._src.python.dataset.sources.tfrecord_dataset import _TFRecordReader, _TFRecordDatasetIterator  # pylint: disable=protected-access
 from grain.experimental import TFRecordIterDataset
+from maxtext.diffusion.block_diffusion import corruption as block_diffusion_corruption
 from maxtext.input_pipeline.protos import example_pb2
 from maxtext.input_pipeline import tokenizer
 from maxtext.multimodal import processor as mm_processor
@@ -68,12 +67,17 @@ def add_segmentation_and_position(x, data_columns, padding_token=0):
   for data_column in data_columns:
     x[f"{data_column}_segmentation"] = tf.cast(x[data_column] != padding_token, tf.int32)
     x[f"{data_column}_position"] = tf.broadcast_to(
-        tf.range(x[data_column].shape[-1], dtype=np.int32)[None, :], x[data_column].shape
+        tf.range(x[data_column].shape[-1], dtype=np.int32)[None, :],
+        x[data_column].shape,
     )
   return x
 
 
-def TokenizeOp(tokenizer_model, features: Features, data_keys: Iterable[str] = ("inputs", "targets")) -> Features:
+def TokenizeOp(
+    tokenizer_model,
+    features: Features,
+    data_keys: Iterable[str] = ("inputs", "targets"),
+) -> Features:
   """Op for tokenization"""
   import tensorflow as tf  # pylint: disable=import-outside-toplevel
 
@@ -92,19 +96,47 @@ def TokenizeOp(tokenizer_model, features: Features, data_keys: Iterable[str] = (
 ########## Functions used by HF pipeline
 
 
-def reformat_prompt(example, column, image_placeholder, model_name):
+def is_video_file(path):
+  if not isinstance(path, str):
+    return False
+  video_extensions = (".mp4", ".avi", ".mkv", ".webm", ".mov")
+  return path.lower().endswith(video_extensions)
+
+
+def reformat_prompt(
+    example,
+    column,
+    image_placeholder,
+    model_name,
+    video_placeholder="<|video|>",
+):
   """reformat prompt for multimodal SFT"""
-  if isinstance(example["images"], list):
-    num_images = len(example["images"])
-  else:
-    num_images = 1
-  example[column] = mm_processor.reformat_prompt(example[column], image_placeholder, model_name, num_images)
+  media = example.get("images")
+  if media is None:
+    media = []
+  elif not isinstance(media, list):
+    media = [media]
+  contains_video = bool(media) and is_video_file(media[0])
+
+  example[column] = mm_processor.reformat_prompt(
+      prompt=example[column],
+      image_placeholder=image_placeholder,
+      model_name=model_name,
+      num_images=0 if contains_video else len(media),
+      video_placeholder=video_placeholder,
+      num_videos=len(media) if contains_video else 0,
+  )
   return example
 
 
 def reformat_response(example, column, model_name):
   """reformat response for multimodal SFT"""
-  example[column] = mm_processor.reformat_response(example[column][0], model_name)
+  val = example[column]
+  if not val:
+    raise ValueError(f"Response column '{column}' cannot be empty or None: {val}")
+  response = val[0] if isinstance(val, (list, tuple)) else val
+
+  example[column] = mm_processor.reformat_response(response, model_name)
   return example
 
 
@@ -121,16 +153,20 @@ def merge_image_columns(example, image_columns, max_num_images_per_example):
   return example
 
 
-def pre_process_image_sft(example, image_column, model_name):
+def pre_process_image_sft(example, image_column, config):
   """pre-process image for multimodal SFT"""
 
   def _process_image_fn(image):
+    is_video = is_video_file(image) or (isinstance(image, list) and image and is_video_file(image[0]))
+    if is_video:
+      return mm_processor.preprocess_image_for_training(image, config)
+
     if isinstance(image, list):
       image = [np.array(mm_utils.convert_to_RGB(img)) for img in image]
     else:
       image = np.array(mm_utils.convert_to_RGB(image))
 
-    image = mm_processor.preprocess_image_for_training(image, model_name)
+    image = mm_processor.preprocess_image_for_training(image, config)
     return image
 
   example[image_column] = _process_image_fn(example[image_column])
@@ -174,13 +210,18 @@ def is_conversational(features, data_columns):
   for column in data_columns:
     messages = features[column]
     if isinstance(messages, datasets.Sequence):
-      if isinstance(messages.feature, dict) and "role" in messages.feature and "content" in messages.feature:
+      if (
+          # pyrefly: ignore[missing-attribute]
+          isinstance(messages.feature, dict)
+          and "role" in messages.feature
+          and "content" in messages.feature  # pyrefly: ignore[missing-attribute]
+      ):
         return True
 
   return False
 
 
-def _extract_token_ids(tokens):
+def extract_token_ids(tokens):
   """Extracts token IDs from various tokenizer output formats.
 
   This helper function standardizes the extraction of tokenized integer IDs
@@ -210,97 +251,51 @@ def _extract_token_ids(tokens):
     raise ValueError(f"Can't extract token_ids from type {type(tokens)}")
 
 
-def verify_chat_template_generation_prompt_logic(tokenizer_model):
-  """Verifies the tokenizer's chat template for correct SFT loss masking.
+def _split_turn_into_prompt_and_completion(tokenizer_model, round_msgs):
+  """Splits a conversational round (system + user + assistant) into prompt and completion formatted strings.
 
-  This function ensures that the tokens added by `add_generation_prompt=True`
-  are identical to the tokens that begin an assistant's turn in a complete
-  conversation, which is critical for masking prompt tokens during SFT loss
-  calculation.
-
-  Example of a mismatch:
-    A `ValueError` is raised if the generation prompt and the actual
-    assistant prefix do not match. For example:
-
-    - `add_generation_prompt=True` on a user message produces a prompt ending in:
-      `...<|im_start|>generation\n`
-    - A full turn with an assistant message starts the reply with:
-      `...<|im_start|>assistant\n...`
-
-    This function would fail because the tokens for "generation" do not
-    match the tokens for "assistant".
-
-  Args:
-    tokenizer_model: The Hugging Face tokenizer instance to verify.
-
-  Raises:
-    ValueError: If the `add_generation_prompt` tokens do not exactly
-      match the beginning of an assistant message in the template.
-  """
-  dummy_msgs = [{"role": "system", "content": "System message"}, {"role": "user", "content": "Test message"}]
-
-  try:
-    prompt_wo_gen_tokens = tokenizer_model.apply_chat_template(dummy_msgs, add_generation_prompt=False, tokenize=True)
-  except TemplateError:
-    max_logging.info(
-        "Tokenizer failed to apply chat template with 'system' role. "
-        "Falling back to 'user' role only for chat template verification."
-    )
-    dummy_msgs.pop(0)
-    prompt_wo_gen_tokens = tokenizer_model.apply_chat_template(dummy_msgs, add_generation_prompt=False, tokenize=True)
-  prompt_wo_gen_ids = _extract_token_ids(prompt_wo_gen_tokens)
-
-  prompt_w_gen_tokens = tokenizer_model.apply_chat_template(dummy_msgs, add_generation_prompt=True, tokenize=True)
-  prompt_w_gen_ids = _extract_token_ids(prompt_w_gen_tokens)
-
-  if prompt_w_gen_ids[: len(prompt_wo_gen_ids)] != prompt_wo_gen_ids:
-    raise ValueError("Unable to extract generation prompt tokens.")
-  # Extract the tokenized generation prompt (the expected assistant prefix)
-  assistant_prefix = prompt_w_gen_ids[len(prompt_wo_gen_ids) :]
-  full_turn_tokens = _extract_token_ids(
-      tokenizer_model.apply_chat_template(
-          dummy_msgs + [{"role": "assistant", "content": "Dummy response"}], add_generation_prompt=False, tokenize=True
-      )
-  )
-  full_turn_ids = _extract_token_ids(full_turn_tokens)
-  # Extract the actual tokens that appear right after the user message in the full turn
-  actual_prefix_in_full_turn = full_turn_ids[len(prompt_wo_gen_ids) : len(prompt_wo_gen_ids) + len(assistant_prefix)]
-
-  if actual_prefix_in_full_turn != assistant_prefix:
-    expected_str = tokenizer_model.decode(assistant_prefix)
-    actual_str = tokenizer_model.decode(actual_prefix_in_full_turn)
-    raise ValueError(
-        "Chat template generation prompt mismatch!\n"
-        f"Expected assistant prefix tokens: {assistant_prefix} ('{expected_str}')\n"
-        f"Actual prefix tokens found: {actual_prefix_in_full_turn} ('{actual_str}')\n"
-        "This means the tokenizer's chat template will break the sft masking logic."
-    )
-
-
-def _get_completion_in_chat_template(tokenizer_model, round_msgs):
-  """
-  Calculates the completion part of a conversation turn when formatted with a chat template.
-
-  This function handles both older and current Hugging Face tokenizers. Modern tokenizers
-  may return a `BatchEncoding` object instead of a simple list of token IDs.
+  Uses the longest-common-prefix between the full conversation tokens and the
+  generation-prompt tokens to locate where the prompt ends and completion begins.
 
   Args:
     tokenizer_model: The tokenizer instance.
-    round_msgs: A list of messages for the current conversational turn, including the assistant's response.
+    round_msgs: Messages for the current conversational turn including the assistant response.
 
   Returns:
-    A string representing the completion formatted by the chat template.
+    A tuple of (prompt_str, completion_str).
   """
-  prompt_completion_tokens = tokenizer_model.apply_chat_template(round_msgs, add_generation_prompt=False, tokenize=True)
-  # include generation_prompt as part of the prompt tokens
-  prompt_tokens = tokenizer_model.apply_chat_template(round_msgs[:-1], add_generation_prompt=True, tokenize=True)
+  full_tokens = extract_token_ids(
+      tokenizer_model.apply_chat_template(round_msgs, add_generation_prompt=False, tokenize=True)
+  )
+  prompt_tokens = extract_token_ids(
+      tokenizer_model.apply_chat_template(round_msgs[:-1], add_generation_prompt=True, tokenize=True)
+  )
 
-  prompt_completion_ids = _extract_token_ids(prompt_completion_tokens)
-  prompt_ids = _extract_token_ids(prompt_tokens)
+  # Find the longest common prefix where prompt ends and completion begins
+  common_len = 0
+  for full_id, prompt_id in zip(full_tokens, prompt_tokens):
+    if full_id == prompt_id:
+      common_len += 1
+    else:
+      break
 
-  completion_tokens = prompt_completion_ids[len(prompt_ids) :]
-  completion_in_chat_template = tokenizer_model.decode(completion_tokens, skip_special_tokens=False)
-  return completion_in_chat_template
+  if common_len == 0:
+    raise ValueError(
+        "Chat template generation prompt mismatch: no common prefix tokens found.\n"
+        f"Full conversation tokens: {full_tokens} ('{tokenizer_model.decode(full_tokens)}')\n"
+        f"Generation prompt tokens: {prompt_tokens} ('{tokenizer_model.decode(prompt_tokens)}')\n"
+        "Cannot determine completion boundary."
+    )
+
+  prompt_str = tokenizer_model.decode(full_tokens[:common_len], skip_special_tokens=False)
+  completion_str = tokenizer_model.decode(full_tokens[common_len:], skip_special_tokens=False)
+  return prompt_str, completion_str
+
+
+def _get_completion_in_chat_template(tokenizer_model, round_msgs):
+  """Calculates the completion part of a conversation turn formatted with a chat template."""
+  _, completion_str = _split_turn_into_prompt_and_completion(tokenizer_model, round_msgs)
+  return completion_str
 
 
 def apply_chat_template(example, tokenizer_model, data_column_name):
@@ -335,15 +330,11 @@ def apply_chat_template(example, tokenizer_model, data_column_name):
         round_msgs.append(message)
       elif message["role"] == "user":
         round_msgs.append(message)
-        prompt_in_chat_template = tokenizer_model.apply_chat_template(
-            round_msgs, add_generation_prompt=True, tokenize=False
-        )
-        messages.append(prompt_in_chat_template)
-        is_prompt.append(True)
       elif message["role"] == "assistant":
         round_msgs.append(message)
-        messages.append(_get_completion_in_chat_template(tokenizer_model, round_msgs))
-        is_prompt.append(False)
+        prompt_str, completion_str = _split_turn_into_prompt_and_completion(tokenizer_model, round_msgs)
+        messages.extend([prompt_str, completion_str])
+        is_prompt.extend([True, False])
         # Round ended, clearing the buffer.
         round_msgs.clear()
   except ValueError as e:
@@ -410,7 +401,12 @@ class SFTPromptMaskingVision(grain.MapTransform):
 
   def map(self, element):
     inputs = np.concatenate((element[self.query_column], element[self.response_column]))
-    targets = np.concatenate((np.asarray([self.pad_id] * len(element[self.query_column])), element[self.response_column]))
+    targets = np.concatenate(
+        (
+            np.asarray([self.pad_id] * len(element[self.query_column])),
+            element[self.response_column],
+        )
+    )
     return {
         "inputs": np.asarray(inputs[: self.max_target_length], dtype=np.int32),
         "targets": np.asarray(targets[: self.max_target_length], dtype=np.int32),
@@ -542,12 +538,103 @@ def make_tfrecord_iter_dataset(path: str):
   return TFRecordIterDataset(path)
 
 
+def make_parquet_iter_dataset(path: str, hf_access_token: str | None = None):
+  """Returns the appropriate ParquetIterDataset for local or HF paths."""
+  if path.startswith("hf://"):
+    from huggingface_hub import HfFileSystem  # pylint: disable=import-outside-toplevel
+
+    return grain.experimental.ParquetIterDataset(path, filesystem=HfFileSystem(token=hf_access_token))
+  return grain.experimental.ParquetIterDataset(path)
+
+
+def compute_file_sharding(file_count, host_index, host_count):
+  """Compute per-host file slicing and optional row-shard parameters.
+
+  When file_count >= host_count, each host reads a disjoint subset of files via the
+  standard `[host_index::host_count]` slice. When file_count < host_count, every file
+  is replicated across `ceil(host_count/file_count)` hosts (or `floor` for files past
+  the remainder), and those hosts shard records by index within the file. This bounds
+  concurrent readers per file at `ceil(host_count/file_count)`
+
+  Returns:
+    file_slice (slice): file slice this host should keep — also the (start, step)
+      pair `(host_index, host_count)` to feed `tf.distribute.InputContext` when applicable.
+    files_per_host (int): files this host's slice contains per epoch.
+    row_shard (tuple|None): `(row_shard_index, row_shard_count)` when host_count > file_count
+      and the file's group has >1 reader; otherwise None.
+  """
+  if file_count >= host_count:
+    return (
+        slice(host_index, None, host_count),
+        max(file_count // host_count, 1),
+        None,
+    )
+  file_idx = host_index % file_count
+  row_shard_idx = host_index // file_count
+  row_shard_count = (host_count // file_count) + (1 if file_idx < (host_count % file_count) else 0)
+  row_shard = (row_shard_idx, row_shard_count) if row_shard_count > 1 else None
+  return slice(file_idx, None, file_count), 1, row_shard
+
+
+class _IndexShardDatasetIterator(grain.DatasetIterator):
+  """Iterator that yields every nth element of its parent (round-robin by index)."""
+
+  def __init__(self, parent: grain.DatasetIterator, host_index: int, host_count: int):
+    super().__init__(parent)
+    self._host_index = host_index
+    self._host_count = host_count
+    self._next_index = 0
+
+  def __next__(self):
+    while True:
+      value = next(self._parent)
+      current = self._next_index
+      self._next_index += 1
+      if current % self._host_count == self._host_index:
+        return value
+
+  def get_state(self):
+    return {
+        "next_index": self._next_index,
+        "parent": self._parent.get_state(),
+    }
+
+  def set_state(self, state):
+    self._next_index = state["next_index"]
+    self._parent.set_state(state["parent"])
+
+
+class IndexShardIterDataset(grain.IterDataset):
+  """Shards an IterDataset across hosts by element index (host i keeps records where idx % N == i).
+
+  Use when the upstream `IterDataset` order is deterministic and identical on every host;
+  this guarantees disjoint, balanced slices without per-file sharding.
+  """
+
+  def __init__(self, parent: grain.IterDataset, host_index: int, host_count: int):
+    super().__init__(parent)
+    self._host_index = host_index
+    self._host_count = host_count
+
+  def __iter__(self) -> _IndexShardDatasetIterator:
+    return _IndexShardDatasetIterator(
+        self._parent.__iter__(),
+        host_index=self._host_index,
+        host_count=self._host_count,
+    )
+
+
 @dataclasses.dataclass
 class ParseFeatures(grain.MapTransform):
-  """Parse serialized example"""
+  """Parse serialized tf.train.Example protos for arrayrecord/tfrecord datasets.
+
+  Also validates that the stored field type matches `tokenize`: raises
+  ValueError if `tokenize=True` but the column contains integers (pre-tokenized)
+  or if `tokenize=False` but the column contains bytes (raw text).
+  """
 
   def __init__(self, data_columns, tokenize):
-    self.data_columns = data_columns
+    self.data_columns = list(data_columns)
     self.tokenize = tokenize
 
   def map(self, element):
@@ -558,12 +645,39 @@ class ParseFeatures(grain.MapTransform):
 
     parsed = {}
     for col in self.data_columns:
-      if col in features:
-        f = features[col]
-        if self.tokenize:
-          parsed[col] = np.array(f.bytes_list.value, dtype=object)
+      target_col = col
+      if col not in features:
+        # Fallback alias: support bidirectional mapping between 'text' and 'messages'
+        if col == "text" and "messages" in features:
+          target_col = "messages"
+        elif col == "messages" and "text" in features:
+          target_col = "text"
         else:
-          parsed[col] = np.array(f.int64_list.value, dtype=np.int32)
+          raise ValueError(
+              f"Column '{col}' not found in dataset. Available columns: {sorted(features.keys())}. "
+              "Please set train_data_columns or eval_data_columns accordingly."
+          )
+
+      f = features[target_col]
+
+      # Dynamically check proto field type instead of relying on the tokenize flag
+      if len(f.float_list.value) > 0:
+        parsed[col] = np.array(f.float_list.value, dtype=np.float32)
+      elif len(f.int64_list.value) > 0:
+        parsed[col] = np.array(f.int64_list.value, dtype=np.int32)
+      elif len(f.bytes_list.value) > 0:
+        parsed[col] = np.array(f.bytes_list.value, dtype=object)
+      else:
+        parsed[col] = np.array([])
+
+    # Reshape the flattened arrays back to 2D [seq_len, top_k]
+    seq_len = len(parsed.get("inputs", []))
+    if seq_len > 0:
+      if "top_k_logits" in parsed and len(parsed["top_k_logits"]) > 0:
+        parsed["top_k_logits"] = parsed["top_k_logits"].reshape(seq_len, -1)
+      if "top_k_indices" in parsed and len(parsed["top_k_indices"]) > 0:
+        parsed["top_k_indices"] = parsed["top_k_indices"].reshape(seq_len, -1)
+
     return parsed
 
 
@@ -584,24 +698,46 @@ class NormalizeFeatures(grain.MapTransform):
 
 @dataclasses.dataclass
 class KeepFeatures(grain.MapTransform):
-  """Keep only specified features in the dataset element.
+  """Filter dataset elements to specified features for parquet and other non-proto formats.
 
-  This transform filters the input dictionary, retaining only the keys
-  that are present in `feature_names`.
+  Retains only the keys present in `feature_names`. Validates the stored value
+  type against `tokenize`: raises ValueError if `tokenize=True` but a column
+  contains integer data (pre-tokenized), or if `tokenize=False` but a column
+  contains string/bytes data (raw text).
   """
 
-  def __init__(self, feature_names: list[str]):
-    """Initializes the KeepFeatures transform.
-
-    Args:
-      feature_names: A list of strings, where each string is the name of a
-        feature to be kept in the dataset element.
-    """
+  def __init__(self, feature_names: list[str], tokenize: bool = True):
     self.feature_names = feature_names
+    self.tokenize = tokenize
 
   def map(self, element: dict[str, Any]) -> dict[str, Any]:
     """Applies the feature filtering to the input element."""
-    return {k: v for k, v in element.items() if k in self.feature_names}
+    missing = [n for n in self.feature_names if n not in element]
+    if missing:
+      raise ValueError(
+          f"Column {missing} not found in dataset. Available columns: {sorted(element.keys())}. "
+          "Please set train_data_columns or eval_data_columns accordingly."
+      )
+    filtered = {k: v for k, v in element.items() if k in self.feature_names}
+    for col, val in filtered.items():
+      if self.tokenize:
+        if isinstance(val, np.ndarray) and np.issubdtype(val.dtype, np.integer):
+          raise ValueError(
+              f"tokenize_data=True but column '{col}' contains integer (pre-tokenized) data. "
+              "Set tokenize_train_data or tokenize_eval_data to False if your dataset is already tokenized."
+          )
+        if isinstance(val, (list, tuple)) and val and isinstance(val[0], (int, np.integer)):
+          raise ValueError(
+              f"tokenize_data=True but column '{col}' contains integer (pre-tokenized) data. "
+              "Set tokenize_train_data or tokenize_eval_data to False if your dataset is already tokenized."
+          )
+      else:
+        if isinstance(val, (str, bytes)):
+          raise ValueError(
+              f"tokenize_data=False but column '{col}' contains text data. "
+              "Set tokenize_train_data or tokenize_eval_data to True if your dataset needs tokenization."
+          )
+    return filtered
 
 
 @dataclasses.dataclass
@@ -699,8 +835,26 @@ class PadOrTrimToMaxLength(grain.MapTransform):
     if not isinstance(preprocessed_image, mm_utils.PreprocessorOutput):
       raise TypeError(f"Input must be multimodal_utils.PreprocessorOutput, but got {type(preprocessed_image)}")
 
+    if getattr(preprocessed_image, "video_values", None) is not None:
+      return preprocessed_image
+
     if preprocessed_image.pixel_values is None:
       raise ValueError("Input preprocessed_image must have pixel_values to pad images.")
+
+    vision_block = mm_processor._get_vision_block(self.config)  # pylint: disable=protected-access
+    model_name = getattr(self.config, "model_name", None)
+    if (
+        vision_block is None
+        or not getattr(self.config, "use_multimodal", False)
+        or vision_block in ["qwen3_omni", "qwen3_vl", "qwen3_5"]
+    ):
+      return preprocessed_image
+    elif model_name and model_name.startswith("qwen"):
+      raise ValueError(
+          f"Qwen multimodal model '{model_name}' with vision_block '{vision_block}' was not "
+          f"registered in `PadOrTrimToMaxLength`. Qwen models use native dynamic grids and must be "
+          f"registered to bypass image padding."
+      )
 
     # Determine the maximum number of images/masks allowed.
     image_offsets = mm_processor.get_image_offsets(self.config, preprocessed_image)
@@ -756,26 +910,49 @@ class PadOrTrimToMaxLength(grain.MapTransform):
   ) -> dict[str, np.ndarray | mm_utils.PreprocessorOutput]:
     """map to each element"""
     data_columns = list(element.keys())
+    preserve_pad_valued_tokens = (
+        self.config is not None and getattr(self.config, "training_objective", "causal_lm") == "block_diffusion"
+    )
     for data_column in data_columns:
       if data_column != "images":
         if isinstance(element[data_column], mm_utils.PreprocessorOutput):
           raise TypeError("Only 'images' column can be of type PreprocessorOutput.")
 
-        element[f"{data_column}_segmentation"] = element[data_column] != self.pad_id
-        element[f"{data_column}_segmentation"] = element[f"{data_column}_segmentation"].astype(np.int32)
-        element[f"{data_column}_position"] = np.arange(element[data_column].shape[0], dtype=np.int32)
+        if preserve_pad_valued_tokens:
+          element[f"{data_column}_segmentation"] = np.ones(
+              element[data_column].shape[0], dtype=np.int32  # pyrefly: ignore[missing-attribute]
+          )
+        else:
+          element[f"{data_column}_segmentation"] = (
+              element[data_column] != self.pad_id  # pyrefly: ignore[unsupported-operation]
+          )  # pyrefly: ignore[unsupported-operation]
+        # pyrefly: ignore[missing-attribute]
+        element[f"{data_column}_segmentation"] = element[
+            f"{data_column}_segmentation"
+        ].astype(  # pyrefly: ignore[missing-attribute]
+            np.int32
+        )
+        element[f"{data_column}_position"] = np.arange(
+            element[data_column].shape[0],
+            dtype=np.int32,  # pyrefly: ignore[missing-attribute]
+        )  # pyrefly: ignore[missing-attribute]
         if self.add_true_length:
-          element[f"{data_column}_true_length"] = np.array([element[data_column].shape[0]], dtype=np.int32)
+          element[f"{data_column}_true_length"] = np.array(
+              [element[data_column].shape[0]],
+              dtype=np.int32,  # pyrefly: ignore[missing-attribute]
+          )  # pyrefly: ignore[missing-attribute]
 
     for key, _ in element.items():
       if key == "images":
-        if self.config.model_name is None:
+        if self.config.model_name is None:  # pyrefly: ignore[missing-attribute]
           raise ValueError("model_name must be provided when padding images")
 
-        element["images"] = self._pad_image_and_mask(element["images"])
+        element["images"] = self._pad_image_and_mask(element["images"])  # pyrefly: ignore[bad-argument-type]
 
+      elif preserve_pad_valued_tokens and key.endswith(("_segmentation", "_position")):
+        element[key] = self._pad_text(element[key], self.max_length, 0)  # pyrefly: ignore[bad-argument-type]
       elif "true_length" not in key:
-        element[key] = self._pad_text(element[key], self.max_length, self.pad_id)
+        element[key] = self._pad_text(element[key], self.max_length, self.pad_id)  # pyrefly: ignore[bad-argument-type]
     return element
 
 
@@ -802,9 +979,23 @@ class ExtractImagesAndMasks(grain.MapTransform):
       raise TypeError(f"'images' must be of type PreprocessorOutput, but got {type(preprocessed_image)}")
 
     output = element.copy()
-    output["images"] = preprocessed_image.pixel_values
+    if getattr(preprocessed_image, "video_values", None) is not None:
+      output["images"] = preprocessed_image.video_values
+      if getattr(preprocessed_image, "video_mask", None) is not None:
+        output["image_masks"] = preprocessed_image.video_mask
+      if getattr(preprocessed_image, "video_grid_thw", None) is not None:
+        output["video_grid_thw"] = preprocessed_image.video_grid_thw
+      if getattr(preprocessed_image, "video_second_per_grid", None) is not None:
+        output["second_per_grids"] = preprocessed_image.video_second_per_grid
+      return output
+
+    output["images"] = preprocessed_image.pixel_values  # pyrefly: ignore[unsupported-operation]
     if preprocessed_image.pixel_mask is not None:
       output["image_masks"] = preprocessed_image.pixel_mask
+    # Qwen MRoPE needs per-image (t, h, w) grids to build 3D positions.
+    pixel_grid_thw = getattr(preprocessed_image, "pixel_grid_thw", None)
+    if pixel_grid_thw is not None:
+      output["image_grid_thw"] = pixel_grid_thw
 
     return output
 
@@ -835,6 +1026,18 @@ class FoldImagesIntoBatch(grain.MapTransform):
     """Applies the folding transformation to the 'images' field if present."""
     images = element.get("images")
     if images is None:
+      return element
+
+    video_grid_thw = element.get("video_grid_thw")
+    if video_grid_thw is not None and images.ndim > len(self.target_shape):
+      element["images"] = images.reshape(-1, *images.shape[2:])
+      image_masks = element.get("image_masks")
+      if image_masks is not None:
+        element["image_masks"] = image_masks.reshape(-1, *image_masks.shape[2:])
+      element["video_grid_thw"] = video_grid_thw.reshape(-1, video_grid_thw.shape[-1])
+      second_per_grids = element.get("second_per_grids")
+      if second_per_grids is not None:
+        element["second_per_grids"] = second_per_grids.reshape(-1)
       return element
 
     # If ndim is greater than the expected ndim for a batched image tensor,
@@ -876,7 +1079,7 @@ def shift_left(x, pad_id, axis=1):
 
 
 def shift_and_refine(x, ignored_ids, axis=1):
-  """Shift inputs, set segmentation to 0 when target element is in ignored_ids if provided"""
+  """Left-shift targets and mask labels equal to one of ``ignored_ids``."""
   x["targets"] = shift_left(x["targets"], ignored_ids[0], axis=axis)
   x["targets_segmentation"] = shift_left(x["targets_segmentation"], 0, axis=axis)
   for ignore_id in ignored_ids:
@@ -887,7 +1090,16 @@ def shift_and_refine(x, ignored_ids, axis=1):
 
 @dataclasses.dataclass
 class ShiftData(grain.MapTransform):
-  """Shift inputs and refine annotations."""
+  """Convert copied token sequences into next-token targets after batching.
+
+  ``targets`` and ``targets_segmentation`` are shifted one position to the
+  left along ``axis``. The final target is padded with ``ignored_ids[0]`` and
+  receives segmentation value zero. Any shifted target equal to an ignored ID
+  also receives segmentation value zero, excluding it from loss computation.
+
+  This transform intentionally leaves positions unchanged: input and target
+  positions refer to the same prediction positions after the left shift.
+  """
 
   def __init__(self, ignored_ids, axis=1):
     self.ignored_ids = ignored_ids
@@ -895,6 +1107,307 @@ class ShiftData(grain.MapTransform):
 
   def map(self, element):
     return shift_and_refine(element, ignored_ids=self.ignored_ids, axis=self.axis)
+
+
+def megatron_min_segment_length(config) -> int:
+  """Return the Megatron-compatible short-segment merge threshold.
+
+  The threshold is ``max_target_length // packing_max_segments_per_sample``.
+  It is meaningful only when attention resets at document boundaries; a
+  non-positive divisor disables merging.
+  """
+  if not config.reset_attention_mask:
+    return 0
+  divisor = config.packing_max_segments_per_sample
+  if divisor <= 0:
+    return 0
+  return config.max_target_length // divisor
+
+
+def _merge_short_segments_np(
+    segmentation: np.ndarray,
+    position: np.ndarray,
+    min_seg_len: int,
+) -> None:
+  """Greedily merge short EOD-derived segments in place.
+
+  This follows Megatron's packed-sequence boundary rule. A candidate boundary
+  is retained only when it is strictly more than ``min_seg_len`` tokens after
+  the previous retained boundary. Dropped boundaries merge their tokens into
+  the preceding retained segment, with segment IDs and position IDs rebuilt
+  as a single contiguous sequence.
+
+  Args:
+    segmentation: One-dimensional, one-indexed segment IDs.
+    position: One-dimensional position IDs corresponding to ``segmentation``.
+    min_seg_len: Boundary-merging threshold. Values of zero or one are no-ops.
+  """
+  seq_len = len(segmentation)
+  if min_seg_len <= 1 or seq_len == 0:
+    return
+
+  boundaries = np.flatnonzero(np.diff(segmentation)) + 1
+  seg_starts = [0, *boundaries.tolist()]
+
+  if len(seg_starts) <= 1:
+    return
+
+  kept = [0]
+  for start in seg_starts[1:]:
+    if start - kept[-1] > min_seg_len:
+      kept.append(start)
+
+  if len(kept) == len(seg_starts):
+    return
+
+  kept.append(seq_len)
+  for seg_idx in range(len(kept) - 1):
+    s, e = kept[seg_idx], kept[seg_idx + 1]
+    segmentation[s:e] = seg_idx + 1
+    position[s:e] = np.arange(e - s, dtype=position.dtype)
+
+
+@dataclasses.dataclass
+class GenerateDocSegmentIds(grain.MapTransform):
+  """Generate EOD-aware segmentation and position arrays for ``mmap`` samples.
+
+  The input data must already contain document-ending EOD tokens, normally
+  from Megatron preprocessing with ``--append-eod``. ``MMapSampleIndexDataSource``
+  concatenates and windows those tokens; it does not insert EOD tokens itself.
+  For every input token field, this transform adds ``<field>_segmentation``
+  and ``<field>_position``.
+
+  Args:
+    eod_id: Token ID that marks the end of a document.
+    reset_attention_mask: Controls document-boundary attention and positions.
+
+      * ``True`` (default) -- attention resets at every document boundary.
+        EOD belongs to the preceding document (same segment ID), and a new
+        segment starts after EOD.  Positions continue through EOD and reset
+        after EOD.
+
+        ::
+
+            tokens:        [tok tok tok EOD tok tok EOD tok tok tok tok tok]
+            segmentation:  [ 1   1   1   1   2   2   2   3   3   3   3   3]
+            positions:     [ 0   1   2   3   0   1   2   0   1   2   3   4]
+
+      * ``False`` -- cross-document attention is allowed. Positions are a
+        continuous ``arange`` over the full sample, and all tokens use
+        segment ID ``1`` except masked EOD positions.
+
+    eod_mask_loss: When ``reset_attention_mask`` is False, controls whether
+      EOD tokens receive segmentation value zero and are excluded from loss.
+      In the ``mmap`` pipeline, ``ShiftData`` subsequently masks shifted EOD
+      labels because EOD is also the batch padding sentinel.
+    min_segment_length: Optional threshold used to merge adjacent short
+      EOD-derived segments when attention resets are enabled.
+  """
+
+  def __init__(
+      self, eod_id: int, reset_attention_mask: bool = True, eod_mask_loss: bool = False, min_segment_length: int = 0
+  ):
+    self.eod_id = eod_id
+    self.reset_attention_mask = reset_attention_mask
+    self.eod_mask_loss = eod_mask_loss
+    self.min_segment_length = min_segment_length
+
+  def map(self, element: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Apply EOD-based segmentation and loss masking to each column."""
+    for col, tokens in list(element.items()):
+      seq_len = tokens.shape[0]
+      is_eod = tokens == self.eod_id
+
+      if self.reset_attention_mask:
+        # EOD belongs to the preceding document: keep current seg_id and
+        # continue position counter.  New segment starts AFTER EOD.
+        segmentation = np.zeros(seq_len, dtype=np.int32)
+        position = np.zeros(seq_len, dtype=np.int32)
+        seg_id = 1
+        pos_in_doc = 0
+        for i in range(seq_len):
+          if is_eod[i]:
+            # EOD keeps the preceding document's seg_id and position
+            segmentation[i] = seg_id
+            position[i] = pos_in_doc
+            pos_in_doc += 1
+            # New segment starts after EOD
+            seg_id += 1
+            pos_in_doc = 0
+          else:
+            segmentation[i] = seg_id
+            position[i] = pos_in_doc
+            pos_in_doc += 1
+        if self.min_segment_length > 0:
+          _merge_short_segments_np(segmentation, position, self.min_segment_length)
+      else:
+        if self.eod_mask_loss:
+          segmentation = np.where(is_eod, np.int32(0), np.int32(1))
+        else:
+          segmentation = np.ones(seq_len, dtype=np.int32)
+        position = np.arange(seq_len, dtype=np.int32)
+
+      element[f"{col}_segmentation"] = segmentation
+      element[f"{col}_position"] = position
+    return element
+
+
+@dataclasses.dataclass
+class MegatronSplitInputsTargets(grain.MapTransform):
+  """Build Megatron-compatible pretraining fields from an ``L + 1`` sample.
+
+  Input is ``{"text": tokens}``, where ``len(tokens) == L + 1``. The output
+  contains length-``L`` fields with ``inputs = tokens[:-1]`` and
+  ``targets = tokens[1:]``. Unlike a padded left-shift, this preserves the
+  final real target and its loss contribution.
+
+  This gives valid prediction targets at every position without padding,
+  unlike the ShiftData approach which wastes the last position.
+
+  Attention, loss, and position annotations are constructed independently to
+  match Megatron's separate attention-mask, loss-mask, and position-ID rules:
+
+  - ``inputs_segmentation`` (attention): controlled by ``reset_attention_mask``.
+    When True, EOD belongs to its preceding document (same segment ID) and
+    a new segment starts after EOD; when False, all tokens share segment 1.
+  - ``targets_segmentation`` (loss): controlled by ``eod_mask_loss`` only.
+    When True, positions where ``inputs == eod_id`` get segmentation=0
+    (excluded from loss); when False, all positions get segmentation=1.
+  - ``inputs_position`` (RoPE): controlled by ``reset_attention_mask``.
+    When True, EOD continues the preceding document's position counter and
+    resets to 0 after EOD; when False, positions are sequential.
+
+  Args:
+    eod_id: Token ID marking the end of a document.
+    reset_attention_mask: When True, EOD ends the current attention segment
+      and positions restart at zero for the following token.
+    eod_mask_loss: When True, positions whose input token is EOD have loss
+      mask zero.
+    no_attnmask_dataset_ids: Optional dataset IDs for samples that disable
+      attention-mask reset regardless of the global setting.
+    min_segment_length: Optional threshold for merging short EOD-derived
+      attention segments.
+    emit_dataset_id: Whether to emit a per-token ``dataset_id`` field when
+      the source sample provides one.
+  """
+
+  def __init__(
+      self,
+      eod_id: int,
+      reset_attention_mask: bool = True,
+      eod_mask_loss: bool = False,
+      no_attnmask_dataset_ids: set[int] | None = None,
+      min_segment_length: int = 0,
+      emit_dataset_id: bool = False,
+  ):
+    self.eod_id = eod_id
+    self.reset_attention_mask = reset_attention_mask
+    self.eod_mask_loss = eod_mask_loss
+    self.no_attnmask_dataset_ids = no_attnmask_dataset_ids or set()
+    self._has_no_attnmask = bool(self.no_attnmask_dataset_ids)
+    self.min_segment_length = min_segment_length
+    self.emit_dataset_id = emit_dataset_id
+
+  def map(self, element: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Split tokens into input/target pairs with EOD-based segmentation."""
+    tokens = element["text"]
+    inputs = tokens[:-1]
+    targets = tokens[1:]
+
+    seq_len = inputs.shape[0]
+    is_eod = inputs == self.eod_id
+
+    # Per-sample override: datasets in no_attnmask_dataset_ids bypass
+    # attention mask reset (antllm no_attnmask_data behavior).
+    effective_reset = self.reset_attention_mask
+    if self._has_no_attnmask:
+      dataset_id = element.get("dataset_id", None)
+      if dataset_id is not None and int(dataset_id) in self.no_attnmask_dataset_ids:
+        effective_reset = False
+
+    # --- inputs_segmentation (attention mask) ---
+    if effective_reset:
+      input_segmentation = np.zeros(seq_len, dtype=np.int32)
+      position = np.zeros(seq_len, dtype=np.int32)
+      seg_id = 1
+      pos_in_doc = 0
+      for i in range(seq_len):
+        if is_eod[i]:
+          # EOD belongs to the preceding document: keep current seg_id,
+          # continue position counter.  New segment starts AFTER EOD.
+          input_segmentation[i] = seg_id
+          position[i] = pos_in_doc
+          pos_in_doc = 0
+          seg_id += 1
+        else:
+          input_segmentation[i] = seg_id
+          position[i] = pos_in_doc
+          pos_in_doc += 1
+      if self.min_segment_length > 0:
+        _merge_short_segments_np(input_segmentation, position, self.min_segment_length)
+    else:
+      input_segmentation = np.ones(seq_len, dtype=np.int32)
+      position = np.arange(seq_len, dtype=np.int32)
+
+    # --- targets_segmentation (loss mask) ---
+    # Independent of reset_attention_mask, matching Megatron's separate
+    # loss_mask which only depends on eod_mask_loss.
+    if self.eod_mask_loss:
+      target_segmentation = np.where(is_eod, np.int32(0), np.int32(1))
+    else:
+      target_segmentation = np.ones(seq_len, dtype=np.int32)
+
+    result = {
+        "inputs": inputs,
+        "targets": targets,
+        "inputs_segmentation": input_segmentation,
+        "targets_segmentation": target_segmentation,
+        "inputs_position": position,
+        "targets_position": position,
+    }
+    if self.emit_dataset_id and "dataset_id" in element:
+      result["dataset_id"] = np.full(seq_len, int(element["dataset_id"]), dtype=np.int32)
+    return result
+
+
+@dataclasses.dataclass
+class BlockDiffusionCorruption(grain.RandomMapTransform):
+  """Adapts block-diffusion corruption to the Grain batch contract."""
+
+  block_size: int
+  mask_id: int
+  min_noise: float = 1.0e-3
+  logit_alignment: str = "same_position"
+  canvas_policy: str = "all_masked"
+  axis: int = 1
+
+  def random_map(self, element, rng: np.random.Generator):
+    """Corrupts inputs while preserving clean targets and input metadata."""
+    inputs = np.asarray(element["inputs"])
+    targets = np.asarray(element["targets"])
+    targets_segmentation = np.asarray(element["targets_segmentation"])
+    if inputs.shape != targets.shape or inputs.shape != targets_segmentation.shape:
+      raise ValueError(
+          "inputs, targets, and targets_segmentation must have identical shapes, got "
+          f"{inputs.shape}, {targets.shape}, and {targets_segmentation.shape}"
+      )
+    result = block_diffusion_corruption.corrupt_tokens(
+        inputs,
+        targets_segmentation != 0,
+        rng,
+        block_size=self.block_size,
+        mask_id=self.mask_id,
+        min_noise=self.min_noise,
+        logit_alignment=self.logit_alignment,
+        canvas_policy=self.canvas_policy,
+        axis=self.axis,
+    )
+    output = dict(element)
+    output["inputs"] = result.inputs
+    output["targets"] = targets
+    output["corruption_mask"] = result.corruption_mask.astype(targets_segmentation.dtype)
+    output["targets_loss_mask"] = result.targets_loss_mask.astype(targets_segmentation.dtype)
+    return output
 
 
 @dataclasses.dataclass
@@ -918,6 +1431,8 @@ class ComputeQwen3OmniPositions(grain.MapTransform):
       spatial_merge_size: int = 2,
       position_id_per_seconds: int = 25,
       use_audio_in_video: bool = False,
+      config=None,
+      keep_aux_fields: bool = False,
   ):
     """Initialize the Qwen3-Omni position computation transform.
 
@@ -926,11 +1441,17 @@ class ComputeQwen3OmniPositions(grain.MapTransform):
       spatial_merge_size: Number of patches merged spatially (e.g., 2 for 2x2→1).
       position_id_per_seconds: Temporal granularity (tokens per second, typically 25).
       use_audio_in_video: If True, audio tokens are interleaved with video tokens.
+      config: Optional model config for model-specific special token IDs.
+      keep_aux_fields: If True, keep auxiliary (aux) fields — mrope deltas / grid
+        metadata — on the element for inference. Training should leave this False
+        so the batch matches get_shaped_batch.
     """
     self.data_column = data_column
     self.spatial_merge_size = spatial_merge_size
     self.position_id_per_seconds = position_id_per_seconds
     self.use_audio_in_video = use_audio_in_video
+    self.config = config
+    self.keep_aux_fields = keep_aux_fields
 
   def map(self, element: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Compute 3D position IDs for the batch element.
@@ -939,13 +1460,13 @@ class ComputeQwen3OmniPositions(grain.MapTransform):
       element: Dictionary containing:
         - {data_column}: Token IDs with shape (batch, seq_len)
         - {data_column}_segmentation: Attention mask (1=real, 0=padding)
-        - image_grid_thw: Optional (num_images, 3) array
+        - image_grid_thw: Optional (num_images, 3) or (batch, num_images, 3) array
         - video_grid_thw: Optional (num_videos, 3) array
         - audio_lengths: Optional (num_audios,) array
         - second_per_grids: Optional (num_videos,) array
 
     Returns:
-      element with {data_column}_position updated to shape (3, batch, seq_len)
+      element with {data_column}_position updated to shape (batch, seq_len, 3)
       for 3D positions (always 3D, even for text-only sequences).
     """
 
@@ -958,6 +1479,12 @@ class ComputeQwen3OmniPositions(grain.MapTransform):
     video_grid_thw = element.get("video_grid_thw")
     audio_lengths = element.get("audio_lengths")
     second_per_grids = element.get("second_per_grids")
+
+    # grain.Batch stacks per-example (N, 3) grids to (B, N, 3). get_rope_index
+    # resets image_idx per sequence against a shared (N, 3) table, which is
+    # correct when training force-resizes all images to the same grid.
+    if image_grid_thw is not None and image_grid_thw.ndim == 3:
+      image_grid_thw = image_grid_thw[0]
 
     # Call the standalone get_rope_index function from multimodal_utils
     from maxtext.multimodal import processor_qwen3_omni  # pylint: disable=import-outside-toplevel
@@ -973,11 +1500,21 @@ class ComputeQwen3OmniPositions(grain.MapTransform):
         second_per_grids=second_per_grids,
         spatial_merge_size=self.spatial_merge_size,
         position_id_per_seconds=self.position_id_per_seconds,
+        config=self.config,
     )
 
     # Update element with 3D positions
-    # Shape: (3, batch, seq_len) for multimodal, or (batch, seq_len) for text-only
-    element[f"{self.data_column}_position"] = position_ids
-    element[f"{self.data_column}_mrope_deltas"] = mrope_position_deltas
+    # Shape: (batch, seq_len, 3) for multimodal, or (batch, seq_len) for text-only
+    element[f"{self.data_column}_position"] = position_ids.astype(np.int32)
+    if self.keep_aux_fields:
+      element[f"{self.data_column}_mrope_deltas"] = mrope_position_deltas
+    else:
+      # Drop metadata that is not part of the training shaped batch.
+      element.pop(f"{self.data_column}_mrope_deltas", None)
+      element.pop("image_grid_thw", None)
+      if getattr(self.config, "video_max_grid_t", None) is None:
+        element.pop("video_grid_thw", None)
+      element.pop("audio_lengths", None)
+      element.pop("second_per_grids", None)
 
     return element

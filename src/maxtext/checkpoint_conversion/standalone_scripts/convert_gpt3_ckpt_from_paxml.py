@@ -39,19 +39,20 @@ import gc
 import os
 import sys
 
+from flax import nnx
 import jax
 from jax import random
 from jax.sharding import Mesh
 from maxtext.configs import pyconfig
 from maxtext.utils.globals import MAXTEXT_PKG_DIR
 from maxtext.common import checkpointing
-from maxtext.common.common_types import MODEL_MODE_TRAIN
-from maxtext.layers import quantizations
-from maxtext.models.models import transformer_as_linen
-from maxtext.optimizers import optimizers
+from maxtext.common import train_state_nnx
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
+from maxtext.utils import maxtext_utils_nnx
+from maxtext.utils import model_creation_utils
+from maxtext.utils import train_utils
 import numpy as np
 from psutil import Process
 import tensorstore as ts
@@ -86,10 +87,15 @@ def convert(paxml_ckpt_path, maxtext_model_name, base_output_directory, run_name
   devices_array = maxtext_utils.create_device_mesh(cfg)
   mesh = Mesh(devices_array, cfg.mesh_axes)
 
-  quant = quantizations.configure_quantization(cfg)
-  model = transformer_as_linen(cfg, mesh, quant=quant, model_mode=MODEL_MODE_TRAIN)
-  learning_rate_schedule = maxtext_utils.create_learning_rate_schedule(cfg)
-  tx = optimizers.get_optimizer(cfg, learning_rate_schedule)
+  rngs = maxtext_utils_nnx.create_nnx_rngs(cfg, rng_key=init_rng)
+  model = model_creation_utils.from_config(cfg, mesh=mesh, rngs=rngs)
+  _, tx = train_utils.create_training_optimizer(cfg, model)
+  _create_model_partial, _ = model_creation_utils.create_nnx_abstract_model(cfg, mesh)
+
+  def init_state_fn():
+    nnx_model = _create_model_partial()
+    optimizer = nnx.Optimizer(nnx_model, tx, wrt=nnx.Param)
+    return train_state_nnx.TrainStateNNX(nnx_model, optimizer)
 
   checkpoint_manager = checkpointing.create_orbax_checkpoint_manager(
       cfg.checkpoint_dir,
@@ -98,7 +104,10 @@ def convert(paxml_ckpt_path, maxtext_model_name, base_output_directory, run_name
       cfg.checkpoint_period,
   )
 
-  state, _, _, _ = maxtext_utils.setup_training_state(model, None, tx, cfg, init_rng, mesh, checkpoint_manager)
+  state, _, _, _, _ = maxtext_utils.setup_training_state(None, cfg, mesh, checkpoint_manager, init_state_fn)
+  state = train_state_nnx.to_checkpoint_dict(state)
+  state.pop("nnx_aux", None)
+
   max_logging.log("start")
   max_utils.print_mem_stats("After params initialized")
 
@@ -183,8 +192,8 @@ def convert(paxml_ckpt_path, maxtext_model_name, base_output_directory, run_name
   }
 
   state_map = {
-      ".step": ("step", None),
-      ".opt_state.count": ("opt_states_0.no_prefix_0.count", None),
+      "['step']": ("step", None),
+      "['opt_state']['count']": ("opt_states_0.no_prefix_0.count", None),
   }
 
   def get_layer_prefix(keystr_pax):
@@ -197,16 +206,16 @@ def convert(paxml_ckpt_path, maxtext_model_name, base_output_directory, run_name
     return prefix_pax_opt_state
 
   for keystr_maxtext, (keystr_pax, transform_fn) in keystr_map.items():
-    # model variable
-    state_map[f".params['params']{keystr_maxtext}"] = (f"mdl_vars{keystr_pax}", transform_fn)
     prefix_pax_opt_state = get_layer_prefix(keystr_pax)
-    # first momentum in optimizer state
-    state_map[f".opt_state.mu['params']{keystr_maxtext}"] = (
+    state_map[f"['params']['params']{keystr_maxtext}"] = (
+        f"mdl_vars{keystr_pax}",
+        transform_fn,
+    )
+    state_map[f"['opt_state']['mu']['params']{keystr_maxtext}"] = (
         f"opt_states_0.{prefix_pax_opt_state}.m{keystr_pax}",
         transform_fn,
     )
-    # second momentum in optimizer state
-    state_map[f".opt_state.nu['params']{keystr_maxtext}"] = (
+    state_map[f"['opt_state']['nu']['params']{keystr_maxtext}"] = (
         f"opt_states_0.{prefix_pax_opt_state}.v{keystr_pax}",
         transform_fn,
     )
@@ -261,11 +270,12 @@ def convert(paxml_ckpt_path, maxtext_model_name, base_output_directory, run_name
   max_logging.log("converted state finished")
   max_utils.print_mem_stats("converted state finished")
 
-  if checkpointing.save_checkpoint(checkpoint_manager, converted_state.step, converted_state):
-    max_logging.log(f"saved a checkpoint at step {converted_state.step}")
+  step_value = int(converted_state["step"]) if isinstance(converted_state, dict) else int(converted_state.step)
+  if checkpointing.save_checkpoint(checkpoint_manager, step_value, converted_state, config=cfg):
+    max_logging.log(f"Saved a checkpoint at step {step_value}.")
   # Upon preemption, exit when and only when all ongoing saves are complete.
-  if checkpoint_manager.reached_preemption(converted_state.step):
-    checkpoint_manager.wait_until_finished()
+  if checkpointing.reached_preemption(checkpoint_manager, step_value):
+    checkpointing.wait_until_finished(checkpoint_manager)
     sys.exit()
 
   max_logging.log(f"Peak cpu memory in a single process: {fmt_size(memory_metrics['max_cpu_bytes'])}")
@@ -280,7 +290,12 @@ if __name__ == "__main__":
       default="gs://mlperf-llm-public2/gpt3_spmd1x64x24_tpuv4-3072_v84_20221101/checkpoints/checkpoint_00004000",
       required=True,
   )
-  parser.add_argument("--maxtext-model-name", choices=["gpt3-175b", "gpt3-52k"], type=str, required=True)
+  parser.add_argument(
+      "--maxtext-model-name",
+      choices=["gpt3-175b", "gpt3-52k"],
+      type=str,
+      required=True,
+  )
   parser.add_argument("--base-output-directory", type=str, required=True)
   parser.add_argument("--run-name", type=str, required=True)
 
@@ -288,4 +303,9 @@ if __name__ == "__main__":
   if not args.paxml_ckpt_path.startswith("gs://"):
     raise ValueError("--paxml-ckpt-path should be a gcs path starting with gs://")
 
-  convert(args.paxml_ckpt_path, args.maxtext_model_name, args.base_output_directory, args.run_name)
+  convert(
+      args.paxml_ckpt_path,
+      args.maxtext_model_name,
+      args.base_output_directory,
+      args.run_name,
+  )

@@ -17,25 +17,29 @@ import os
 import unittest
 
 from datasets import load_dataset
+from flax import nnx
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
-from maxtext.configs import pyconfig
-from maxtext.common.common_types import MODEL_MODE_TRAIN
-from maxtext.experimental.rl.grpo_trainer import _merge_grpo_state, grpo_loss_fn
-from maxtext.experimental.rl.grpo_utils import compute_log_probs
+from maxtext.configs import pyconfig, types
+from maxtext.experimental.rl.grpo_trainer import grpo_loss_fn_nnx
+from maxtext.experimental.rl.grpo_utils import compute_log_probs_nnx
 from maxtext.utils.globals import MAXTEXT_PKG_DIR
-from maxtext.models import models
 from maxtext.utils import maxtext_utils
+from maxtext.utils import model_creation_utils
 import numpy as np
 import pytest
 import torch
 import transformers
-# from datasets import Dataset
+from tests.utils.test_helpers import ensure_tokenizer_downloaded
 
 from trl import GRPOConfig, GRPOTrainer
 
-pytestmark = [pytest.mark.external_training, pytest.mark.post_training]  # uses pre-generated checkpoint
+pytestmark = [
+    pytest.mark.external_training,
+    pytest.mark.post_training,
+    pytest.mark.integration_test,
+]  # uses pre-generated checkpoint
 
 
 class GRPOTest(unittest.TestCase):
@@ -44,6 +48,7 @@ class GRPOTest(unittest.TestCase):
     super().setUp()
     self.cfg = pyconfig.initialize(
         [None, os.path.join(MAXTEXT_PKG_DIR, "experimental", "rl", "grpo.yml")],
+        config_class=types.RLConfig,
         run_name="grpo_test",
         model_name="llama3.1-8b",
         enable_checkpointing=True,
@@ -60,13 +65,16 @@ class GRPOTest(unittest.TestCase):
     self.rng = jax.random.PRNGKey(42)
     devices_array = maxtext_utils.create_device_mesh(self.cfg)
     mesh = Mesh(devices_array, self.cfg.mesh_axes)
-    self.model = models.transformer_as_linen(config=self.cfg, mesh=mesh, quant=None, model_mode=MODEL_MODE_TRAIN)
-    self.state, _ = maxtext_utils.setup_decode_state(self.model, self.cfg, self.rng, mesh, None)
+    # NNX: from_pretrained loads the checkpoint (or inits) into the model, which
+    # carries its own params. The frozen reference is a clone of the policy.
+    self.model = model_creation_utils.from_pretrained(self.cfg, mesh=mesh, rng_key=self.rng)
+    self.reference_model = nnx.clone(self.model)
+    self.state = None
+    tokenizer_path = ensure_tokenizer_downloaded("llama3.1-tokenizer", skip_test_on_failure=True)
     self.tokenizer_model = transformers.AutoTokenizer.from_pretrained(
-        "meta-llama/Llama-3.1-8B",
+        tokenizer_path,
         add_bos_token=False,
         add_eos_token=False,
-        token=self.cfg.hf_access_token,
     )
     self.input_str = "Hello world this is a test"
 
@@ -121,7 +129,7 @@ class GRPOTest(unittest.TestCase):
     )
 
   def _prepare_trl_inputs(self):
-    """Prepare TRL inputs."""
+    """Prepare inputs for TRL model."""
     tokenized_inputs = self.tokenizer_model([self.input_str], return_tensors="pt")
     input_ids = torch.cat((tokenized_inputs["input_ids"], tokenized_inputs["input_ids"]), axis=-1)
     attention_mask = torch.cat(
@@ -134,6 +142,39 @@ class GRPOTest(unittest.TestCase):
     logits_to_keep = tokenized_inputs["input_ids"].size()[1]
     return input_ids, attention_mask, logits_to_keep
 
+  def _maxtext_logits(self, inputs, inputs_position, inputs_segmentation):
+    """NNX forward pass logits."""
+    return self.model(
+        decoder_input_tokens=inputs,
+        decoder_positions=inputs_position,
+        decoder_segment_ids=inputs_segmentation,
+        enable_dropout=False,
+    )
+
+  def _policy_logps(self, input_ids, input_position, input_segmentation, completion_segmentation):
+    """Policy per-token log-probs."""
+    return compute_log_probs_nnx(
+        self.model, input_ids, input_position, input_segmentation, completion_segmentation, self.cfg, is_train=False
+    )
+
+  def _reference_logps(self, input_ids, input_position, input_segmentation, completion_segmentation, reference_params):
+    """Reference per-token log-probs from the cloned reference model."""
+    del reference_params  # NNX reads the cloned reference model directly
+    return compute_log_probs_nnx(
+        self.reference_model,
+        input_ids,
+        input_position,
+        input_segmentation,
+        completion_segmentation,
+        self.cfg,
+        is_train=False,
+    )
+
+  def _grpo_loss(self, data, reference_params):
+    """GRPO loss from the NNX policy and cloned reference model."""
+    del reference_params  # NNX reads the cloned reference model directly
+    return grpo_loss_fn_nnx(self.model, self.cfg, data, self.rng, None, self.reference_model)
+
   def test_logits(self):
     def _prepare_inputs():
       input_ids = jnp.tile(jnp.array(self.tokenizer_model.encode(self.input_str)), (4, 1))
@@ -143,15 +184,7 @@ class GRPOTest(unittest.TestCase):
       return input_ids, input_segmentation, input_position
 
     inputs, inputs_segmentation, inputs_position = _prepare_inputs()
-    logits, _ = self.model.apply(
-        self.state.params,
-        inputs,
-        inputs_position,
-        decoder_segment_ids=inputs_segmentation,
-        enable_dropout=False,
-        rngs=self.rng,
-        mutable="intermediates",
-    )
+    logits = self._maxtext_logits(inputs, inputs_position, inputs_segmentation)
 
     hf_logits = (
         self.hf_model(
@@ -167,15 +200,8 @@ class GRPOTest(unittest.TestCase):
   def test_logps(self):
 
     input_ids, input_segmentation, input_position, completion_segmentation = self._prepare_maxtext_inputs()
-    maxtext_per_token_logps, _ = compute_log_probs(
-        self.model,
-        self.state.params,
-        input_ids,
-        input_position,
-        input_segmentation,
-        completion_segmentation,
-        self.cfg,
-        is_train=False,
+    maxtext_per_token_logps, _ = self._policy_logps(
+        input_ids, input_position, input_segmentation, completion_segmentation
     )
     hf_input_ids, attention_mask, logits_to_keep = self._prepare_trl_inputs()
     with torch.no_grad():
@@ -239,57 +265,30 @@ class GRPOTest(unittest.TestCase):
     self.trainer._get_per_token_logps(self.hf_model, hf_input_ids, attention_mask, logits_to_keep)  # pylint: disable=protected-access
 
     input_ids, input_segmentation, input_position, completion_segmentation = self._prepare_maxtext_inputs()
-    maxtext_per_token_logps, _ = compute_log_probs(
-        self.model,
-        self.state.params,
-        input_ids,
-        input_position,
-        input_segmentation,
-        completion_segmentation,
-        self.cfg,
-        is_train=False,
+    maxtext_per_token_logps, _ = self._policy_logps(
+        input_ids, input_position, input_segmentation, completion_segmentation
     )
 
-    reference_params = jax.tree.map(jnp.copy, self.state.params["params"])
-    self.state = _merge_grpo_state(self.state, reference_params)
+    # The reference is a frozen copy of the step-0 policy, held as a cloned model
+    # built in setUp; the NNX loss path reads it directly.
+    reference_params = None
     data = {
         "prompt_completions": input_ids,
         "prompt_completions_position": input_position,
         "prompt_completions_segmentation": input_segmentation,
         "ar_completions_segmentation": completion_segmentation,
     }
-    maxtext_loss, aux = grpo_loss_fn(
-        self.model,
-        self.cfg,
-        data,
-        self.rng,
-        self.state.params,
-        reference_params,
-    )
+    maxtext_loss, aux = self._grpo_loss(data, reference_params)
     self.assertEqual(self.trainer._metrics["train"]["kl"][0], aux.avg_kl.tolist())  # pylint: disable=protected-access
     self.assertEqual(hf_loss.item(), maxtext_loss.tolist())
     # since this is on-policy
     self.assertEqual(aux.avg_advantage.tolist(), 0.0)
     # since we are at step 0
-    maxtext_per_token_logps, _ = compute_log_probs(
-        self.model,
-        self.state.params,
-        input_ids,
-        input_position,
-        input_segmentation,
-        completion_segmentation,
-        self.cfg,
-        is_train=False,
+    maxtext_per_token_logps, _ = self._policy_logps(
+        input_ids, input_position, input_segmentation, completion_segmentation
     )
-    maxtext_per_token_logps_ref, _ = compute_log_probs(
-        self.model,
-        {"params": reference_params},
-        input_ids,
-        input_position,
-        input_segmentation,
-        completion_segmentation,
-        self.cfg,
-        is_train=False,
+    maxtext_per_token_logps_ref, _ = self._reference_logps(
+        input_ids, input_position, input_segmentation, completion_segmentation, reference_params
     )
     self.assertTrue(
         jax.numpy.allclose(

@@ -16,6 +16,7 @@
 
 import dataclasses
 import functools
+import os
 from typing import Any, Iterable, Optional, Tuple, Union, cast
 
 from jax.ad_checkpoint import checkpoint_name
@@ -27,15 +28,14 @@ from flax import nnx
 
 from maxtext.common.common_types import (
     DecoderBlockType,
-    BATCH,
-    BATCH_NO_EXP,
+    BATCH_ATTN,
     HEAD,
     PREFILL_LENGTH,
     D_KV,
     AxisNames,
     AxisIdxes,
     ATTN_LENGTH,
-    ATTN_LENGTH_NO_EXP,
+    ATTN_INPUT_LENGTH,
     DType,
     Config,
     Array,
@@ -45,16 +45,14 @@ from maxtext.common.common_types import (
     KV_HEAD,
     KV_HEAD_DIM,
     KV_BATCH,
-    KV_BATCH_NO_EXP,
     ATTN_EMBED,
     MODEL_MODE_AUTOREGRESSIVE,
     MODEL_MODE_TRAIN,
     MODEL_MODE_PREFILL,
-    EP_AS_CONTEXT,
     AttentionType,
 )
 from maxtext.layers import nnx_wrappers
-from maxtext.layers.attention_op import AttentionOp
+from maxtext.layers.attention_op import AttentionOp, _resolve_attention_type
 from maxtext.layers.embeddings import (
     LLaMARotaryEmbedding,
     LlamaVisionRotaryEmbedding,
@@ -63,14 +61,15 @@ from maxtext.layers.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
     PartialRotaryEmbedding,
+    Gemma4PartialRotaryEmbedding,
 )
 from maxtext.layers.initializers import nd_dense_init, NdInitializer, variable_to_logically_partitioned, default_bias_init
 from maxtext.layers.linears import DenseGeneral, canonicalize_tuple, normalize_axes
 from maxtext.layers.normalizations import RMSNorm, Qwen3NextRMSNorm, GlobalRMSNorm
 from maxtext.layers.quantizations import AqtQuantization as Quant
-from maxtext.inference import kvcache, page_manager, paged_attention
+from maxtext.inference import kvcache
 from maxtext.inference.kvcache import KVQuant
-from maxtext.utils.sharding import maybe_shard_with_logical, create_sharding
+from maxtext.utils.sharding import maybe_shard_with_logical, create_sharding, logical_to_mesh_axes
 
 # pylint: disable=line-too-long, g-doc-args, g-doc-return-or-yield, bad-continuation, g-inconsistent-quotes
 # pytype: disable=attribute-error
@@ -90,16 +89,6 @@ class L2Norm(nnx.Module):
 
   def __call__(self, x):
     return x * jax.lax.rsqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.eps)
-
-
-def l2_norm_as_linen(self, eps: float = 1e-6):
-  """
-  Initializes the L2Norm module and returns it as a Linen module.
-
-  Args:
-    eps: float, epsilon used for numerical stability (default value should be ok for most cases).
-  """
-  return nnx_wrappers.to_linen(L2Norm, eps=eps, metadata_fn=variable_to_logically_partitioned)
 
 
 def attention_as_linen(
@@ -122,7 +111,7 @@ def attention_as_linen(
     float32_logits: bool = False,  # cast logits in float32 for stability.
     quant: Optional[Quant] = None,
     kv_quant: Optional[KVQuant] = None,
-    attention_type: AttentionType = AttentionType.GLOBAL,  # Default to global attention
+    attention_type: AttentionType = AttentionType.GLOBAL,
     attn_logits_soft_cap: float | None = None,
     sliding_window_size: int | None = None,
     use_ragged_attention: bool = False,
@@ -141,16 +130,11 @@ def attention_as_linen(
     prefill_query_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, KV_HEAD, KV_HEAD_DIM),
     prefill_key_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, KV_HEAD, KV_HEAD_DIM),
     prefill_value_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, KV_HEAD, KV_HEAD_DIM),
-    query_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
-    key_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
-    value_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
-    ep_query_axis_names: AxisNames = (KV_BATCH_NO_EXP, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
-    ep_key_axis_names: AxisNames = (KV_BATCH_NO_EXP, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
-    ep_value_axis_names: AxisNames = (KV_BATCH_NO_EXP, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
-    input_axis_names: AxisNames = (BATCH, ATTN_LENGTH_NO_EXP, ATTN_EMBED),
-    ep_input_axis_names: AxisNames = (BATCH_NO_EXP, ATTN_LENGTH, ATTN_EMBED),
-    out_axis_names: AxisNames = (BATCH, ATTN_LENGTH_NO_EXP, HEAD, D_KV),
-    ep_out_axis_names: AxisNames = (BATCH_NO_EXP, ATTN_LENGTH, HEAD, D_KV),
+    query_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
+    key_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
+    value_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
+    input_axis_names: AxisNames = (BATCH_ATTN, ATTN_INPUT_LENGTH, ATTN_EMBED),
+    out_axis_names: AxisNames = (BATCH_ATTN, ATTN_LENGTH, HEAD, D_KV),
     prefill_input_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, ATTN_EMBED),
     decode_input_axis_names: AxisNames = (DECODE_BATCH, DECODE_LENGTH, ATTN_EMBED),
     prefill_out_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, HEAD, D_KV),
@@ -210,13 +194,8 @@ def attention_as_linen(
       query_axis_names=query_axis_names,
       key_axis_names=key_axis_names,
       value_axis_names=value_axis_names,
-      ep_query_axis_names=ep_query_axis_names,
-      ep_key_axis_names=ep_key_axis_names,
-      ep_value_axis_names=ep_value_axis_names,
       input_axis_names=input_axis_names,
-      ep_input_axis_names=ep_input_axis_names,
       out_axis_names=out_axis_names,
-      ep_out_axis_names=ep_out_axis_names,
       prefill_input_axis_names=prefill_input_axis_names,
       decode_input_axis_names=decode_input_axis_names,
       prefill_out_axis_names=prefill_out_axis_names,
@@ -289,7 +268,7 @@ class Attention(nnx.Module):
       float32_logits: bool = False,  # cast logits in float32 for stability.
       quant: Optional[Quant] = None,
       kv_quant: Optional[KVQuant] = None,
-      attention_type: AttentionType = AttentionType.GLOBAL,  # Default to global attention
+      attention_type: AttentionType = AttentionType.GLOBAL,
       attn_logits_soft_cap: float | None = None,
       sliding_window_size: int | None = None,
       use_ragged_attention: bool = False,
@@ -308,16 +287,11 @@ class Attention(nnx.Module):
       prefill_query_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, KV_HEAD, KV_HEAD_DIM),
       prefill_key_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, KV_HEAD, KV_HEAD_DIM),
       prefill_value_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, KV_HEAD, KV_HEAD_DIM),
-      query_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
-      key_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
-      value_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH_NO_EXP, KV_HEAD, KV_HEAD_DIM),
-      ep_query_axis_names: AxisNames = (KV_BATCH_NO_EXP, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
-      ep_key_axis_names: AxisNames = (KV_BATCH_NO_EXP, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
-      ep_value_axis_names: AxisNames = (KV_BATCH_NO_EXP, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
-      input_axis_names: AxisNames = (BATCH, ATTN_LENGTH_NO_EXP, ATTN_EMBED),
-      ep_input_axis_names: AxisNames = (BATCH_NO_EXP, ATTN_LENGTH, ATTN_EMBED),
-      out_axis_names: AxisNames = (BATCH, ATTN_LENGTH_NO_EXP, HEAD, D_KV),
-      ep_out_axis_names: AxisNames = (BATCH_NO_EXP, ATTN_LENGTH, HEAD, D_KV),
+      query_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
+      key_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
+      value_axis_names: AxisNames = (KV_BATCH, ATTN_LENGTH, KV_HEAD, KV_HEAD_DIM),
+      input_axis_names: AxisNames = (BATCH_ATTN, ATTN_INPUT_LENGTH, ATTN_EMBED),
+      out_axis_names: AxisNames = (BATCH_ATTN, ATTN_LENGTH, HEAD, D_KV),
       prefill_input_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, ATTN_EMBED),
       decode_input_axis_names: AxisNames = (DECODE_BATCH, DECODE_LENGTH, ATTN_EMBED),
       prefill_out_axis_names: AxisNames = (PREFILL_KV_BATCH, PREFILL_LENGTH, HEAD, D_KV),
@@ -334,7 +308,11 @@ class Attention(nnx.Module):
       mrope_section: tuple[int, int, int] | None = None,
       name: str | None = None,
       rope_type: str | None = None,
-      rngs: Optional[nnx.Rngs] = None,
+      use_v_norm: bool = False,
+      rope_max_timescale: float | None = None,
+      partial_rotary_factor: float | None = None,
+      share_kv_layer: bool = False,
+      rngs: nnx.Rngs | None = None,
   ):
     """Initializes the Attention module.
 
@@ -365,6 +343,7 @@ class Attention(nnx.Module):
       use_qk_norm: Whether to apply normalization to query and key.
       query_pre_attn_scalar: Scalar to apply to query before attention.
       use_bias_in_projections: Whether to use bias in Q, K, V, and output projections.
+      share_kv_projections: If true, Key and Value use the same projection.
       temperature_tuning: Whether to use temperature tuning for attention.
       temperature_tuning_scale: The scale for temperature tuning.
       temperature_tuning_floor_scale: The floor scale for temperature tuning.
@@ -375,6 +354,12 @@ class Attention(nnx.Module):
       base_kv_cache: Whether to use base (non-MLA) kv cache, if KVCache is used
       rope_type: Optional override for the RoPE type (e.g., 'default', 'yarn').
           If provided, this takes precedence over `config.rope_type`.
+      use_v_norm: Whether to apply normalization to value.
+      rope_max_timescale: The maximum timescale for RoPE.
+      partial_rotary_factor: The factor for partial rotary embedding.
+      share_kv_layer: If True, this layer reuses K / V from an earlier (donor) layer of the same
+          attention type; k_proj / v_proj / k_norm / v_norm are not created and RoPE-on-K is
+          skipped. The caller must pass `shared_key` / `shared_value` to `__call__`.
       rngs: RNG state for initialization, passed by the nnx.to_linen wrapper.
     """
 
@@ -394,7 +379,7 @@ class Attention(nnx.Module):
     self.float32_logits = float32_logits
     self.quant = quant
     self.kv_quant = kv_quant
-    self.attention_type = attention_type
+    self.attention_type = _resolve_attention_type(self.config, attention_type)
     self.attn_logits_soft_cap = attn_logits_soft_cap
     self.sliding_window_size = sliding_window_size
     self.use_ragged_attention = use_ragged_attention
@@ -412,13 +397,8 @@ class Attention(nnx.Module):
     self.query_axis_names = query_axis_names
     self.key_axis_names = key_axis_names
     self.value_axis_names = value_axis_names
-    self.ep_query_axis_names = ep_query_axis_names
-    self.ep_key_axis_names = ep_key_axis_names
-    self.ep_value_axis_names = ep_value_axis_names
     self.input_axis_names = input_axis_names
-    self.ep_input_axis_names = ep_input_axis_names
     self.out_axis_names = out_axis_names
-    self.ep_out_axis_names = ep_out_axis_names
     self.prefill_input_axis_names = prefill_input_axis_names
     self.decode_input_axis_names = decode_input_axis_names
     self.prefill_out_axis_names = prefill_out_axis_names
@@ -435,14 +415,22 @@ class Attention(nnx.Module):
     self.rngs = rngs
     # Use the rope type specified in the arguments if provided, otherwise fall back to the one in the config.
     self.rope_type = (rope_type or self.config.rope_type).lower()
+    self.use_v_norm = use_v_norm
+    self.rope_max_timescale = rope_max_timescale if rope_max_timescale is not None else self.config.rope_max_timescale
+    self.partial_rotary_factor = partial_rotary_factor
+    self.share_kv_layer = share_kv_layer
 
     self.is_qwen2 = self.config.decoder_block == DecoderBlockType.QWEN2
-    self.is_qwen3_next = self.config.decoder_block == DecoderBlockType.QWEN3_NEXT
+    self.is_qwen3_hybrid = (
+        self.config.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.QWEN3_5) and not self.is_vision
+    )
 
     # Module attribute names must match names previously passed to Linen for checkpointing
     self.KVCache_0 = (
         self.init_kv_caches(inputs_kv_shape=inputs_kv_shape)
-        if self.model_mode != MODEL_MODE_TRAIN and base_kv_cache and config.attention != "vllm_rpa"
+        if self.model_mode != MODEL_MODE_TRAIN
+        and base_kv_cache
+        and config.attention not in ("vllm_rpa", "vllm_batched_rpa")
         else None
     )
 
@@ -472,31 +460,13 @@ class Attention(nnx.Module):
         ragged_block_size=self.ragged_block_size,
         rngs=self.rngs,
     )
-    # When paged attention is enabled, paged attention op is used for all model modes except TRAIN,
-    # which uses default attention op.
-    if self.config.attention == "paged":
-      self.paged_attention_op = paged_attention.PagedAttentionOp(
-          mesh=self.mesh,
-          num_pages=self.config.pagedattn_num_pages,
-          tokens_per_page=self.config.pagedattn_tokens_per_page,
-          max_pages_per_slot=(self.config.max_target_length + self.config.pagedattn_tokens_per_page - 1)
-          // self.config.pagedattn_tokens_per_page,
-          max_pages_per_prefill=(self.config.max_prefill_predict_length + self.config.pagedattn_tokens_per_page - 1)
-          // self.config.pagedattn_tokens_per_page,
-          pages_per_compute_block=self.config.pagedattn_pages_per_compute_block,
-          num_kv_heads=self.num_kv_heads,
-          kv_head_dim_size=self.head_dim,
-          dtype=self.dtype,
-          attn_logits_soft_cap=self.attn_logits_soft_cap,
-          rngs=self.rngs,
-      )
 
     self._init_projections(inputs_q_shape, inputs_kv_shape)
 
     if self.config.attention_sink:
       self.sinks = nnx.Param(
           default_bias_init(self.rngs.params(), (self.config.num_query_heads,), self.weight_dtype),
-          sharding=(None,),
+          out_sharding=(None,),
       )
     else:
       self.sinks = None
@@ -513,6 +483,8 @@ class Attention(nnx.Module):
       q_features = (self.num_query_heads * self.head_dim) if use_global_qk_norm else self.head_dim
       k_features = (self.num_kv_heads * self.head_dim) if use_global_qk_norm else self.head_dim
 
+      with_scale = getattr(self.config, "qk_norm_with_scale", True)
+
       self.query_norm = qk_norm_cls(
           num_features=q_features,
           dtype=self.config.dtype,
@@ -520,35 +492,57 @@ class Attention(nnx.Module):
           shard_mode=self.config.shard_mode,
           epsilon=self.config.normalization_layer_epsilon,
           kernel_axes=("norm",),
+          with_scale=with_scale,
           rngs=self.rngs,
       )
-      self.key_norm = qk_norm_cls(
-          num_features=k_features,
+      if self.share_kv_layer:
+        self.key_norm = None
+      else:
+        self.key_norm = qk_norm_cls(
+            num_features=k_features,
+            dtype=self.config.dtype,
+            weight_dtype=self.config.weight_dtype,
+            shard_mode=self.config.shard_mode,
+            epsilon=self.config.normalization_layer_epsilon,
+            kernel_axes=("norm",),
+            with_scale=with_scale,
+            rngs=self.rngs,
+        )
+    elif self.is_qwen3_hybrid:
+      self.query_norm = Qwen3NextRMSNorm(
+          num_features=self.config.head_dim,
+          epsilon=self.config.normalization_layer_epsilon,
           dtype=self.config.dtype,
           weight_dtype=self.config.weight_dtype,
           shard_mode=self.config.shard_mode,
-          epsilon=self.config.normalization_layer_epsilon,
-          kernel_axes=("norm",),
-          rngs=self.rngs,
-      )
-    elif self.is_qwen3_next:
-      self.query_norm = Qwen3NextRMSNorm(
-          num_features=self.config.head_dim,
-          eps=self.config.normalization_layer_epsilon,
-          dtype=self.config.dtype,
-          weight_dtype=self.config.weight_dtype,
           rngs=self.rngs,
       )
       self.key_norm = Qwen3NextRMSNorm(
           num_features=self.config.head_dim,
-          eps=self.config.normalization_layer_epsilon,
+          epsilon=self.config.normalization_layer_epsilon,
           dtype=self.config.dtype,
           weight_dtype=self.config.weight_dtype,
+          shard_mode=self.config.shard_mode,
           rngs=self.rngs,
       )
     else:
       self.query_norm = None
       self.key_norm = None
+
+    if self.use_v_norm and not self.share_kv_layer:
+      with_scale = self.config.v_norm_with_scale
+      self.value_norm = RMSNorm(
+          num_features=self.head_dim,
+          dtype=self.config.dtype,
+          weight_dtype=self.config.weight_dtype,
+          shard_mode=self.config.shard_mode,
+          epsilon=self.config.normalization_layer_epsilon,
+          kernel_axes=("norm",),
+          with_scale=with_scale,
+          rngs=self.rngs,
+      )
+    else:
+      self.value_norm = None
 
     self._maybe_shard_with_logical = functools.partial(
         maybe_shard_with_logical,
@@ -557,15 +551,102 @@ class Attention(nnx.Module):
         debug_sharding=config.debug_sharding,
     )
 
+  def _logical_to_mesh_axes(self, logical_name):
+    # Pipeline parallelism uses context managers for logical rules instead of the config,
+    # so pass None to ensure `logical_to_mesh_axes` defers to using the current Flax context manager
+    logical_rules = None if self.config.using_pipeline_parallelism else self.config.logical_axis_rules
+    return logical_to_mesh_axes(logical_name, mesh=self.mesh, rules=logical_rules)
+
+  def _validate_kv_heads(self) -> None:
+    """Validates the number of key/value heads."""
+    if self.num_kv_heads == -1:
+      raise ValueError("num_kv_heads is not defined.")
+
+    if self.num_query_heads % self.num_kv_heads != 0:
+      raise ValueError("Invalid num_kv_heads for GQA.")
+
+  def _validate_kv_head_sharding(
+      self,
+      kernel_axes: Tuple[Optional[str], ...],
+  ) -> None:
+    """Validates that the key/value head dimension can be sharded evenly.
+
+    Attention heads are atomic under tensor parallelism.  The `kv_heads`
+    logical axis of the key/value projection is split across whichever mesh
+    axes `logical_axis_rules` maps it to -- by default `tensor`,
+    `tensor_sequence` and `autoregressive` -- so the KV head count has to be
+    divisible by their combined size.  Note that `num_kv_heads` is the
+    per-layer count, which for models such as Gemma 4 is `global_num_kv_heads`
+    on global attention layers and `num_kv_heads` elsewhere.
+
+    Ulysses context parallelism shards the KV heads a second time, over the
+    context axis, using a runtime all-to-all rather than the weight's logical
+    axes, so that axis is folded in explicitly.  `types.py` separately requires
+    `num_kv_heads` to be divisible by the context-parallel size on its own;
+    checking the product here is what catches a head count that clears each
+    factor individually but not both together.
+
+    Without this check an over-sharded mesh fails much later, either with an
+    opaque XLA divisibility error or by silently leaving the projection
+    unsharded until `assert_params_sufficiently_sharded` trips.
+
+    Args:
+      kernel_axes: Logical axis names of the key/value projection kernel.
+
+    Raises:
+      ValueError: If the KV heads cannot be split evenly across the mesh.
+    """
+    if "kv_heads" not in kernel_axes:
+      # The projection is replicated, so the head count is unconstrained.
+      return
+
+    # Size-one mesh axes are already dropped, so this is the exact shard count.
+    # An empty result means no logical rule shards the heads; that is not an
+    # early exit, because Ulysses below can still shard them over the context
+    # axis. An unsharded head dimension just leaves `kv_parallelism` at 1.
+    kv_heads_index = kernel_axes.index("kv_heads")
+    kv_head_axes = self._logical_to_mesh_axes(kernel_axes)[kv_heads_index]
+    if kv_head_axes is None:
+      kv_head_axes = ()
+    elif isinstance(kv_head_axes, str):
+      kv_head_axes = (kv_head_axes,)
+    kv_head_axes = list(kv_head_axes)
+
+    # Ulysses exchanges sequence ownership for head ownership through an
+    # all-to-all, so the context axis shards KV heads too even though no
+    # logical rule says so.
+    if self.config.context_parallel_strategy.lower() == "ulysses":
+      ulysses_axis = self.config.context_sharding
+      if ulysses_axis not in kv_head_axes:
+        kv_head_axes.append(ulysses_axis)
+
+    kv_parallelism = 1
+    for axis in kv_head_axes:
+      kv_parallelism *= self.mesh.shape.get(axis, 1)
+
+    if self.num_kv_heads % kv_parallelism != 0:
+      raise ValueError(
+          f"num_kv_heads ({self.num_kv_heads}) for {self.attention_type}"
+          f" attention layers must be divisible by {kv_parallelism}, the"
+          f" combined size of the mesh axes {kv_head_axes} that shard KV heads."
+          " Attention heads are atomic under tensor parallelism and cannot be"
+          " split across more shards than there are heads. Either reduce the"
+          " parallelism on those axes, raise the KV head count"
+          " (`base_num_kv_heads`, or `global_num_kv_heads` for global attention"
+          " layers), or move the parallelism onto an axis that does not shard"
+          " KV heads (e.g. fsdp)."
+      )
+
   def _init_projections(self, inputs_q_shape: Tuple, inputs_kv_shape: Tuple) -> None:
     """Initializes the query, key, value, and output projections."""
     if self.config.fused_qkv:
       self.qkv_proj = self.init_qkv_w(inputs_shape=inputs_q_shape)
     else:
       self.query = self.init_query_w(inputs_q_shape=inputs_q_shape)
-      self.key = self.init_kv_w(inputs_kv_shape=inputs_kv_shape)
-      if not self.share_kv_projections:
-        self.value = self.init_kv_w(inputs_kv_shape=inputs_kv_shape)
+      if not self.share_kv_layer:
+        self.key = self.init_kv_w(inputs_kv_shape=inputs_kv_shape)
+        if not self.share_kv_projections:
+          self.value = self.init_kv_w(inputs_kv_shape=inputs_kv_shape)
     self.out = self.init_out_w(output_dim=inputs_q_shape[-1])
 
   def init_query_w(self, inputs_q_shape: Tuple) -> nnx.Module:
@@ -576,7 +657,9 @@ class Attention(nnx.Module):
     #       linear transformations, which is equivalent under Adafactor.
     # We disable depth_scaling when using qk_norm or a query_pre_attn_scalar
     # to avoid applying scaling twice.
-    if self.config.use_qk_norm or (self.query_pre_attn_scalar is not None and self.query_pre_attn_scalar != 1.0):
+    if getattr(self.config, "use_qk_norm", False) or (
+        self.query_pre_attn_scalar is not None and self.query_pre_attn_scalar != 1.0
+    ):
       depth_scaling = 1.0
     else:
       depth_scaling = jnp.sqrt(self.head_dim).astype(self.dtype)
@@ -586,14 +669,15 @@ class Attention(nnx.Module):
       return self.kernel_init(*args) / depth_scaling
 
     kernel_axes = (
-        (None, None, None) if self.config.ici_context_autoregressive_parallelism > 1 else ("embed", "q_heads", "kv")
+        (None, None, None) if self.config.ici_context_autoregressive_parallelism > 1 else ("embed_attn", "q_heads", "kv")
     )
     in_features = self.convert_dense_general_inputs_shape(inputs_q_shape)
     out_features = (self.num_query_heads, self.head_dim)
 
-    if self.is_qwen3_next:
+    if self.is_qwen3_hybrid:
       out_features = (self.num_query_heads, self.head_dim * 2)
 
+    block_size = getattr(self.config, "weight_block_size", None)
     return DenseGeneral(
         in_features_shape=in_features,
         out_features_shape=out_features,
@@ -606,6 +690,7 @@ class Attention(nnx.Module):
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
         shard_mode=self.config.shard_mode,
+        block_size=block_size,
         rngs=self.rngs,
     )
 
@@ -623,18 +708,16 @@ class Attention(nnx.Module):
     Returns:
       A DenseGeneral module that performs the key or value projection.
     """
-    if self.num_kv_heads == -1:
-      raise ValueError("num_kv_heads is not defined.")
-
-    if self.num_query_heads % self.num_kv_heads != 0:
-      raise ValueError("Invalid num_kv_heads for GQA.")
+    self._validate_kv_heads()
 
     kernel_axes = (
         (None, None, None)
         if self.config.ici_context_autoregressive_parallelism > 1
-        else ("embed", "kv_heads", "kv_head_dim")
+        else ("embed_attn", "kv_heads", "kv_head_dim")
     )
+    self._validate_kv_head_sharding(kernel_axes)
 
+    block_size = getattr(self.config, "weight_block_size", None)
     return DenseGeneral(
         in_features_shape=self.convert_dense_general_inputs_shape(inputs_kv_shape),
         out_features_shape=(self.num_kv_heads, self.head_dim),
@@ -647,6 +730,7 @@ class Attention(nnx.Module):
         shard_mode=self.config.shard_mode,
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
+        block_size=block_size,
         rngs=self.rngs,
     )
 
@@ -673,12 +757,15 @@ class Attention(nnx.Module):
       raise ValueError(f"proj_name must be 'key' or 'value', but got {proj_name}")
 
   def init_qkv_w(self, inputs_shape: Tuple) -> nnx.Module:
+    """Initializes the a fused QKV projection using only one DenseGeneral module."""
+    self._validate_kv_heads()
+
     return DenseGeneral(
         in_features_shape=self.convert_dense_general_inputs_shape(inputs_shape),
-        out_features_shape=(3, self.num_query_heads, self.head_dim),
+        out_features_shape=(self.num_query_heads + 2 * self.num_kv_heads, self.head_dim),
         axis=-1,
         kernel_init=self.kernel_init,
-        kernel_axes=("embed", "qkv", "heads", "kv"),
+        kernel_axes=("embed_attn", "heads", "kv"),
         dtype=self.dtype,
         weight_dtype=self.weight_dtype,
         quant=self.quant,
@@ -693,23 +780,42 @@ class Attention(nnx.Module):
 
     qkv_proj = self.qkv_proj(inputs, out_sharding)
     qkv_proj = checkpoint_name(qkv_proj, "qkv_proj")
-    query, key, value = qkv_proj[:, :, 0, ...], qkv_proj[:, :, 1, ...], qkv_proj[:, :, 2, ...]
-    return query, key, value
+
+    # Since fused QKV projection places all heads along the same axis which could be tensor
+    # parallel partitioned, we must use shard_map to split into equally partitioned Q, K, V arrays.
+    q_bshd = self._logical_to_mesh_axes(self.query_axis_names)
+    k_bshd = self._logical_to_mesh_axes(self.key_axis_names)
+    v_bshd = self._logical_to_mesh_axes(self.value_axis_names)
+
+    @jax.shard_map(mesh=self.mesh, in_specs=(q_bshd,), out_specs=(q_bshd, k_bshd, v_bshd))
+    def split_qkv(qkv_proj: Array) -> tuple[Array, Array, Array]:
+      num_local_heads = qkv_proj.shape[2]
+      num_query_heads = (num_local_heads * self.num_query_heads) // (self.num_query_heads + 2 * self.num_kv_heads)
+      num_kv_heads = (num_local_heads - num_query_heads) // 2
+
+      return tuple(jnp.split(qkv_proj, [num_query_heads, num_query_heads + num_kv_heads], axis=2))
+
+    return split_qkv(qkv_proj)
+
+  @property
+  def out_head_dim(self) -> int:
+    return self.head_dim
 
   def init_out_w(self, output_dim: int) -> nnx.Module:
     """out projection"""
-    in_features = (self.num_query_heads, self.head_dim)
+    in_features = (self.num_query_heads, self.out_head_dim)
     out_features = output_dim
     out_kernel_axis = (
-        (None, None, None) if self.config.ici_context_autoregressive_parallelism > 1 else ("heads", "kv", "embed")
+        (None, None, None) if self.config.ici_context_autoregressive_parallelism > 1 else ("heads", "kv", "embed_attn")
     )
     axis = (-2, -1)
 
-    if self.is_qwen3_next:
-      in_features = self.num_query_heads * self.head_dim
-      out_kernel_axis = ("mlp", "embed")
+    if self.is_qwen3_hybrid:
+      in_features = self.num_query_heads * self.out_head_dim
+      out_kernel_axis = ("mlp", "embed_attn")
       axis = (-1,)
 
+    block_size = getattr(self.config, "weight_block_size", None)
     return DenseGeneral(
         in_features_shape=in_features,
         out_features_shape=out_features,
@@ -722,12 +828,46 @@ class Attention(nnx.Module):
         shard_mode=self.config.shard_mode,
         matmul_precision=self.config.matmul_precision,
         use_bias=False if self.is_qwen2 else self.use_bias_in_projections,
+        block_size=block_size,
         rngs=self.rngs,
     )
 
   def out_projection(self, out: Array, out_sharding: NamedSharding | None = None) -> Array:
     """out projection"""
     return self.out(out, out_sharding=out_sharding)
+
+  def compute_shared_kv(
+      self,
+      inputs_kv: Array,
+      inputs_positions: Array | None = None,
+      rope_kwargs: dict | None = None,
+  ) -> tuple[Array, Array]:
+    """Computes the rotated, normed K / V for this layer.
+
+    Used by KV-donor layers in models with cross-layer KV sharing (e.g. Gemma 4
+    small): the donor calls this once, passes the result into its own
+    ``__call__`` as ``shared_key`` / ``shared_value`` to avoid double-computing,
+    and forwards the same tensors to downstream shared layers.
+    """
+    if self.share_kv_layer:
+      raise ValueError("compute_shared_kv cannot be called on a share_kv_layer=True layer.")
+    if self.config.fused_qkv:
+      raise ValueError("compute_shared_kv is incompatible with fused_qkv.")
+    qkv_sharding = create_sharding(self.mesh, self.input_axis_names)
+    key = self.kv_projection(inputs_kv, proj_name="key", out_sharding=qkv_sharding)
+    value = (
+        key if self.share_kv_projections else self.kv_projection(inputs_kv, proj_name="value", out_sharding=qkv_sharding)
+    )
+    is_llama4_decoder_block = self.config.decoder_block == DecoderBlockType.LLAMA4
+    if (self.use_qk_norm and not is_llama4_decoder_block) or self.is_qwen3_hybrid:
+      key = self.key_norm(key)
+    if self.use_v_norm:
+      value = self.value_norm(value)
+    if not self.is_nope_layer:
+      key = self.apply_rotary_embedding(key, inputs_positions=inputs_positions, rope_kwargs=rope_kwargs)
+    if self.use_qk_norm and is_llama4_decoder_block and not self.is_nope_layer:
+      key = L2Norm(eps=self.config.normalization_layer_epsilon)(key)
+    return key, value
 
   def convert_dense_general_inputs_shape(
       self,
@@ -752,7 +892,7 @@ class Attention(nnx.Module):
     rope_type = self.rope_type
     rope_use_scale = self.config.rope_use_scale
     if self.is_vision:
-      if self.config.model_name.startswith("qwen3-omni"):
+      if self.config.model_name.startswith("qwen3") or self.config.model_name.startswith("weaver"):
         rotary_embedding = Qwen3OmniMoeVisionRotaryEmbedding(
             hidden_size=self.config.hidden_size_for_vit,
             num_attention_heads=self.config.num_attention_heads_for_vit,
@@ -778,18 +918,21 @@ class Attention(nnx.Module):
     elif self.use_mrope:
       rotary_embedding = Qwen3OmniMoeThinkerTextRotaryEmbedding(
           min_timescale=self.config.rope_min_timescale,
-          max_timescale=self.config.rope_max_timescale,
+          max_timescale=self.rope_max_timescale,
           embedding_dims=rope_embedding_dims,
           cast_as_fprop_dtype=True,
           fprop_dtype=self.dtype,
           mrope_section=self.mrope_section,
+          partial_rotary_factor=(
+              self.partial_rotary_factor if self.partial_rotary_factor is not None else self.config.partial_rotary_factor
+          ),
           rngs=self.rngs,
       )
 
     elif self.config.model_name.startswith("llama3.1") or rope_type.startswith("llama3.1"):
       rotary_embedding = LLaMARotaryEmbedding(
           min_timescale=self.config.rope_min_timescale,
-          max_timescale=self.config.rope_max_timescale,
+          max_timescale=self.rope_max_timescale,
           mesh=self.mesh,
           embedding_dims=rope_embedding_dims,
           fprop_dtype=self.dtype,
@@ -804,20 +947,22 @@ class Attention(nnx.Module):
           original_max_position_embeddings=self.config.original_max_position_embeddings,
           beta_fast=self.config.beta_fast,
           beta_slow=self.config.beta_slow,
-          rope_theta=self.config.rope_max_timescale,
+          rope_theta=self.rope_max_timescale,
           rope_factor=self.config.rope_factor,
           embedding_dims=rope_embedding_dims,
           fprop_dtype=self.dtype,
           interleave=self.config.rope_interleave,
           truncate=self.config.rope_truncate,
           attention_scaling=self.config.rope_attention_scaling,
+          pairwise=self.config.rope_pairwise,
           shard_mode=self.config.shard_mode,
           rngs=self.rngs,
       )
-    elif self.is_qwen3_next:
+
+    elif self.is_qwen3_hybrid:
       rotary_embedding = PartialRotaryEmbedding(
           min_timescale=self.config.rope_min_timescale,
-          max_timescale=self.config.rope_max_timescale,
+          max_timescale=self.rope_max_timescale,
           mesh=self.mesh,
           embedding_dims=self.config.head_dim,
           partial_rotary_factor=self.config.partial_rotary_factor,
@@ -826,9 +971,34 @@ class Attention(nnx.Module):
           shard_mode=self.config.shard_mode,
           rngs=self.rngs,
       )
+    elif self.partial_rotary_factor is not None and self.partial_rotary_factor < 1.0:
+      if self.config.model_name.startswith("gemma4"):
+        rotary_embedding = Gemma4PartialRotaryEmbedding(
+            min_timescale=self.config.rope_min_timescale,
+            max_timescale=self.rope_max_timescale,
+            mesh=self.mesh,
+            embedding_dims=rope_embedding_dims,
+            partial_rotary_factor=self.partial_rotary_factor,
+            cast_as_fprop_dtype=True,
+            fprop_dtype=self.dtype,
+            shard_mode=self.config.shard_mode,
+            rngs=self.rngs,
+        )
+      else:
+        rotary_embedding = PartialRotaryEmbedding(
+            min_timescale=self.config.rope_min_timescale,
+            max_timescale=self.rope_max_timescale,
+            mesh=self.mesh,
+            embedding_dims=rope_embedding_dims,
+            partial_rotary_factor=self.partial_rotary_factor,
+            cast_as_fprop_dtype=True,
+            fprop_dtype=self.dtype,
+            shard_mode=self.config.shard_mode,
+            rngs=self.rngs,
+        )
     else:
-      max_timescale = self.config.rope_max_timescale
-      # For local attention use local_rope_max_timescale if it's is positive
+      max_timescale = self.rope_max_timescale
+      # For local attention use local_rope_max_timescale if it is positive
       if self.attention_type == AttentionType.LOCAL_SLIDING and self.config.local_rope_max_timescale > 0:
         max_timescale = self.config.local_rope_max_timescale
 
@@ -867,8 +1037,12 @@ class Attention(nnx.Module):
       num_frames = rope_kwargs.get("num_frames")
       height = rope_kwargs.get("height")
       width = rope_kwargs.get("width")
+      token_mask = rope_kwargs.get("token_mask")
+      valid_grid = rope_kwargs.get("valid_grid")
       # Type cast required: Omni rotary embedding uses different __call__ parameters than other embeddings.
-      return cast(Qwen3OmniMoeVisionRotaryEmbedding, self.rotary_embedding)(inputs, num_frames, height, width)
+      return cast(Qwen3OmniMoeVisionRotaryEmbedding, self.rotary_embedding)(
+          inputs, num_frames, height, width, token_mask=token_mask, valid_grid=valid_grid
+      )
     else:
       return self.rotary_embedding(inputs, inputs_positions)
 
@@ -946,8 +1120,10 @@ class Attention(nnx.Module):
       value: Array,
       rpa_kv_cache: list[Array] | None = None,
       rpa_metadata: dict[str, Any] | None = None,
-  ) -> tuple[list[Array], Array]:
+  ) -> tuple[Array, list[Array]]:
     """Forward function for vLLM serving with RPA attention."""
+    if self.config.attention == "vllm_batched_rpa":
+      os.environ["USE_BATCHED_RPA_KERNEL"] = "1"
     try:
       # pylint: disable=import-outside-toplevel
       # pytype: disable=import-error
@@ -957,22 +1133,30 @@ class Attention(nnx.Module):
           "vLLM RPA attention ops require the vllm-tpu package. Please install it with `pip install vllm-tpu`."
       ) from e
 
+    query = query.reshape(-1, query.shape[2], query.shape[3]).astype(self.dtype)
+    key = key.reshape(-1, key.shape[2], key.shape[3]).astype(self.dtype)
+    value = value.reshape(-1, value.shape[2], value.shape[3]).astype(self.dtype)
+
     if rpa_kv_cache is None or rpa_metadata is None:
-      raise ValueError("kv_cache and attention_metadata must be provided when using vLLM.")
+      # Return dummy values for dry runs (e.g. during model initialization or JIT tracing)
+      return query, []
 
-    query = query.reshape(-1, query.shape[2], query.shape[3])
-    key = key.reshape(-1, key.shape[2], key.shape[3])
-    value = value.reshape(-1, value.shape[2], value.shape[3])
-
-    if self.config.sliding_window_size > 0:
+    # Sliding window applies only to LOCAL_SLIDING layers; global layers must run
+    # full attention.
+    if self.attention_type == AttentionType.LOCAL_SLIDING and self.config.sliding_window_size > 0:
       attention_chunk_size = self.config.sliding_window_size
     else:
-      # Chunked attention currently not used in vLLM RPA.
       attention_chunk_size = None
 
     q_scale, k_scale, v_scale = None, None, None
 
     md = rpa_metadata
+
+    # With cross-layer KV sharing (Gemma 4 E2B / E4B), a KV-shared layer has no
+    # cache of its own: `rpa_kv_cache` here is the donor layer's cache, and
+    # attention must run against the K/V the donor already wrote for this
+    # position. Only the donor writes the cache; shared layers read it as-is.
+    update_kv_cache = not self.share_kv_layer
 
     output, kv_cache = rpa_ops(
         self.mesh,
@@ -990,8 +1174,9 @@ class Attention(nnx.Module):
         q_scale,
         k_scale,
         v_scale,
+        update_kv_cache=update_kv_cache,
     )
-    return kv_cache, output
+    return output, kv_cache
 
   def __call__(
       self,
@@ -1005,11 +1190,12 @@ class Attention(nnx.Module):
       deterministic: bool = False,
       previous_chunk: Any = None,
       slot: Optional[int] = None,
-      page_state: Optional[page_manager.PageState] = None,
       bidirectional_mask: Any = None,
       rope_kwargs: dict | None = None,
       kv_cache: Optional[Array] = None,
       attention_metadata: Optional[dict[str, Any]] = None,
+      shared_key: Array | None = None,
+      shared_value: Array | None = None,
   ):
     """Applies Attention on the input data.
 
@@ -1035,7 +1221,6 @@ class Attention(nnx.Module):
       deterministic: If True, disables dropout.
       previous_chunk: Information about previously processed chunks for chunked prefill.
       slot: The batch slot index for paged attention.
-      page_state: The current state of the paged attention manager.
       bidirectional_mask: A mask for bidirectional attention, used in multimodal models.
       kv_cache: Optional KV cache input, used when invoking from vLLM.
       attention_metadata: Optional mapping to store attention metadata, used when invoking from vLLM.
@@ -1045,8 +1230,6 @@ class Attention(nnx.Module):
     """
     if model_mode == MODEL_MODE_PREFILL:
       input_axis_names = self.prefill_input_axis_names
-    elif model_mode == MODEL_MODE_TRAIN and self.config.expert_shard_attention_option == EP_AS_CONTEXT:
-      input_axis_names = self.ep_input_axis_names
     elif model_mode == MODEL_MODE_TRAIN:
       input_axis_names = self.input_axis_names
     else:
@@ -1056,9 +1239,19 @@ class Attention(nnx.Module):
     inputs_kv = self._maybe_shard_with_logical(inputs_kv, input_axis_names)
     qkv_sharding = create_sharding(self.mesh, input_axis_names)
 
+    use_shared_kv = shared_key is not None and shared_value is not None
+    if self.share_kv_layer and not use_shared_kv:
+      raise ValueError("share_kv_layer=True requires both shared_key and shared_value to be provided.")
+    if use_shared_kv and self.config.fused_qkv:
+      raise ValueError("shared_key / shared_value are incompatible with fused_qkv.")
+
     # apply projection.
     if self.config.fused_qkv:
       query, key, value = self.qkv_projection(inputs_q, proj_name="qkv_proj")
+    elif use_shared_kv:
+      # Donor layer already produced rotated, normed K/V — use them directly.
+      query = self.query_projection(inputs_q, out_sharding=qkv_sharding)
+      key, value = shared_key, shared_value
     else:
       query = self.query_projection(inputs_q, out_sharding=qkv_sharding)
       key = self.kv_projection(inputs_kv, proj_name="key", out_sharding=qkv_sharding)
@@ -1068,7 +1261,7 @@ class Attention(nnx.Module):
         value = self.kv_projection(inputs_kv, proj_name="value", out_sharding=qkv_sharding)
 
     gate = None
-    if self.is_qwen3_next:
+    if self.is_qwen3_hybrid:
       # Split query into query & gate.
       query, gate = jnp.split(query, 2, axis=-1)
       batch_size, seq_len, _, _ = gate.shape
@@ -1077,9 +1270,13 @@ class Attention(nnx.Module):
     is_llama4_decoder_block = self.config.decoder_block == DecoderBlockType.LLAMA4
     # NOTE: llama 4 does L2 normalization after RoPE
     # Apply Qwen3Next specific RMS Norm
-    if (self.use_qk_norm and not is_llama4_decoder_block) or self.is_qwen3_next:
+    if (self.use_qk_norm and not is_llama4_decoder_block) or self.is_qwen3_hybrid:
       query = self.query_norm(query)
-      key = self.key_norm(key)
+      if not use_shared_kv:
+        key = self.key_norm(key)
+
+    if self.use_v_norm and not use_shared_kv:
+      value = self.value_norm(value)
 
     # NOTE: is_nope_layer should be used in attention mask and also used in attention tuning
     use_rope = not self.is_nope_layer
@@ -1087,12 +1284,14 @@ class Attention(nnx.Module):
 
     if use_rope:
       query = self.apply_rotary_embedding(query, inputs_positions=inputs_positions, rope_kwargs=rope_kwargs)
-      key = self.apply_rotary_embedding(key, inputs_positions=inputs_positions, rope_kwargs=rope_kwargs)
+      if not use_shared_kv:
+        key = self.apply_rotary_embedding(key, inputs_positions=inputs_positions, rope_kwargs=rope_kwargs)
 
     if use_qk_norm and is_llama4_decoder_block:
       l2_norm = L2Norm(eps=self.config.normalization_layer_epsilon)
       query = l2_norm(query)
-      key = l2_norm(key)
+      if not use_shared_kv:
+        key = l2_norm(key)
 
     # apply query_pre_attn_scalar if it's present.
     if self.query_pre_attn_scalar and self.query_pre_attn_scalar != 1.0:
@@ -1114,10 +1313,6 @@ class Attention(nnx.Module):
       query = self._maybe_shard_with_logical(query, (DECODE_BATCH, DECODE_LENGTH, HEAD, D_KV))
       key = self._maybe_shard_with_logical(key, (DECODE_BATCH, DECODE_LENGTH, KV_HEAD, D_KV))
       value = self._maybe_shard_with_logical(value, (DECODE_BATCH, DECODE_LENGTH, KV_HEAD, D_KV))
-    elif model_mode == MODEL_MODE_TRAIN and self.config.expert_shard_attention_option == EP_AS_CONTEXT:
-      query = self._maybe_shard_with_logical(query, self.ep_query_axis_names)
-      key = self._maybe_shard_with_logical(key, self.ep_key_axis_names)
-      value = self._maybe_shard_with_logical(value, self.ep_value_axis_names)
     else:
       query = self._maybe_shard_with_logical(query, self.query_axis_names)
       key = self._maybe_shard_with_logical(key, self.key_axis_names)
@@ -1129,15 +1324,9 @@ class Attention(nnx.Module):
 
     assert not self.config.quantize_kvcache or self.kv_quant
 
-    if self.config.attention == "paged" and model_mode != MODEL_MODE_TRAIN:
-      unnormalized_out, _, exp_sum = self.paged_attention_op(
-          query, key, value, decoder_segment_ids, model_mode, previous_chunk, slot=slot, page_state=page_state
-      )
-      out = unnormalized_out / (exp_sum + 1e-9) if exp_sum is not None else unnormalized_out
-
-    elif self.config.attention == "vllm_rpa" and model_mode != MODEL_MODE_TRAIN:
+    if self.config.attention in ("vllm_rpa", "vllm_batched_rpa") and model_mode != MODEL_MODE_TRAIN:
       batch, seq_len, num_heads, head_dim = query.shape
-      updated_kv, attn_out = self.forward_serve_vllm(
+      attn_out, updated_kv = self.forward_serve_vllm(
           query, key, value, rpa_kv_cache=kv_cache, rpa_metadata=attention_metadata
       )
       out = attn_out.reshape(batch, seq_len, num_heads, head_dim)
@@ -1152,6 +1341,7 @@ class Attention(nnx.Module):
           key,
           value,
           decoder_segment_ids,
+          inputs_positions,
           model_mode,
           cached_values,
           previous_chunk,
@@ -1161,17 +1351,15 @@ class Attention(nnx.Module):
     out = jax.ad_checkpoint.checkpoint_name(out, "attention_out")
     if model_mode == MODEL_MODE_PREFILL:
       out = self._maybe_shard_with_logical(out, self.prefill_out_axis_names)
-    elif model_mode == MODEL_MODE_TRAIN and self.config.expert_shard_attention_option == EP_AS_CONTEXT:
-      out = self._maybe_shard_with_logical(out, self.ep_out_axis_names)
     elif model_mode == MODEL_MODE_TRAIN:
       out = self._maybe_shard_with_logical(out, self.out_axis_names)
     else:
       out = self._maybe_shard_with_logical(out, self.decode_out_axis_names)
-    if self.is_qwen3_next:
+    if self.is_qwen3_hybrid:
       out = out.reshape(batch_size, seq_len, self.config.num_query_heads * self.config.head_dim)
       out = out * jax.nn.sigmoid(gate)
     out = self.out_projection(out, out_sharding=out_sharding)
-    if self.config.distill_beta > 0.0:
+    if getattr(self.config, "distill_beta", 0.0) > 0.0:
       self.sow(nnx.Intermediate, "out_projection_activations", out)
     out = checkpoint_name(out, "out_proj")
     return out, kv_cache

@@ -64,7 +64,9 @@ python3 -m maxtext.trainers.pre_train.train src/maxtext/configs/base.yml \
     model_name=gpt-oss-20b \
     tokenizer_type=huggingface \
     tokenizer_path=openai/gpt-oss-20b \
-    dataset_type=synthetic \
+    dataset_type=grain \
+    grain_file_type=tfrecord \
+    dataset_path=${DATASET_PATH?} \
     enable_checkpointing=false \
     attention=flash \
     sparse_matmul=True \
@@ -90,6 +92,8 @@ python3 -m maxtext.trainers.pre_train.train src/maxtext/configs/base.yml \
     model_name=gpt-oss-20b \
     tokenizer_type=huggingface \
     tokenizer_path=openai/gpt-oss-20b \
+    dataset_type=grain \
+    grain_file_type=tfrecord \
     dataset_path=${DATASET_PATH?} \
     enable_checkpointing=true \
     async_checkpointing=false \
@@ -110,7 +114,7 @@ python3 -m maxtext.trainers.pre_train.train src/maxtext/configs/base.yml \
 One example command to run supervised finetuning with gpt-oss-20b on v5p-8. Supervised finetuning is only working with HuggingFace conversational datasets. And, you can customize the dataset path using the `hf_path` config. If using [gated dataset](https://huggingface.co/docs/hub/en/datasets-gated) or [gated model](https://huggingface.co/docs/hub/en/models-gated), you need additionally provide the access token with `hf_access_token` config.
 
 ```sh
-python3 -m maxtext.trainers.post_train.sft.train_sft_deprecated src/maxtext/configs/post_train/sft.yml \
+python3 -m maxtext.trainers.post_train.sft.train_sft_native src/maxtext/configs/post_train/sft.yml \
     base_output_directory=${BASE_OUTPUT_PATH?} \
     run_name=megablox_supervised_fine_tuning \
     model_name=gpt-oss-20b \
@@ -197,7 +201,7 @@ python3 -m tests.utils.forward_pass_logit_checker \
     dtype=float32 \
     --atol=0.1 --rtol=0.1 \
     --max_kl_div=3e-4 \
-    --golden_logits_path=${PWD}/golden_data_gpt-oss-20b.jsonl
+    --golden_logits_path=golden_data_gpt-oss-20b.jsonl
 ```
 This is to check unscanned checkpoint. To check scanned checkpoint, you can use `load_parameters_path=${SCANNED_CKPT_PATH} scan_layers=true`.
 

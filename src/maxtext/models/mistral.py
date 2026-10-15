@@ -16,9 +16,11 @@
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
 
-from flax import linen as nn
+import functools
+
 from flax import nnx
 from jax.ad_checkpoint import checkpoint_name
+import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 from maxtext.common.common_types import Config
@@ -29,6 +31,7 @@ from maxtext.layers.linears import Dropout, MlpBlock
 from maxtext.layers.normalizations import RMSNorm
 from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.utils import max_utils
+from maxtext.utils.sharding import create_sharding, get_logical_axis_rules, maybe_shard_with_logical
 
 # -----------------------------------------
 # The Decoder Layer for Mistral
@@ -55,10 +58,26 @@ class MistralDecoderLayer(nnx.Module):
     batch_size, seq_len = max_utils.get_batch_seq_len_for_mode(config, model_mode)
     dummy_inputs_shape = (batch_size, seq_len, config.emb_dim)
 
+    self.activation_axis_names = ("activation_batch", "activation_norm_length", "activation_embed")
+    self.mlp_activation_axis_names = ("activation_batch", "activation_norm_length", "activation_mlp")
+
+    # Physical shardings used to pin sublayer outputs under ShardMode.EXPLICIT. In
+    # ShardMode.AUTO the callees ignore these and let GSPMD infer the layout.
+    self.out_sharding = create_sharding(mesh, self.activation_axis_names, rules=get_logical_axis_rules())
+    self.mlp_intermediate_sharding = create_sharding(mesh, self.mlp_activation_axis_names, rules=get_logical_axis_rules())
+    self._maybe_shard_with_logical = functools.partial(
+        maybe_shard_with_logical,
+        mesh=mesh,
+        shard_mode=config.shard_mode,
+        debug_sharding=config.debug_sharding,
+        extra_stack_level=1,
+    )
+
     self.pre_self_attention_layer_norm = RMSNorm(
         num_features=config.emb_dim,
         dtype=config.dtype,
         weight_dtype=config.weight_dtype,
+        shard_mode=config.shard_mode,
         kernel_axes=("norm",),
         epsilon=config.normalization_layer_epsilon,
         rngs=self.rngs,
@@ -96,6 +115,7 @@ class MistralDecoderLayer(nnx.Module):
         num_features=config.emb_dim,
         dtype=config.dtype,
         weight_dtype=config.weight_dtype,
+        shard_mode=config.shard_mode,
         kernel_axes=("norm",),
         epsilon=config.normalization_layer_epsilon,
         rngs=self.rngs,
@@ -117,8 +137,6 @@ class MistralDecoderLayer(nnx.Module):
 
     self.dropout = Dropout(rate=config.dropout_rate, broadcast_dims=(-2,), rngs=self.rngs)
 
-    self.activation_axis_names = ("activation_batch", "activation_norm_length", "activation_embed")
-
   def __call__(
       self,
       inputs,
@@ -126,21 +144,26 @@ class MistralDecoderLayer(nnx.Module):
       decoder_positions,
       deterministic,
       model_mode,
-      page_state: None | int = None,
-      slot: None | int = None,
       previous_chunk=None,
+      slot: None | int = None,
       kv_cache=None,
       attention_metadata=None,
   ):
     cfg = self.config
 
     # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
-    if isinstance(inputs, tuple):
+    is_scan_carry = False
+    if isinstance(inputs, tuple) and len(inputs) == 3:
+      hidden_states, stacked_kv_cache, layer_idx = inputs
+      kv_cache = stacked_kv_cache[layer_idx]
+      inputs = hidden_states
+      is_scan_carry = True
+    elif isinstance(inputs, tuple):
       inputs = inputs[0]
-    inputs = nn.with_logical_constraint(inputs, self.activation_axis_names)
+    inputs = self._maybe_shard_with_logical(inputs, self.activation_axis_names)
     inputs = checkpoint_name(inputs, "decoder_layer_input")
-    lnx = self.pre_self_attention_layer_norm(inputs)
-    lnx = nn.with_logical_constraint(lnx, self.activation_axis_names)
+    lnx = self.pre_self_attention_layer_norm(inputs, out_sharding=self.out_sharding)
+    lnx = self._maybe_shard_with_logical(lnx, self.activation_axis_names)
 
     attention_lnx, kv_cache = self.self_attention(
         lnx,
@@ -150,37 +173,51 @@ class MistralDecoderLayer(nnx.Module):
         deterministic=deterministic,
         model_mode=model_mode,
         slot=slot,
-        page_state=page_state,
         previous_chunk=previous_chunk,
+        out_sharding=self.out_sharding,
         kv_cache=kv_cache,
         attention_metadata=attention_metadata,
     )
 
-    attention_lnx = nn.with_logical_constraint(attention_lnx, self.activation_axis_names)
+    attention_lnx = self._maybe_shard_with_logical(attention_lnx, self.activation_axis_names)
     intermediate_inputs = inputs + attention_lnx
 
     # Fully Connected
-    hidden_states = self.post_self_attention_layer_norm(intermediate_inputs)
-    hidden_states = nn.with_logical_constraint(hidden_states, self.activation_axis_names)
+    hidden_states = self.post_self_attention_layer_norm(intermediate_inputs, out_sharding=self.out_sharding)
+    hidden_states = self._maybe_shard_with_logical(hidden_states, self.activation_axis_names)
 
     # MLP block.
-    mlp_lnx = self.mlp(hidden_states, deterministic=deterministic)
-    mlp_lnx = nn.with_logical_constraint(mlp_lnx, self.activation_axis_names)
+    mlp_lnx = self.mlp(
+        hidden_states,
+        deterministic=deterministic,
+        intermediate_sharding=self.mlp_intermediate_sharding,
+        out_sharding=self.out_sharding,
+    )
+    mlp_lnx = self._maybe_shard_with_logical(mlp_lnx, self.activation_axis_names)
 
     layer_output = mlp_lnx + intermediate_inputs
     layer_output = self.dropout(layer_output, deterministic=deterministic)
-    layer_output = nn.with_logical_constraint(layer_output, self.activation_axis_names)
+    layer_output = self._maybe_shard_with_logical(layer_output, self.activation_axis_names)
 
-    if cfg.record_internal_nn_metrics:
-      self.sow("intermediates", "activation_mean", jnp.mean(layer_output))
-      self.sow("intermediates", "activation_stdev", jnp.std(layer_output))
+    if getattr(cfg, "record_internal_nn_metrics", False):
+      self.sow(nnx.Intermediate, "activation_mean", jnp.mean(layer_output))
+      self.sow(nnx.Intermediate, "activation_stdev", jnp.std(layer_output))
       self.sow(
-          "intermediates",
+          nnx.Intermediate,
           "activation_fraction_zero",
           jnp.sum(layer_output == 0) / jnp.size(layer_output),
       )
 
-    if cfg.scan_layers:
+    if is_scan_carry:
+
+      def update_cache(cache, val):
+        if jnp.size(val) > 0:
+          return cache.at[layer_idx].set(val)
+        return cache
+
+      stacked_kv_cache = jax.tree_util.tree_map(update_cache, stacked_kv_cache, kv_cache)  # pyrefly: ignore[unbound-name]
+      return (layer_output, stacked_kv_cache, layer_idx + 1), None  # pyrefly: ignore[unbound-name]
+    elif cfg.scan_layers:
       return layer_output, None
     else:
       return layer_output, kv_cache

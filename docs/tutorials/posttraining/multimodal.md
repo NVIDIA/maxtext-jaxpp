@@ -6,11 +6,16 @@ This document provides a guide to use the multimodal functionalities in MaxText 
 - **Multimodal Decode**: Inference with text+images as input.
 - **Supervised Fine-Tuning (SFT)**: Apply SFT to the model using a visual-question-answering dataset.
 
-We also provide a [colab](https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/examples/multimodal_gemma3_demo.ipynb) for multimodal features demonstration. The following table provides a list of models and modalities we currently support:
+We also provide a [colab](https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/examples/sft_multimodal_gemma3_demo.ipynb) for multimodal features demonstration. The following table provides a list of models and modalities we currently support:
 
-| Models                                         | Input Modalities | Output Modalities |
-| :--------------------------------------------- | :--------------- | :---------------- |
-| - Gemma3-4B/12B/27B<br>- Llama4-Scout/Maverick | Text, images     | Text              |
+| Models                       | Input: Text | Input: Image | Input: Video | Input: Audio | Output |
+| :--------------------------- | :---------: | :----------: | :----------: | :----------: | :----: |
+| **Gemma3** (4B/12B/27B)      |      ✓      |      ✓       |              |              |  Text  |
+| **Gemma4** (26B/31B)         |      ✓      |      ✓       |              |              |  Text  |
+| **Llama4** (Scout/Maverick)  |      ✓      |      ✓       |              |              |  Text  |
+| **Qwen3-VL** (2B/4B/30B-A3B) |      ✓      |      ✓       |      ✓       |              |  Text  |
+| **Qwen3-Omni**               |      ✓      |      ✓       |      ✓       |      ✓       |  Text  |
+| **Qwen3.5** (35B/397B)       |      ✓      |      ✓       |      ✓       |              |  Text  |
 
 ## Introduction
 
@@ -23,40 +28,85 @@ Multimodal Large Language Models (LLMs) extend traditional text-only models by i
 ![Illustration of multimodal MaxText.](../../_static/multimodal_overview.png)
 *Figure 1: Overview of multimodal dataflow in MaxText.*
 
+## Install MaxText
+
+For instructions on installing MaxText on your VM, please refer to the [official documentation](../../install_maxtext.md#from-source) and use the `maxtext[tpu]` installation path to include all necessary dependencies.
+
+> **Note:** If you have previously installed MaxText with a different option, we strongly recommend using a fresh virtual environment for `maxtext[tpu]` to avoid potential library version conflicts.
+
+## Setup environment variables
+
+Login to Hugging Face. Provide your access token when prompted:
+
+```bash
+hf auth login
+```
+
+Set up the following environment variables to configure your training run. Replace
+placeholders with your actual values.
+
+```bash
+# -- Model configuration --
+# The MaxText model name. See `src/maxtext/configs/types.py` for `ModelName` for a
+# full list of supported models.
+export MODEL=<MODEL_NAME> # e.g., 'gemma3-4b'
+
+# -- MaxText configuration --
+# Use a GCS bucket you own to store logs and checkpoints. Ideally in the same
+# region as your TPUs to minimize latency and costs.
+# You can list your buckets and their locations in the
+# [Cloud Console](https://console.cloud.google.com/storage/browser).
+export BASE_OUTPUT_DIRECTORY=<GCS_BUCKET> # e.g., gs://my-bucket/maxtext-runs
+
+# An arbitrary string to identify this specific run.
+# We recommend to include the model, user, and timestamp.
+export RUN_NAME=<RUN_NAME>
+
+export STEPS=<STEPS> # e.g., 1000
+```
+
 ## Checkpoint Conversion
 
-Recently we have onboarded a new centralized tool for bidirectional checkpoint conversion between MaxText and HuggingFace ([README](https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/checkpoint_conversion/README.md)).
+This section explains how to prepare your model checkpoint for use with MaxText.
 
-Install pytorch:
+### Option 1: Using an existing MaxText checkpoint
 
+If you already have a MaxText-compatible model checkpoint, simply set the following environment variable and move on to the next section.
+
+```sh
+export MAXTEXT_CKPT_PATH=<CKPT_PATH> # e.g., gs://my-bucket/my-model-checkpoint/0/items
 ```
+
+### Option 2: Converting a Hugging Face checkpoint
+
+Refer to [Hugging Face to MaxText](hf-to-maxtext) to convert a hugging face checkpoint to MaxText. Make sure you have correct checkpoint files converted and saved. Use this command to convert an unscanned checkpoint from HuggingFace to MaxText:
+
+```sh
 python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-```
 
-Then use this command to convert an unscanned checkpoint from HuggingFace to MaxText, and save it to `MAXTEXT_CKPT_GCS_PATH`:
-
-```shell
-export HF_ACCESS_TOKEN=hf_...
-export MAXTEXT_CKPT_GCS_PATH=gs://...
-python -m maxtext.checkpoint_conversion.to_maxtext \
-    model_name=gemma3-4b \
-    hf_access_token=${HF_ACCESS_TOKEN?} \
-    base_output_directory=${MAXTEXT_CKPT_GCS_PATH?} \
+# We explicitly set lazy_load_tensors to False here as lazy loading of tensors
+# is not supported when use_multimodal is True.
+python3 -m maxtext.checkpoint_conversion.to_maxtext \
+    model_name=${MODEL?} \
+    base_output_directory=${BASE_OUTPUT_DIRECTORY?} \
     use_multimodal=true \
-    scan_layers=false
+    scan_layers=false \
+    --lazy_load_tensors=False \
+    --eager_load_method="transformers"
 ```
 
-For the Llama4 model family, we are using a separate checkpoint conversion script (of note, we will gradually migrate all checkpoint conversion scripts to the above consolidated tool soon):
+After conversion finishes, set `MAXTEXT_CKPT_PATH` to the converted MaxText checkpoint path.
 
-```shell
-export LOCAL_HF_MODEL_PATH=...  # Need to pre-download the safetensors from HuggingFace
-export MAXTEXT_CKPT_GCS_PATH=gs://...
-python -m maxtext.checkpoint_conversion.standalone_scripts.llama4_ckpt_unscanned \
-    --model-size=llama4-17b-16e \
-    --huggingface-checkpoint=True \
-    --base-model-path=${LOCAL_HF_MODEL_PATH?} \
-    --maxtext-model-path=${MAXTEXT_CKPT_GCS_PATH?}
+```sh
+export MAXTEXT_CKPT_PATH=<CKPT_PATH> # e.g., gs://my-bucket/my-model-checkpoint/0/items
 ```
+
+> [!IMPORTANT]
+> **Automatic `scan_layers` Resolution:**
+> MaxText automatically loads `scan_layers` from the checkpoint's saved metadata when resuming (via `load_parameters_path`) if you do not explicitly specify it on the command-line.
+>
+> - You do not need to manually supply `scan_layers=False` (or `scan_layers=True`) when loading checkpoints; MaxText will configure this automatically.
+> - If you do explicitly provide a `scan_layers` argument, it must match the checkpoint's saved setting or a `ValueError` mismatch error will be raised.
 
 ## Multimodal Decode
 
@@ -68,21 +118,18 @@ MaxText supports multimodal decoding, allowing you to input text with multiple i
 
 Since each model uses a unique native chatting template from its pretraining, we've implemented these specific templates within `multimodal_utils.py` and apply them directly to your prompt.
 
+### Decode with Text + Image
+
 To run a forward pass and verify the model's output, use the following command:
 
-```shell
-# Gemma3 decode
-python -m maxtext.inference.decode \
-    model_name=gemma3-4b \
-    hf_access_token=${HF_ACCESS_TOKEN?} \
+```sh
+python3 -m maxtext.inference.decode \
+    model_name=${MODEL?} \
     tokenizer_path=src/maxtext/assets/tokenizers/tokenizer.gemma3 \
-    load_parameters_path=${MAXTEXT_CKPT_GCS_PATH?}/0/items \
+    load_parameters_path=${MAXTEXT_CKPT_PATH?} \
     per_device_batch_size=1 \
-    run_name=ht_test \
     max_prefill_predict_length=272 \
     max_target_length=300 \
-    steps=1 \
-    async_checkpointing=false \
     scan_layers=false \
     use_multimodal=true \
     prompt='Describe image <start_of_image>' \
@@ -98,7 +145,7 @@ Describe image <start_of_image><end_of_turn>
 <start_of_turn>model
 ` -> `Here's a description of the image:
 
-**Overall Impression:** The image is a bright, expansive cityscape view of Seattle, Washington, with`
+**Overall Impression:** The image is a bright, expansive cityscape view of Seattle, Washington,`
 ```
 
 To decode with multiple images at once, you can provide multiple image paths like this:
@@ -107,8 +154,8 @@ To decode with multiple images at once, you can provide multiple image paths lik
 export TARGET_LENGTH=...  # Adjust to fit expected output length
 export PREDICT_LENGTH=...  # Adjust to fit image tokens + text prompt
 
-python -m maxtext.inference.decode \
-    model_name=gemma3-4b \
+python3 -m maxtext.inference.decode \
+    model_name=${MODEL?} \
     ... \
     max_prefill_predict_length=${PREDICT_LENGTH?}  # Adjust to fit image tokens + text prompt \
     max_target_length=${TARGET_LENGTH?} \
@@ -119,21 +166,51 @@ python -m maxtext.inference.decode \
 
 For larger models such as Llama4-Scout/Maverick, we suggest to run the decoding on a TPU cluster such as v5p-16.
 
+### Decode with Text + Video + Audio
+
+For models that support video input (e.g., Qwen3-Omni and Qwen3.5), pass a video file via `video_path`. For Qwen3-Omni, which also supports audio, set `use_audio_in_video=true` to additionally process the embedded audio track. Since the required token budget scales with video length and resolution, set `max_prefill_predict_length` accordingly.
+
+```sh
+# Qwen3-Omni decode with video + audio
+export MAXTEXT_CKPT_PATH=<Checkpoint GCS path>  # gs://my-bucket/path/0/items for Qwen3-Omni
+python3 -m maxtext.inference.decode \
+    model_name=qwen3-omni-30b-a3b \
+    tokenizer_path=Qwen/Qwen3-Omni-30B-A3B-Instruct \
+    tokenizer_type=huggingface \
+    load_parameters_path=${MAXTEXT_CKPT_PATH?} \
+    per_device_batch_size=1 \
+    scan_layers=false \
+    use_multimodal=true \
+    use_audio_in_video=true \
+    prompt='What can you see and hear? Answer in one short sentence.' \
+    video_path='tests/assets/test_video.mp4' \
+    max_prefill_predict_length=1250 \
+    max_target_length=1280 \
+    add_bos=false \
+    attention='dot_product' \
+```
+
+The expected output will look similar to:
+
+```
+Input `<|im_start|>user
+<|vision_start|><|video_pad|><|vision_end|>What can you see and hear? Answer in one short sentence.<|im_end|>
+<|im_start|>assistant
+` -> `A roaring Tyrannosaurus rex animatronic is displayed in a museum exhibit.
+```
+
 ## Supervised Fine-Tuning
 
 Supervised Fine-Tuning (SFT) of multimodal LLMs in MaxText focuses specifically on post-training; we don't yet support pre-training multimodal models from scratch. The SFT process typically involves training on Visual Question Answering (VQA) datasets where the model learns to generate accurate text responses based on both visual and textual inputs. During this fine-tuning phase, we recommend to freeze the pre-trained encoder layers (such as vision transformers) to preserve their learned visual representations, while the projection layers and LLM decoder components remain trainable. This selective training strategy allows the model to adapt the cross-modal alignment and text generation capabilities without disrupting the robust feature extraction abilities of the encoders, ultimately leading to improved performance on multimodal understanding and reasoning tasks while maintaining computational efficiency. This is achieved by setting `freeze_vision_encoder_params=True` in [sft-vision-chartqa.yml](https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/configs/post_train/sft-vision-chartqa.yml).
 
-Here, we use [ChartQA](https://huggingface.co/datasets/HuggingFaceM4/ChartQA) as an example to demonstrate SFT functionality:
+**Text+image SFT is supported for all models listed above.** The following example uses Gemma3-4B with the [ChartQA](https://huggingface.co/datasets/HuggingFaceM4/ChartQA) dataset:
 
 ```shell
-export UNSCANNED_CKPT_PATH=...  # either set to an already available MaxText ckpt or to the one we just converted in the previous step
-python -m maxtext.trainers.post_train.sft.train_sft_deprecated \
+python3 -m maxtext.trainers.post_train.sft.train_sft_native \
     src/maxtext/configs/post_train/sft-vision-chartqa.yml \
-    run_name="chartqa-sft" \
-    model_name=gemma3-4b \
-    tokenizer_path="google/gemma-3-4b-it" \
-    hf_access_token=${HF_ACCESS_TOKEN?} \
-    load_parameters_path=${UNSCANNED_CKPT_PATH?} \
+    run_name=${RUN_NAME?} \
+    model_name=${MODEL?} \
+    load_parameters_path=${MAXTEXT_CKPT_PATH?} \
     base_output_directory=${BASE_OUTPUT_DIRECTORY?} \
     per_device_batch_size=1 \
     steps=${STEPS?} \
@@ -145,7 +222,7 @@ python -m maxtext.trainers.post_train.sft.train_sft_deprecated \
     enable_checkpointing=True \
     attention=dot_product \
     max_num_images_per_example=1 \
-    dataset_type=hf profiler=xplane
+    dataset_type=grain profiler=xplane
 ```
 
 ## Other Recommendations
@@ -153,12 +230,12 @@ python -m maxtext.trainers.post_train.sft.train_sft_deprecated \
 - **Setting appropriate prefill length**: To prevent truncation and ensure your full input (text + image) is processed, the prefill length should be set longer than the total combined length of your text tokens and image tokens. This combined length makes up the final sequence fed to the decoder. We recommend to estimate the combined sequence length from your full input and then add a buffer when setting your `max_prefill_predict_length` for decoding. Token estimation rules:
   - For text tokens, a good estimate is:
 
-    $\\text{Text Tokens} \\approx 1.3 \\times \\text{Number of Words in Prompt}$.
+    $\text{Text Tokens} \approx 1.3 \times \text{Number of Words in Prompt}$.
 
   - For Gemma3, each image is resized to 896\*896 and contributes 256 tokens:
 
-    $\\text{Total Tokens} \\approx \\text{Text Tokens} + \\text{Number of Images} * 256$.
+    $\text{Total Tokens} \approx \text{Text Tokens} + \text{Number of Images} * 256$.
 
   - For Llama4 models, each image is dynamically tiled based on its size, with each resulting tile contributing 144 tokens:
 
-    $\\text{Total Tokens} \\approx \\text{Text Tokens} + 144 \\times \\sum\_{i=1}^{N} \\text{Number of Tiles of Image}\_i$.
+    $\text{Total Tokens} \approx \text{Text Tokens} + 144 \times \sum_{i=1}^{N} \text{Number of Tiles of Image}_i$.

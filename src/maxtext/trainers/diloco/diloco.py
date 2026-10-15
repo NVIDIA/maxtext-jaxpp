@@ -1,16 +1,16 @@
-#  Copyright 2025 Google LLC
+# Copyright 2025 Google LLC
 #
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#       https://www.apache.org/licenses/LICENSE-2.0
+#      https://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """An implementation of Distributed Low-Communication (DiLoCo) training.
 
@@ -22,18 +22,19 @@ This module contains implementations of:
     https://arxiv.org/abs/2501.18512
 """
 
-from collections.abc import Sequence
 from typing import Any, Callable
 
 import drjax
+from flax import nnx
 from flax import struct
-from flax.training import train_state
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Int32, Key, PyTree, UInt32
+from maxtext.configs import pyconfig
+from maxtext.trainers.diloco import utils as diloco_utils
+from maxtext.utils import diloco_sharding
 import optax
 
-from maxtext.configs import pyconfig
 
 Batch = Any
 Params = PyTree
@@ -49,72 +50,19 @@ class DiLoCoTrainState(struct.PyTreeNode):
 
   Attributes:
     inner_state: A `flax.training.train_state.TrainState` of the state for each
-      step of the inner optimization.  All arrays are expected to have a leading
+      step of the inner optimization. All arrays are expected to have a leading
       dimension with size of the number of diloco replicas so that training
       steps can be mapped over this dimension.
-    params: A PyTree of the global model weights. These will mimic a
-      sub-PyTree in `inner_state`, which rank-1 shape.
+    params: A PyTree of the global model weights. These will mimic a sub-PyTree
+      in `inner_state`, which rank-1 shape.
     outer_opt_state: The state for the outer Nesterov momentum optimizer.
     step: The step counter of the training process.
   """
 
-  inner_state: train_state.TrainState
+  inner_state: Any
   params: Params
   outer_opt_state: OptState
   step: Step
-
-
-def add_diloco_to_sharding(pytree):
-  """
-  Recursively traverses a PyTree and prepends 'diloco' to the PartitionSpec
-  of any NamedSharding object that doesn't have an empty PartitionSpec.
-  """
-
-  def map_fn(leaf):
-    if isinstance(leaf, jax.sharding.NamedSharding):
-      new_spec = jax.sharding.PartitionSpec("diloco", *leaf.spec)
-      return jax.sharding.NamedSharding(mesh=leaf.mesh, spec=new_spec)
-    return leaf
-
-  return jax.tree_util.tree_map(map_fn, pytree)
-
-
-def reshape_first_axis_with_diloco(num_diloco_replicas: int, pytree: PyTree) -> PyTree:
-  """Reshapes the first dimension of each array in the PyTree to include a DiLoCo axis.
-
-  This function takes a a batch of data represented as a PyTree
-  and reshapes the leading dimension of each array within it. The purpose is
-  to introduce a new 'diloco' axis, which is used for distributing data
-  across DiLoCo replicas.
-
-  Args:
-    num_diloco_replicas: The number of DiLoCo replicas. This determines the
-      size of the new leading dimension.
-    pytree: The input PyTree, where each array is expected to have a batch
-      dimension as its first axis.
-
-  Returns:
-    A new PyTree with the same structure as the input, but with each array's
-    first dimension reshaped to `(num_diloco_replicas, original_batch_dim // num_diloco_replicas, ...)`.
-    The sharding specification is also updated to include the 'diloco' axis.
-  """
-
-  def extend_pspec(pspec: jax.sharding.PartitionSpec | Sequence[str | Sequence[str]] = ()) -> jax.sharding.PartitionSpec:
-    if tuple(*pspec)[0] == "diloco":
-      # pull out diloco axis if already present
-      return jax.sharding.PartitionSpec("diloco", (*pspec[0][1:],), (*pspec[1:],))
-    return jax.sharding.PartitionSpec("diloco", *pspec)
-
-  def reshape_for_diloco(arr):
-    batch_dim, *example_shape = arr.shape
-    diloco_shape = (num_diloco_replicas, batch_dim // num_diloco_replicas, *example_shape)
-    if hasattr(arr, "sharding"):
-      s = arr.sharding
-      s = jax.sharding.NamedSharding(mesh=s.mesh, spec=extend_pspec(s.spec))
-      return jax.lax.with_sharding_constraint(jnp.reshape(arr, shape=diloco_shape), s)
-    return jnp.reshape(arr, shape=diloco_shape)
-
-  return jax.tree.map(reshape_for_diloco, pytree)
 
 
 def build_abstract_diloco_state(
@@ -153,7 +101,12 @@ def build_abstract_diloco_state(
       momentum=config.diloco_outer_momentum,
       nesterov=True,
   )
-  outer_opt_state = jax.eval_shape(outer_optimizer.init, abstract_state.params)
+  # Model params (Param variables only) live under abstract_state.model.
+  _, model_params, _ = nnx.split(abstract_state.model, nnx.Param, ...)
+  model_params = model_params.to_pure_dict()  # pyrefly: ignore[missing-attribute]
+  _, model_params_sharding, _ = nnx.split(state_mesh_shardings.model, nnx.Param, ...)
+  model_params_sharding = model_params_sharding.to_pure_dict()  # pyrefly: ignore[missing-attribute]
+  outer_opt_state = jax.eval_shape(outer_optimizer.init, model_params)
 
   # Create abstract step
   abstract_step = jax.ShapeDtypeStruct((), jnp.int32)
@@ -161,24 +114,24 @@ def build_abstract_diloco_state(
   # Build abstract DiLoCo state
   diloco_state = DiLoCoTrainState(
       inner_state=inner_state,
-      params=abstract_state.params,
+      params=model_params,
       outer_opt_state=outer_opt_state,
-      step=abstract_step,
+      step=abstract_step,  # pyrefly: ignore[bad-argument-type]
   )
 
   # Build shardings
-  inner_state_shardings = add_diloco_to_sharding(state_mesh_shardings)
+  inner_state_shardings = diloco_utils.add_diloco_to_sharding(state_mesh_shardings)
   # Sharding for outer_opt_state. For SGD with momentum, it is (TraceState(trace=...), EmptyState())
   # We shard the momentum trace the same way as the parameters.
   outer_opt_state_sharding = (
-      optax.TraceState(trace=state_mesh_shardings.params),
+      optax.TraceState(trace=model_params_sharding),
       optax.EmptyState(),
   )
   diloco_state_shardings = DiLoCoTrainState(
       inner_state=inner_state_shardings,
-      params=state_mesh_shardings.params,
+      params=model_params_sharding,
       outer_opt_state=outer_opt_state_sharding,
-      step=None,
+      step=None,  # pyrefly: ignore[bad-argument-type]
   )
 
   return diloco_state, diloco_state_shardings, inner_state_shardings
@@ -186,7 +139,7 @@ def build_abstract_diloco_state(
 
 def build_diloco_state(
     config: "pyconfig.HyperParameters",
-    initialize_state: Callable[[], train_state.TrainState],
+    initialize_state: Callable[[], Any],
     mesh: jax.sharding.Mesh | None = None,
 ) -> tuple[DiLoCoTrainState, PyTree]:
   """Given a non-DiLoCo train state, construct a DiLoCo training state."""
@@ -205,84 +158,142 @@ def build_diloco_state(
     # mesh automatically when jax.set_mesh is used.
     inner_state = drjax.broadcast(state, mesh=mesh)
     # Outer state retains a single copy of the model parameters and optimizer state.
-    outer_params = state.params
+    # Model params (Param variables only) live under state.model.
+    _, outer_params, _ = nnx.split(state.model, nnx.Param, ...)
+    outer_params = outer_params.to_pure_dict()  # pyrefly: ignore[missing-attribute]
     outer_opt_state = outer_optimizer.init(outer_params)
     outer_opt_state_sharding = jax.tree_util.tree_map(lambda x: x.sharding, outer_opt_state)
+    step = state.optimizer.step
     return (
-        DiLoCoTrainState(inner_state=inner_state, params=outer_params, outer_opt_state=outer_opt_state, step=state.step),
+        DiLoCoTrainState(inner_state=inner_state, params=outer_params, outer_opt_state=outer_opt_state, step=step),
         outer_opt_state_sharding,
     )
 
   return init_diloco_state()
 
 
-def build_diloco_train_step(
+def build_vanilla_diloco_train_step(
     config: pyconfig.HyperParameters,
-    train_step: Callable[[train_state.TrainState, Batch, PRNGKey], tuple[train_state.TrainState, Metrics]],
+    train_step: Callable[[Any, Batch, PRNGKey], tuple[Any, Metrics]],
     mesh: jax.sharding.Mesh | None = None,
 ) -> Callable[[DiLoCoTrainState, Batch, PRNGKey], tuple[DiLoCoTrainState, Metrics]]:
-  """Convert a local state and train step into DiLoCo-compatible versions.
-
-  This is an implementation of the original (non-streaming) DiLoCo algorithm
-  which syncs all model parameters across  the replicas every
-  `config.diloco_sync_period` steps, treating the difference accumulated over
-  non-sync steps as a pseudo gradient and applying SGD with Nesterov momentum on
-  the "global" model.
-
-  Args:
-    config: The config used to set up training.
-    train_step: A local train step. This will be executed independently within
-      each replica.
-  """
+  """Convert a local state and train step into vanilla DiLoCo train step."""
   outer_optimizer = optax.sgd(
       config.diloco_outer_lr,
       momentum=config.diloco_outer_momentum,
       nesterov=True,
   )
 
-  def synchronize(state):
-    # Calculate the delta between the current replica's state and the global
-    # state (since last synchronization).
-    broadcast_outer_params = drjax.broadcast(state.params, mesh=mesh)
-    model_delta = jax.tree.map(lambda x, y: y - x, state.inner_state.params, broadcast_outer_params)
-    # Treat the average delta as the outer optimizer's gradient and apply to
-    # the global (outer) model params.
-    averaged_pseudo_grad = drjax.reduce_mean(model_delta)
-    updates, new_opt_state = outer_optimizer.update(averaged_pseudo_grad, state.outer_opt_state, state.params)
-    new_outer_params = optax.apply_updates(state.params, updates)
-    # Replace inner model params with the new global model params.
-    # NOTE: inner optimizer state is retained despite the change in parameters,
-    # see section 6.1 in https://arxiv.org/pdf/2311.08105.
-    new_inner_state = drjax.map_fn(lambda state: state.replace(params=new_outer_params), state.inner_state, mesh=mesh)
-    return state.replace(
-        params=new_outer_params,
-        outer_opt_state=new_opt_state,
-        inner_state=new_inner_state,
-    )
-
-  def typed_reduce_mean(in_tree):
-    total = drjax.reduce_sum(in_tree)
-    avg = jax.tree.map(lambda x: (x / config.num_diloco_replicas).astype(x.dtype), total)
-    return avg
-
   @drjax.program(placements={"diloco": config.num_diloco_replicas})
-  def diloco_train_step(state, batch, prng):
-    # Broadcast the RNG across replicas.
-    broadcast_rng = drjax.broadcast(prng, mesh=mesh)
-    inner_state, metrics = drjax.map_fn(train_step, (state.inner_state, batch, broadcast_rng), mesh=mesh)
-    avg_metrics = typed_reduce_mean(metrics)
+  def vanilla_diloco_train_step(state: DiLoCoTrainState, batch: Batch, prng: PRNGKey):
+    keys = jax.random.split(prng, config.num_diloco_replicas) if prng is not None else None
+    inner_state, metrics = drjax.map_fn(train_step, (state.inner_state, batch, keys), mesh=mesh)
+    default_metrics = diloco_utils.extract_per_island_metrics(metrics, config.num_diloco_replicas)
+    new_step = inner_state.optimizer.step[0]
     state = state.replace(
         inner_state=inner_state,
-        step=inner_state.step[0],
+        step=new_step,
     )
-    # Either synchronize the model, or no-op, depending on whether the current
-    # step falls on the synchronization period.
+
     state = jax.lax.cond(
-        inner_state.step[0] % config.diloco_sync_period == 0,
-        synchronize,
-        lambda x: x,  # no-op
+        new_step % config.diloco_sync_period == 0,
+        lambda s: diloco_utils.synchronize_full_state(s, outer_optimizer, mesh=mesh),
+        lambda x: x,
         state,
     )
-    return state, avg_metrics
+    return state, default_metrics
 
-  return diloco_train_step
+  return vanilla_diloco_train_step
+
+
+def build_streaming_diloco_train_step(
+    config: pyconfig.HyperParameters,
+    train_step: Callable[[Any, Batch, PRNGKey], tuple[Any, Metrics]],
+    mesh: jax.sharding.Mesh | None = None,
+) -> Callable[[DiLoCoTrainState, Batch, PRNGKey], tuple[DiLoCoTrainState, Metrics]]:
+  """Convert a local state and train step into streaming DiLoCo train step."""
+  outer_optimizer = optax.sgd(
+      config.diloco_outer_lr,
+      momentum=config.diloco_outer_momentum,
+      nesterov=True,
+  )
+  num_fragments = config.num_diloco_fragments
+  steps_between_syncs, period = diloco_utils.get_streaming_schedule(config)
+  delay_v = config.num_communication_overlapping_steps
+  alpha = config.communication_overlapping_alpha
+
+  @drjax.program(placements={"diloco": config.num_diloco_replicas})
+  def streaming_diloco_train_step(state: DiLoCoTrainState, batch: Batch, prng: PRNGKey):
+    keys = jax.random.split(prng, config.num_diloco_replicas) if prng is not None else None
+    inner_state, metrics = drjax.map_fn(train_step, (state.inner_state, batch, keys), mesh=mesh)
+    default_metrics = diloco_utils.extract_per_island_metrics(metrics, config.num_diloco_replicas)
+    new_step = inner_state.optimizer.step[0]
+    state = state.replace(
+        inner_state=inner_state,
+        step=new_step,
+    )
+
+    manipulator = diloco_utils.FragmentedTreeManipulator.create(state.params, config)
+
+    # Step 1: Run the synchronization logic if we hit a sync step
+    is_sync_step = (new_step > 0) & (new_step % steps_between_syncs == 0)
+
+    def do_sync(s):
+      frag_idx = (new_step % period) // steps_between_syncs
+      return jax.lax.switch(
+          frag_idx,
+          [
+              lambda s_arg, idx=i: diloco_utils.synchronize_fragment_state(
+                  s_arg, manipulator, idx, outer_optimizer, mesh=mesh
+              )
+              for i in range(num_fragments)
+          ],
+          s,
+      )
+
+    state = jax.lax.cond(is_sync_step, do_sync, lambda s: s, state)
+
+    # Step 2: Apply the synced parameters (with delay V)
+    is_apply_step = (new_step - delay_v > 0) & ((new_step - delay_v) % steps_between_syncs == 0)
+
+    def do_apply(s):
+      frag_idx = ((new_step - delay_v) % period) // steps_between_syncs
+      return jax.lax.switch(
+          frag_idx,
+          [
+              lambda s_arg, idx=i: diloco_utils.apply_fragment_to_inner_state(
+                  s_arg, manipulator, idx, alpha=alpha, mesh=mesh
+              )
+              for i in range(num_fragments)
+          ],
+          s,
+      )
+
+    state = jax.lax.cond(is_apply_step, do_apply, lambda s: s, state)
+
+    return state, default_metrics
+
+  return streaming_diloco_train_step
+
+
+def build_diloco_train_step(
+    config: pyconfig.HyperParameters,
+    train_step: Callable[[Any, Batch, PRNGKey], tuple[Any, Metrics]],
+    mesh: jax.sharding.Mesh | None = None,
+) -> Callable[[DiLoCoTrainState, Batch, PRNGKey], tuple[DiLoCoTrainState, Metrics]]:
+  """Convert a local state and train step into DiLoCo-compatible versions.
+
+  Args:
+    config: The config used to set up training.
+    train_step: A local train step. This will be executed independently within
+      each replica.
+    mesh: The mesh for sharding.
+  """
+  if config.enable_streaming_diloco:
+    return build_streaming_diloco_train_step(config, train_step, mesh=mesh)
+  return build_vanilla_diloco_train_step(config, train_step, mesh=mesh)
+
+
+# Re-exports for backward compatibility
+reshape_first_axis_with_diloco = diloco_sharding.reshape_first_axis_with_diloco
+add_diloco_to_sharding = diloco_sharding.add_diloco_to_sharding

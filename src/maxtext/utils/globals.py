@@ -20,11 +20,11 @@ import os.path
 # Since this file is at src/maxtext/utils/globals.py, we need to go up 2 levels
 MAXTEXT_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# This is the maxtext repo root: with ".git" folder; "README.md"; "pyproject.toml"; &etc.
+# This is the maxtext repo root: with ".git" folder or file (when using Git worktrees); "README.md"; "pyproject.toml"; etc.
 MAXTEXT_REPO_ROOT = os.environ.get(
     "MAXTEXT_REPO_ROOT",
     r
-    if os.path.isdir(
+    if os.path.exists(
         os.path.join(r := os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), ".git")
     )
     else MAXTEXT_PKG_DIR,
@@ -50,6 +50,10 @@ HF_IDS = {
     "gemma3-4b": "google/gemma-3-4b-it",  # hf multi-modal should also support the pure-text
     "gemma3-12b": "google/gemma-3-12b-it",
     "gemma3-27b": "google/gemma-3-27b-it",
+    "gemma4-26b": "google/gemma-4-26b-a4b-it",
+    "gemma4-31b": "google/gemma-4-31b-it",
+    "gemma4-e2b": "google/gemma-4-E2B-it",
+    "gemma4-e4b": "google/gemma-4-E4B-it",
     "qwen2.5-1.5b": "Qwen/Qwen2.5-1.5B-Instruct",
     "qwen2.5-7b": "Qwen/Qwen2.5-7B-Instruct",
     "qwen2.5-14b": "Qwen/Qwen2.5-14B-Instruct",
@@ -59,26 +63,39 @@ HF_IDS = {
     "qwen3-8b": "Qwen/Qwen3-8B",
     "qwen3-14b": "Qwen/Qwen3-14B",
     "qwen3-32b": "Qwen/Qwen3-32B",
+    "qwen3-vl-2b": "Qwen/Qwen3-VL-2B-Instruct",
+    "qwen3-vl-4b": "Qwen/Qwen3-VL-4B-Instruct",
+    "qwen3-vl-30b-a3b": "Qwen/Qwen3-VL-30B-A3B-Instruct",
     "llama3.1-8b": "meta-llama/Llama-3.1-8B",
     "llama3.1-8b-Instruct": "meta-llama/Llama-3.1-8B-Instruct",
     "llama3.1-70b-Instruct": "meta-llama/Llama-3.1-70B-Instruct",
     "llama3.1-70b": "meta-llama/Llama-3.1-70B",
     "llama3.1-405b": "meta-llama/Llama-3.1-405B",
     "qwen3-30b-a3b": "Qwen/Qwen3-30B-A3B-Thinking-2507",
+    "qwen3-30b-a3b-base": "Qwen/Qwen3-30B-A3B-Base",
     "qwen3-235b-a22b": "Qwen/Qwen3-235B-A22B-Thinking-2507",
     "qwen3-480b-a35b": "Qwen/Qwen3-Coder-480B-A35B-Instruct",
     "deepseek2-16b": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek3-671b": "deepseek-ai/DeepSeek-V3",
     "deepseek3.2-671b": "deepseek-ai/DeepSeek-V3.2",
-    "gpt-oss-20b": "openai/gpt-oss-20b",
-    "gpt-oss-120b": "openai/gpt-oss-120b",
+    "deepseek4-284b": "deepseek-ai/DeepSeek-V4-Flash",
+    "gpt-oss-20b": "unsloth/gpt-oss-20b-BF16",
+    "gpt-oss-120b": "unsloth/gpt-oss-120b-BF16",
     "qwen3-omni-30b-a3b": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
     "qwen3-next-80b-a3b": "Qwen/Qwen3-Next-80B-A3B-Instruct",
+    "qwen3.5-397b-a17b": "Qwen/Qwen3.5-397B-A17B",
+    "qwen3.5-397b-a17b-fp8": "Qwen/Qwen3.5-397B-A17B-FP8",
+    "qwen3.5-35b-a3b": "Qwen/Qwen3.5-35B-A3B",
+    "qwen3.5-35b-a3b-fp8": "Qwen/Qwen3.5-35B-A3B-FP8",
+    "qwen3.5-35b-fp8": "Qwen/Qwen3.5-35B-A3B-FP8",
     "mixtral-8x7b": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "mistral-7b": "mistralai/Mistral-7B-v0.1",
     "mixtral-8x22b": "mistralai/Mixtral-8x22B-Instruct-v0.1",
     "olmo3-7b": "allenai/Olmo-3-7B-Instruct",
     "olmo3-7b-pt": "allenai/Olmo-3-1025-7B",
     "olmo3-32b": "allenai/Olmo-3-32B-Think",
+    "weaver-mini": "Qwen/Qwen3-VL-4B-Instruct",
+    "weaver-max": "Qwen/Qwen3-VL-8B-Instruct",
     # "default" is not HF model, but adding to to avoid confusing warning about tokenizer_path
     "default": os.path.join(MAXTEXT_ASSETS_ROOT, "tokenizers/tokenizer.llama2"),
 }

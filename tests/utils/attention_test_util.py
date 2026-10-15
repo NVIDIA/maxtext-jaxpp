@@ -23,12 +23,12 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from maxtext.configs import pyconfig
 from maxtext.common.gcloud_stub import is_decoupled
-from maxtext.common.common_types import AttentionType, DECODING_ACTIVE_SEQUENCE_INDICATOR, EP_AS_CONTEXT, MODEL_MODE_PREFILL, MODEL_MODE_TRAIN, ShardMode
+from maxtext.common.common_types import AttentionType, DECODING_ACTIVE_SEQUENCE_INDICATOR, MODEL_MODE_PREFILL, MODEL_MODE_TRAIN, ShardMode
 from maxtext.layers.attention_mla import MLA
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
 from maxtext.utils.sharding import maybe_shard_with_name
-from tests.utils.test_helpers import get_test_config_path, get_decoupled_parallelism_overrides
+from tests.utils.test_helpers import get_test_config_path
 
 
 class MLATestBase(parameterized.TestCase):
@@ -47,6 +47,8 @@ class MLATestBase(parameterized.TestCase):
       "qk_nope_head_dim": 128,
       "qk_rope_head_dim": 64,
       "v_head_dim": 192,
+      "dtype": "float32",
+      "mla_naive_kvcache": False,  # TODO: Test both naive/non-naive modes once b/485997160 is resolved.
   }
 
   def setUp(self):
@@ -59,9 +61,6 @@ class MLATestBase(parameterized.TestCase):
         jax.config.update("jax_remove_size_one_mesh_axis_from_type", True)
       except AttributeError:
         pass
-      # In decoupled mode, adapt mesh/ICI parallelism to local devices so
-      # fill_unspecified_mesh_axes matches the available device count.
-      config_args.update(get_decoupled_parallelism_overrides(include_mesh_defaults=True))
     else:
       jax.config.update("jax_remove_size_one_mesh_axis_from_type", True)
 
@@ -188,33 +187,36 @@ def forward_with_context_expert_parallelism(
   """Get logits from attention under context/expert parallelism."""
   # If load balanced cp, shuffle along seq dim for input
   # This corresponds to the pre-shuffle step in training
-  context_parallel_size = cfg_cp.context_parallel_size
+  context_parallel_size = mesh_cp.shape.get(cfg_cp.context_sharding, 1)
+  # This helper is TPU-oriented and uses the TPU-compatible DUAL_CHUNK_SWAP reorder path.
+  # It does not model GPU-specific packed/striped reorder behavior.
   if context_parallel_size > 1 and cfg_cp.context_parallel_load_balance:
     batch = {
         "inputs": lnx,
         "inputs_segmentation": decoder_segment_ids,
         "inputs_position": decoder_positions,
     }
-    with mesh_cp:
-      reordered_batch = maxtext_utils.get_reorder_callable(context_parallel_size, ShardMode.AUTO)(batch)
+    # jax.set_mesh requires all sharding constraints inside the block to reference devices in the context mesh.
+    with jax.set_mesh(mesh_cp):
+      replicated = NamedSharding(mesh_cp, P())
+      replicated_batch = {k: jax.device_put(v, replicated) for k, v in batch.items()}
+      reordered_batch = maxtext_utils.get_reorder_callable(
+          context_parallel_size, ShardMode.AUTO, hardware=cfg_cp.hardware
+      )(replicated_batch)
     lnx = reordered_batch["inputs"]
     decoder_segment_ids = reordered_batch["inputs_segmentation"]
     decoder_positions = reordered_batch["inputs_position"]
   # apply attention with sharding
-  with mesh_cp, nn_partitioning.axis_rules(cfg_cp.logical_axis_rules):
-    if cfg_cp.expert_shard_attention_option == EP_AS_CONTEXT:
-      batch_axis = "activation_batch_no_exp"
-      length_axis = "activation_length"
-    else:
-      batch_axis = "activation_batch"
-      length_axis = "activation_length_no_exp"
+  with jax.set_mesh(mesh_cp), nn_partitioning.axis_rules(cfg_cp.logical_axis_rules):
+    batch_axis = "activation_batch"
+    length_axis = "activation_length"
     lnx_spec = nn_partitioning.logical_to_mesh_axes(
         (batch_axis, length_axis, "activation_embed"),
         nn_partitioning.get_axis_rules(),
     )
-    pos_spec = nn_partitioning.logical_to_mesh_axes((batch_axis, length_axis), nn_partitioning.get_axis_rules())
-    lnx_sharding = NamedSharding(mesh_cp, lnx_spec)
-    pos_sharding = NamedSharding(mesh_cp, pos_spec)
+    pos_spec = nn_partitioning.logical_to_mesh_axes((None, length_axis), nn_partitioning.get_axis_rules())
+    lnx_sharding = NamedSharding(mesh_cp, lnx_spec)  # pyrefly: ignore[bad-argument-type]
+    pos_sharding = NamedSharding(mesh_cp, pos_spec)  # pyrefly: ignore[bad-argument-type]
 
     lnx = jax.device_put(lnx, lnx_sharding)
     decoder_segment_ids = jax.device_put(decoder_segment_ids, pos_sharding)

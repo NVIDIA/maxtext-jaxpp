@@ -37,8 +37,8 @@ ignore:
   - "src/maxtext/examples"
   - "src/maxtext/experimental"
   - "src/maxtext/inference"
+  - "src/maxtext/integration/vllm"
   - "src/maxtext/scratch_code"
-  - "src/MaxText"
 
 flags:
   # Updated ONLY by PRs (contains subset of tests, excluding scheduled_only).
@@ -66,4 +66,3 @@ coverage:
         threshold: 10% # fail on 10+ percent degradation
         flags:
           - regular
-

@@ -14,24 +14,21 @@
 # limitations under the License.
 
 # pylint: disable=line-too-long, disable=bare-except, consider-using-generator
-""" Utils that are only interesting to MaxText and sharding related. """
-
-from flax import linen as nn
+"""Utils that are only interesting to MaxText and sharding related."""
 
 from collections.abc import Iterable
-
-import jax
-from jax.core import Tracer
-from jax.sharding import PartitionSpec as P, NamedSharding, reshard
-
-import optax
-
-from maxtext.common.common_types import ShardMode
-from maxtext.utils import max_logging
-from maxtext.utils import max_utils
-
 import inspect  # for debugging only
 from pathlib import Path
+
+from flax import linen as nn, nnx
+from flax.core.spmd import get_logical_axis_rules as flax_get_logical_axis_rules
+import jax
+from jax.core import Tracer
+from jax.sharding import NamedSharding, PartitionSpec as P, reshard
+from maxtext.common.common_types import ShardMode
+from maxtext.configs import pyconfig
+from maxtext.utils import max_logging
+from maxtext.utils import max_utils
 
 _LOGGED_ACTIVATION_SHARDINGS = set()
 _ACTIVATION_SHARDINGS_DUMP = []
@@ -43,15 +40,20 @@ def clear_input_shardings_dump():
   _ACTIVATION_SHARDINGS_DUMP.clear()
 
 
-def get_input_data_sharding(config, mesh):
+def get_input_data_sharding(config, mesh, rules=None):
   """Get the input data sharding for the model"""
+  if rules is None:
+    rules = config.logical_axis_rules
   if config.enable_diloco:
-    data_sharding = create_sharding(
-        mesh, ["diloco"] + config.input_data_sharding_logical_axes, rules=config.logical_axis_rules
-    )
+    data_sharding = create_sharding(mesh, ["diloco"] + config.input_data_sharding_logical_axes, rules=rules)
   else:
-    data_sharding = create_sharding(mesh, config.input_data_sharding_logical_axes, rules=config.logical_axis_rules)
+    data_sharding = create_sharding(mesh, config.input_data_sharding_logical_axes, rules=rules)
   return data_sharding
+
+
+def get_logical_axis_rules():
+  """Get the logical axis rules for the flax model"""
+  return flax_get_logical_axis_rules()
 
 
 def _get_sharding_desc(inputs, extra_stack_level):
@@ -84,6 +86,17 @@ def maybe_shard_with_name(
   """
   if inputs is None:
     return None
+  if hasattr(inputs, "ndim"):
+    named_sharding = truncate_out_sharding(named_sharding, inputs.ndim)
+  if (
+      isinstance(named_sharding, NamedSharding)
+      and hasattr(inputs, "shape")
+      and getattr(named_sharding, "mesh", None) is not None
+      and (isinstance(inputs, nnx.Variable) or hasattr(inputs, "value"))
+  ):
+    adj_spec = adjust_pspec_for_indivisible_shapes(named_sharding.spec, inputs.shape, named_sharding.mesh)
+    if adj_spec != named_sharding.spec:
+      named_sharding = NamedSharding(named_sharding.mesh, adj_spec)
   if (
       debug_sharding and isinstance(inputs, Tracer) and isinstance(named_sharding, NamedSharding)
   ):  # only print pspec for JitTracer
@@ -114,6 +127,29 @@ def maybe_shard_with_name(
     return reshard(inputs, named_sharding)
   else:
     return jax.lax.with_sharding_constraint(inputs, named_sharding)
+
+
+def maybe_shard_with_pspec(
+    inputs,
+    pspec: jax.sharding.PartitionSpec | None,
+    mesh,
+    shard_mode,
+    debug_sharding=False,
+    extra_stack_level=0,
+    logical_axes=None,
+):
+  """Apply a physical sharding constraint while preserving logical-axis debug metadata."""
+  if pspec is None:
+    return None
+  sharding = NamedSharding(mesh, pspec)
+  return maybe_shard_with_name(
+      inputs,
+      sharding,
+      shard_mode=shard_mode,
+      debug_sharding=debug_sharding,
+      extra_stack_level=extra_stack_level + 1,
+      logical_axes=logical_axes,
+  )
 
 
 def maybe_shard_with_logical(
@@ -164,6 +200,175 @@ def remove_size_one_mesh_axis(spec, mesh):
   return P(*new_spec, unreduced=spec.unreduced, reduced=spec.reduced)
 
 
+def mesh_axes_for_dim(axis_names):
+  """Returns the mesh axes attached to one tensor dimension."""
+  if axis_names is None:
+    return ()
+  if isinstance(axis_names, str):
+    return (axis_names,)
+  return tuple(axis for axis in axis_names if axis is not None)
+
+
+def batch_mesh_axes(mesh, rules=None):
+  """Returns the mesh axes of size > 1 that the activation batch dimension is sharded over."""
+  spec = logical_to_mesh_axes(("activation_batch",), mesh, rules=rules)
+  # A rule that resolves to a rank-0 spec leaves no dimension to read, so there is nothing the
+  # batch is sharded over.
+  if spec is None or not spec.partitions:
+    return frozenset()
+  return frozenset(axis for axis in mesh_axes_for_dim(spec.partitions[0]) if mesh.shape.get(axis, 1) > 1)
+
+
+def mesh_axes_size(mesh, axes, *, label):
+  """Returns the product of mesh sizes for a set of axes."""
+  size = 1
+  for axis in axes:
+    if axis not in mesh.shape:
+      raise ValueError(f"{label} requires mesh axis {axis!r} to exist.")
+    size *= mesh.shape[axis]
+  return size
+
+
+def with_axis_on_dim(axis_names, axis, dim):
+  """Returns sharding axis names with one dimension replaced."""
+  if axis_names is None:
+    return None
+  if dim >= len(axis_names):
+    raise ValueError(f"Dimension {dim} is out of range for sharding axis names {axis_names}.")
+  axes = list(axis_names)
+  axes[dim] = axis
+  if isinstance(axis_names, P):
+    return P(*axes, unreduced=axis_names.unreduced, reduced=axis_names.reduced)
+  if isinstance(axis_names, tuple):
+    return tuple(axes)
+  return axes
+
+
+def adjust_pspec_for_indivisible_shapes(spec: P, shape: tuple[int, ...], mesh) -> P:
+  """Removes physical mesh axes from spec where array dimension is not divisible by the mesh axis size."""
+  if spec is None or mesh is None or not shape:
+    return spec
+  new_spec = []
+  for i, s in enumerate(spec):
+    if i >= len(shape) or s is None or s == P.UNCONSTRAINED:
+      new_spec.append(s)
+    else:
+      dim_len = shape[i]
+      if isinstance(s, tuple):
+        valid_axes = []
+        cum_product = 1
+        for axis_name in s:
+          axis_size = mesh.shape.get(axis_name, 1) if hasattr(mesh, "shape") else 1
+          if dim_len % (cum_product * axis_size) == 0:
+            valid_axes.append(axis_name)
+            cum_product *= axis_size
+        new_spec.append(tuple(valid_axes) if valid_axes else None)
+      else:
+        axis_size = mesh.shape.get(s, 1) if hasattr(mesh, "shape") else 1
+        if dim_len % axis_size == 0:
+          new_spec.append(s)
+        else:
+          new_spec.append(None)
+  return P(*new_spec, unreduced=spec.unreduced, reduced=spec.reduced)
+
+
+def get_nnx_var_named_sharding_with_scan_axis(v: nnx.Variable, mesh) -> nnx.Variable:
+  """Compute NamedSharding for an NNX variable, correctly handling the scan axis."""
+  val = v.get_value()
+  if not hasattr(val, "shape"):
+    # `val` is either truly leafless (e.g. optax MaskedNode) or a composite
+    # pytree of tensors (e.g. Qwix QArray or AQT QTensor).
+    if jax.tree_util.tree_leaves(val):
+      first_leaf = jax.tree_util.tree_leaves(val)[0]
+      if hasattr(first_leaf, "shape"):
+        leaf_var = get_nnx_var_named_sharding_with_scan_axis(v.replace(value=first_leaf), mesh)
+        leaf_sharding = leaf_var.get_value()
+        if not isinstance(leaf_sharding, NamedSharding):
+          leaf_sharding = NamedSharding(mesh, P())
+        return v.replace(jax.tree.map(lambda _: leaf_sharding, val))
+      replicated = NamedSharding(mesh, P())
+      return v.replace(jax.tree.map(lambda _: replicated, val))
+    return v
+  metadata = v.get_metadata()
+  out_sharding = metadata.get("out_sharding") or metadata.get("sharding_names") or metadata.get("sharding")
+  if not out_sharding:
+    pspec = P()
+  elif isinstance(out_sharding, jax.sharding.NamedSharding):
+    return v.replace(out_sharding)
+  elif isinstance(out_sharding, jax.sharding.PartitionSpec):
+    pspec = out_sharding
+  else:
+    out_sharding = [out_sharding] if isinstance(out_sharding, str) else list(out_sharding)
+    # Insert the scan axis for parameters created by _create_scanned_layers.
+    if "param_scan_axis" in metadata and nnx.PARTITION_NAME in metadata:
+      partition_name = metadata[nnx.PARTITION_NAME]
+      scan_axis = metadata.get("param_scan_axis", 0)
+      if partition_name not in out_sharding:
+        out_sharding.insert(scan_axis, partition_name)
+    elif len(val.shape) > len(out_sharding):
+      diff = len(val.shape) - len(out_sharding)
+      out_sharding = list(out_sharding) + [None] * diff
+    out_sharding = tuple(out_sharding)
+    # Convert logical axis names to physical mesh axes using current context rules.
+    context_rules = get_logical_axis_rules()
+    local_rules = metadata.get("sharding_rules", ())
+    if context_rules or local_rules:
+      local_rules_list = list(local_rules) if local_rules is not None else []
+      context_rules_list = list(context_rules) if context_rules is not None else []
+      rules = local_rules_list + context_rules_list
+      pspec = logical_to_mesh_axes(out_sharding, mesh, rules=rules)
+    else:
+      pspec = P(*out_sharding)
+      if mesh is not None:
+        pspec = remove_size_one_mesh_axis(pspec, mesh)
+    if pspec is not None and nnx.PARTITION_NAME not in metadata:
+      orig_sharding = metadata.get("out_sharding") or metadata.get("sharding_names") or metadata.get("sharding")
+      if isinstance(orig_sharding, str):
+        orig_len = 1
+      elif isinstance(orig_sharding, (list, tuple)):
+        orig_len = len(orig_sharding)
+      else:
+        orig_len = 0
+      if 0 < orig_len < len(pspec):
+        pspec = P(*pspec[:orig_len])
+
+  # pyrefly: ignore[bad-argument-type]
+  return v.replace(NamedSharding(mesh, pspec))
+
+
+def nnx_construct_named_sharding(abs_var_state: nnx.State, mesh) -> nnx.State:
+  """Compute NamedSharding for each NNX variable, correctly handling the scan (stacked layers) axis.
+
+  Unlike flax.nnx.spmd.get_var_pspec (used inside nnx.get_abstract_model), this
+  function also
+  inserts the partition_name axis at the correct scan_axis position for
+  parameters created by
+  _create_scanned_layers. Without this, scanned parameters get a 2D partition
+  spec applied to a
+  3D tensor, placing sharding on the stacked-layers dimension instead of the
+  embedding dimension.
+
+  Args:
+    abs_var_state: NNX abstract variable state from
+      nnx.split(nnx.eval_shape(...)).
+    mesh: JAX physical mesh.
+
+  Returns:
+    Same tree structure as abs_var_state with leaf values replaced with
+    NamedSharding.
+    Note that it preserves the original nnx.Variable / Param wrapper nodes to
+    maintain
+    type structure matching abs_var_state (necessary for multi-tree maps). Use
+    maxtext_utils_nnx.nnx_extract_named_sharding to retrieve clean raw
+    NamedShardings.
+  """
+  return jax.tree.map(
+      lambda x: get_nnx_var_named_sharding_with_scan_axis(x, mesh),
+      abs_var_state,
+      is_leaf=lambda x: isinstance(x, nnx.Variable),
+  )
+
+
 def logical_to_mesh_axes(logical_names, mesh, rules=None):
   """Remove size one mesh axes given logical names."""
   tensor_spec = nn.logical_to_mesh_axes(logical_names, rules=rules)
@@ -194,7 +399,41 @@ def logical_to_mesh_sharding(tree, mesh, rules=None):
 
 def create_sharding(mesh, logical_names, rules=None):
   """Create NamedSharding with given logical names."""
-  return NamedSharding(mesh, logical_to_mesh_axes(logical_names, mesh, rules=rules))
+  spec = logical_to_mesh_axes(logical_names, mesh, rules=rules)
+  if spec is None:
+    spec = P()
+  return NamedSharding(mesh, spec)
+
+
+def _truncate_pspec(pspec: P, out_ndim: int) -> P:
+  """Drop trailing entries of a PartitionSpec, keeping any unreduced/reduced annotation.
+
+  Slicing a PartitionSpec directly raises once it carries an unreduced/reduced set — and
+  the annotation describes a cross-replica state of the whole array, not of a particular
+  dimension, so it has to survive the truncation. Gradient accumulation marks gradients
+  unreduced over "data" before resharding them, which is how such specs get here.
+  """
+  partitions = pspec.partitions if hasattr(pspec, "partitions") else pspec._partitions
+  return P(*partitions[:out_ndim], unreduced=pspec.unreduced, reduced=pspec.reduced)
+
+
+def truncate_out_sharding(out_sharding, out_ndim: int):
+  """Truncates out_sharding if tensor ndim is less than out_sharding pspec length."""
+  if out_sharding is None:
+    return None
+  if isinstance(out_sharding, NamedSharding):
+    if len(out_sharding.spec) > out_ndim:
+      return NamedSharding(
+          out_sharding.mesh,
+          _truncate_pspec(out_sharding.spec, out_ndim),
+      )
+  elif isinstance(out_sharding, P):
+    if len(out_sharding) > out_ndim:
+      return _truncate_pspec(out_sharding, out_ndim)
+  elif isinstance(out_sharding, (tuple, list)):
+    if len(out_sharding) > out_ndim:
+      return tuple(out_sharding[:out_ndim])
+  return out_sharding
 
 
 def get_mesh_axes_used_by_tensor_spec(tensor_sharding_spec):
@@ -246,9 +485,9 @@ def _get_nontrival_mesh_axes(mesh):
       "fsdp_transpose",
       "sequence",
       "context",
+      "context_usp_ulysses",
       "context_autoregressive",
       "tensor",
-      "tensor_transpose",
       "tensor_sequence",
       "stage",
       "expert",
@@ -288,15 +527,18 @@ def _analyze_sharding(params, mesh, valid_target_mesh_axes):
   for path, p_leaf in all_params_leaves:  # Iterate over each parameter leaf
     param_name_str = jax.tree_util.keystr(path)  # Convert the tree path to a readable string
 
-    # Check that sharding and spec exist and are valid
-    sharding = getattr(p_leaf, "sharding", None)
-    spec = getattr(sharding, "spec", None)
-    assert sharding is not None and spec is not None and isinstance(spec, P), (
-        f"Parameter '{param_name_str}' is missing a valid '.sharding.spec'."
-        "Expected 'p_leaf.sharding.spec' to be a non-null 'partitionspec'."
-    )
+    # Default unannotated LoRA parameters to PartitionSpec P() while leaving standard parameters as None for strict assertions.
+    is_lora_param = isinstance(p_leaf, getattr(nnx, "LoRAParam", ()))
+    is_lora = is_lora_param or "lora" in param_name_str.lower()
+    if isinstance(p_leaf, nnx.Variable):
+      p_leaf = p_leaf.value
 
-    current_sharding_spec = p_leaf.sharding.spec  # Extract the current tensor's sharding spec
+    spec = getattr(getattr(p_leaf, "sharding", None), "spec", None)
+    if spec is None and is_lora:
+      spec = P()
+    assert isinstance(spec, P), f"Expected '.sharding.spec' for parameter '{param_name_str}' to be a PartitionSpec."
+
+    current_sharding_spec = spec  # Extract the current tensor's sharding spec
     # Identify axes used for sharding
     mesh_axes_used = get_mesh_axes_used_by_tensor_spec(current_sharding_spec)
     # Check if the parameter is sharded on all the valid target axes.
@@ -345,7 +587,7 @@ def _raise_if_unsharded_exceeds_tolerance(unsharded_size, total_size, tolerance,
   # Calculate the percentage of unsharded parameters.
   unsharded_param_perc = unsharded_size / total_size
 
-  # If the percentage is over the tolerance, prepare and raise an error.
+  # If the percentage is over or equal to the tolerance, prepare and raise an error.
   if unsharded_param_perc > tolerance:
     # Sort the problematic tensors by size to show the largest ones first.
     problematic_tensors_details.sort(key=lambda x: x["size"], reverse=True)
@@ -427,13 +669,30 @@ def add_data_to_sharding(mesh, path, aval, sharding):
   """
   if not isinstance(sharding, jax.sharding.NamedSharding):
     raise AssertionError(f"Expected NamedSharding, found {sharding} of {type(sharding)=} at {jax.tree_util.keystr(path)}")
+
+  pspec = sharding.spec
+  if len(pspec) != len(aval.shape):
+    if len(pspec) > len(aval.shape):
+      if "local_layers" in pspec and len(pspec) - 1 == len(aval.shape):
+        pspec = tuple(axis for axis in pspec if axis != "local_layers")
+      else:
+        pspec = pspec[: len(aval.shape)]
+    else:
+      pspec = tuple(pspec) + (None,) * (len(aval.shape) - len(pspec))
+    sharding = jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec(*pspec))
+
   try:
     sharded_shape = sharding.shard_shape(aval.shape)
   except Exception as e:
     raise AssertionError(f"Could not shard {jax.tree_util.keystr(path)} of shape={aval.shape} with {sharding=}") from e
   pspec = sharding.spec
 
-  if "data" in jax.tree.leaves(pspec):
+  # `tuple(pspec)`, not `pspec`: a PartitionSpec is a pytree *leaf*, so flattening one gives
+  # back the spec itself and this guard never fired. Its entries are what have to be walked,
+  # and they nest -- a dimension sharded over two axes is a tuple. Without this, a leaf
+  # already sharded over "data" gets a second one and `NamedSharding` rejects the result
+  # outright (`DuplicateSpecError: P(('data', 'data'), None)`).
+  if "data" in jax.tree.leaves(tuple(pspec)):
     return sharding
 
   for idx, (size, partition) in enumerate(zip(sharded_shape, pspec)):
@@ -444,7 +703,7 @@ def add_data_to_sharding(mesh, path, aval, sharding):
       partition = (partition,)
 
     if size % mesh.shape["data"] == 0 and (partition is None or "tensor" not in partition):
-      added_component = ("data",) + partition
+      added_component = ("data",) + partition  # pyrefly: ignore[unsupported-operation]
       new_pspec = jax.sharding.PartitionSpec(*(pspec[:idx] + (added_component,) + pspec[idx + 1 :]))
       new_sharding = jax.sharding.NamedSharding(sharding.mesh, new_pspec)
       return new_sharding
@@ -515,22 +774,157 @@ def maybe_update_params_sharding_with_opt(config, state_mesh_shardings):
       - updated_state_mesh_shardings: State mesh shardings with updated params field
         (unchanged if shard_optimizer_over_data is False)
   """
-  prev_params_shardings = state_mesh_shardings.params
-  if config.shard_optimizer_over_data:
-    if isinstance(state_mesh_shardings.opt_state, optax.ScaleByAdamState):
-      sharded_fp32_params = state_mesh_shardings.opt_state.mu
-    elif isinstance(state_mesh_shardings.opt_state, tuple) and isinstance(
-        state_mesh_shardings.opt_state[0], optax.ScaleByAdamState
-    ):
-      sharded_fp32_params = state_mesh_shardings.opt_state[0].mu
-    else:
-      raise NotImplementedError(f"Could not find optimizer state shardings from {type(state_mesh_shardings.opt_state)}")
-    if "params" not in sharded_fp32_params.keys():
-      # When quantization=fp8 is enabled the sharded_fp32_params
-      # are not wrapped in `params`. Here we wrap them back.
-      sharded_fp32_params = {"params": sharded_fp32_params}
-    state_mesh_shardings = state_mesh_shardings.replace(params=dict(prev_params_shardings, **sharded_fp32_params))
-  return prev_params_shardings, state_mesh_shardings
+  return maybe_update_params_sharding_with_opt_nnx(config, state_mesh_shardings)
+
+
+def maybe_update_params_sharding_with_opt_nnx(
+    config: pyconfig.HyperParameters, state_mesh_shardings: nnx.State
+) -> tuple[nnx.State, nnx.State]:
+  """
+  NNX version of parameter sharding update. Updates parameter sharding configuration
+  when optimizer state sharding is enabled.
+
+  When shard_optimizer_over_data is enabled (Zero-1 style sharding), this function
+  extracts the optimizer state shardings from the Adam optimizer's first moment (mu)
+  and merges them with the parameter shardings. This ensures parameter sharding is
+  consistent with how the optimizer state is distributed across the compute mesh.
+
+  Args:
+    config: Configuration with shard_optimizer_over_data flag.
+    state_mesh_shardings: The sharding state for a TrainStateNNX container.
+
+  Returns:
+    A tuple of (prev_params_shardings, updated_state_mesh_shardings):
+      - prev_params_shardings: Original parameter shardings before the update
+      - updated_state_mesh_shardings: State mesh shardings with updated params field
+        (unchanged if shard_optimizer_over_data is False)"""
+  # In TrainStateNNX, parameters are under 'model'
+  model_shardings = state_mesh_shardings.model
+
+  def _extract_param_only(state):
+    """Recursively extract nnx.Param variables from an nnx.State into a nested plain dict.
+
+    Constructs nnx.State({'key': nested_dict, ...}) which produces the same pytree
+    structure as nnx.split(model, nnx.Param, ...)[1], enabling jax.tree.map
+    to work correctly between ga_params (Param-only) and params_shardings.
+    """
+    result = {}
+    for k, v in state.items():
+      if isinstance(v, nnx.Param):
+        result[k] = v
+      elif isinstance(v, nnx.Variable):
+        pass  # skip non-Param variables (RngKey, RngCount, OptVariable, etc.)
+      elif hasattr(v, "items"):
+        sub = _extract_param_only(v)
+        if sub:
+          result[k] = sub
+      else:
+        result[k] = v
+    return result
+
+  # prev_params_shardings must match the pytree structure of ga_params from
+  # nnx.split(model, nnx.Param, ...) — Param variables only, no rngs.
+  prev_params_shardings = nnx.State(_extract_param_only(model_shardings))
+
+  if not config.shard_optimizer_over_data:
+    return prev_params_shardings, state_mesh_shardings
+
+  sharded_fp32_params = None
+  # Check if the optimizer has any state at all (stateless optimizers like SGD omit this key)
+  if "opt_state" in state_mesh_shardings.optimizer:
+    # Access the optimizer branch to find the optax state
+    # state_mesh_shardings.optimizer contains the sharding for the nnx.Optimizer
+    opt_state = state_mesh_shardings.optimizer.opt_state
+
+    def collect_mu_trees(obj, out):
+      if isinstance(obj, nnx.Variable):
+        return
+      if hasattr(obj, "get") and "mu" in obj:
+        out.append(obj["mu"])
+      elif hasattr(obj, "values"):
+        for v in obj.values():
+          collect_mu_trees(v, out)
+      elif isinstance(obj, (list, tuple)):
+        for v in obj:
+          collect_mu_trees(v, out)
+
+    mu_trees = []
+    collect_mu_trees(opt_state, mu_trees)
+    sharded_fp32_params = mu_trees or None
+  if sharded_fp32_params is None:
+    actual_type = type(state_mesh_shardings.optimizer.get("opt_state", "None"))
+    raise NotImplementedError(f"Could not find Adam/Muon optimizer state in: {actual_type}")
+
+  # Update model parameter sharding to match the mu (first moment) sharding.
+  # This ensures parameter sharding is consistent with the Zero-1 distributed layout.
+  # Build a path → new_PS lookup from sharded_fp32_params (mu), then update model_shardings
+  # at those paths while preserving rngs and any other non-Param variables.
+  mu_lookup = {}
+  for mu_tree in mu_trees:
+    for path, mu_var in jax.tree_util.tree_leaves_with_path(mu_tree, is_leaf=lambda x: isinstance(x, nnx.Variable)):
+      if not isinstance(mu_var, nnx.Variable):
+        continue
+      mu_value = mu_var.get_value()
+      # A partitioned optimizer (e.g. Muon: a 'muon' branch owning the 2D
+      # weights plus an 'adam' fallback owning the rest) holds one param-mirroring mu
+      # per branch, with optax MaskedNode at every position the branch does NOT own —
+      # so each param's sharding must come from whichever branch actually tracks it,
+      # and MaskedNode placeholders must never overwrite a real param sharding.
+      if not isinstance(mu_value, NamedSharding):
+        continue  # skip MaskedNode / other non-sharding placeholders
+      mu_lookup.setdefault(path, mu_value)
+
+  def _update_model_var(path, var):
+    if path in mu_lookup:
+      return var.replace(mu_lookup[path])
+    return var
+
+  new_model_shardings = jax.tree_util.tree_map_with_path(
+      _update_model_var, model_shardings, is_leaf=lambda x: isinstance(x, nnx.Variable)
+  )
+  # Use jax.tree_util.tree_map (identity) to create a new nnx.State via JAX's unflatten
+  # mechanism (not the nnx.State constructor). This is critical because:
+  # 1. nnx.State({...}) constructor recursively converts nested plain dicts to nnx.State,
+  #    causing a pytree type mismatch with the actual state from nnx.split (which stores
+  #    nested module states as plain dicts). JAX's unflatten preserves the original types.
+  # 2. copy.deepcopy fails because NamedSharding contains non-picklable jaxlib.Device objects.
+  # Direct __setattr__ assignment stores new_model_shardings as-is (no type conversion).
+  updated_state = jax.tree_util.tree_map(lambda x: x, state_mesh_shardings, is_leaf=lambda x: isinstance(x, nnx.Variable))
+  updated_state.model = new_model_shardings
+
+  return prev_params_shardings, updated_state
+
+
+def build_zero1_input_state_mesh_shardings(config, state_mesh_shardings, params_shardings):
+  """Build the train-step input shardings under shard_optimizer_over_data (Zero-1).
+
+  Model params on input use the original pre-Zero-1 sharding (params_shardings),
+  while the rest
+  of the state — including the optimizer state — keeps the Zero-1 layout from
+  state_mesh_shardings,
+  so the optimizer state input matches its output. When
+  shard_optimizer_over_data is False,
+  state_mesh_shardings passes through unchanged.
+  """
+  if not config.shard_optimizer_over_data:
+    return state_mesh_shardings
+  # nnx.State has no .replace: shallow-copy via tree_map (preserves nested container
+  # types) and overlay params_shardings under input_state.model.
+  input_state = jax.tree_util.tree_map(
+      lambda x: x,
+      state_mesh_shardings,
+      is_leaf=lambda x: isinstance(x, nnx.Variable),
+  )
+
+  def _overlay(model_node, params_node):
+    for k, pv in params_node.items():
+      if isinstance(pv, nnx.Variable):
+        model_node[k] = pv
+      elif hasattr(pv, "items"):
+        _overlay(model_node[k], pv)
+
+  _overlay(input_state.model, params_shardings)
+  return input_state
 
 
 def logical_axis_rules_pp_act_as_dp(logical_rules):
@@ -615,34 +1009,161 @@ def get_formatted_sharding_annotations(params, mesh=None):
   return "\n".join(annotation_lines)
 
 
-def remove_fsdp_sharding(sharding_tree):
-  """Recursively traverses the sharding tree to remove fsdp axes."""
+FSDP_MESH_AXES = ("fsdp", "fsdp_transpose")
 
-  def _remove_fsdp_from_partition_spec(named_sharding):
-    """Removes 'fsdp' and 'fsdp_transpose' from a PartitionSpec."""
+
+def remove_mesh_axes_from_partition_spec(pspec, axes_to_remove, dims=None):
+  """Return `pspec` with `axes_to_remove` stripped from the given dims.
+
+  Replacing a mesh axis with `None` in a PartitionSpec instructs JAX to replicate
+  the array data along that physical mesh dimension, so peeling an axis here is
+  what turns a sharding constraint into an all-gather.
+
+  Args:
+    pspec: The PartitionSpec to strip axes from.
+    axes_to_remove: Collection of physical mesh axis names to remove.
+    dims: Dim indices to modify; `None` (the default) modifies every dim.
+
+  Returns:
+    A new PartitionSpec with the requested axes replaced by `None`.
+  """
+  axes_to_remove = set(axes_to_remove)
+  new_spec = []
+  for i, axis in enumerate(pspec):
+    if axis is None or (dims is not None and i not in dims):
+      new_spec.append(axis)
+    elif isinstance(axis, str):
+      new_spec.append(None if axis in axes_to_remove else axis)
+    elif isinstance(axis, (list, tuple)):
+      new_spec.append(tuple(a for a in axis if a not in axes_to_remove) or None)
+    else:
+      raise ValueError(f"Unsupported axis type: {type(axis)}")
+  return jax.sharding.PartitionSpec(*new_spec)
+
+
+def remove_incompatible_mesh_axes_from_partition_spec(
+    pspec,
+    shape,
+    mesh,
+    dims=None,
+    *,
+    allow_remove_axes=False,
+):
+  """Replicate tensor dimensions that cannot be evenly sharded by their mesh axes.
+
+  `shard_map` requires every tensor dimension to be evenly divisible by the
+  product of the mesh axes assigned to that dimension. By default, an
+  incompatible specification raises an error. Callers that can safely
+  replicate the checked dimension may opt into removing its mesh axes.
+
+  Args:
+    pspec: Physical PartitionSpec to make compatible with `shape`.
+    shape: Global tensor shape described by `pspec`.
+    mesh: Device mesh containing the physical axes referenced by `pspec`.
+    dims: Dim indices to check; `None` (the default) checks every dim. Negative
+      indices follow normal Python indexing rules.
+    allow_remove_axes: Whether an incompatible checked dimension may be
+      replicated by removing its assigned mesh axes. Defaults to `False` so a
+      sharding configuration cannot silently fall back.
+
+  Returns:
+    A PartitionSpec whose checked dimensions are evenly shardable.
+  """
+  if len(pspec) > len(shape):
+    raise ValueError(f"PartitionSpec rank {len(pspec)} exceeds tensor rank {len(shape)}")
+
+  if dims is None:
+    dims_to_check = None
+  else:
+    rank = len(shape)
+    dims_to_check = set()
+    for dim in dims:
+      normalized_dim = dim + rank if dim < 0 else dim
+      if normalized_dim < 0 or normalized_dim >= rank:
+        raise ValueError(f"Dimension index {dim} is out of bounds for tensor rank {rank}")
+      dims_to_check.add(normalized_dim)
+
+  compatible_pspec = pspec
+  for dim, (dim_size, partition) in enumerate(zip(shape, pspec)):
+    if (dims_to_check is not None and dim not in dims_to_check) or partition is None or partition == P.UNCONSTRAINED:
+      continue
+
+    if isinstance(partition, str):
+      mesh_axes = (partition,)
+    elif isinstance(partition, (list, tuple)):
+      mesh_axes = tuple(partition)
+    else:
+      raise ValueError(f"Unsupported axis type: {type(partition)}")
+
+    shard_count = 1
+    for mesh_axis in mesh_axes:
+      shard_count *= mesh.shape[mesh_axis]
+    if dim_size % shard_count:
+      if not allow_remove_axes:
+        raise ValueError(
+            f"Tensor dimension {dim} with size {dim_size} is not evenly divisible by "
+            f"{shard_count} shards from mesh axes {mesh_axes}. Pass "
+            "allow_remove_axes=True only when replicating this dimension is safe."
+        )
+      compatible_pspec = remove_mesh_axes_from_partition_spec(
+          compatible_pspec,
+          mesh_axes,
+          dims=(dim,),
+      )
+
+  return compatible_pspec
+
+
+def remove_mesh_axes_from_sharding(sharding_tree, axes_to_remove):
+  """Recursively traverses a sharding tree removing `axes_to_remove` from each spec."""
+
+  def _peel(named_sharding):
     if isinstance(named_sharding, jax.sharding.NamedSharding):
-      new_spec = []
-      # Iterate through each axis in the original PartitionSpec.
-      for axis in named_sharding.spec:
-        if axis is None:
-          new_spec.append(None)
-        elif isinstance(axis, str):
-          # If the axis is 'fsdp', replace it with None to signify replication.
-          if axis not in ("fsdp", "fsdp_transpose"):
-            new_spec.append(axis)
-          else:
-            new_spec.append(None)
-        elif isinstance(axis, (list, tuple)):
-          # If the axis is a collection, filter out 'fsdp'.
-          new_axis = [a for a in axis if a not in ("fsdp", "fsdp_transpose")]
-          new_spec.append(tuple(new_axis))
-        else:
-          raise ValueError(f"Unsupported_axis_type: {type(axis)}")
-        # Return a new sharding object with the modified spec.
-      return jax.sharding.NamedSharding(named_sharding.mesh, jax.sharding.PartitionSpec(*new_spec))
+      return jax.sharding.NamedSharding(
+          named_sharding.mesh,
+          remove_mesh_axes_from_partition_spec(named_sharding.spec, axes_to_remove),
+      )
     return named_sharding
 
-  return jax.tree.map(_remove_fsdp_from_partition_spec, sharding_tree)
+  return jax.tree.map(_peel, sharding_tree)
+
+
+def remove_expert_from_partition_spec(pspec, dims_to_peel):
+  """Return `pspec` with the 'expert' mesh axis removed from the given dim indices.
+
+  Used by the MoE dispatch/MLP sharding: the expert dim is already sharded over the
+  'expert' mesh axis via the `activation_exp` rule, so the batch dim must not also map
+  to 'expert' (that double-maps two tensor dims onto one mesh axis and makes GSPMD fall
+  back to FSDP-style AllGather+ReduceScatter instead of expert-parallel AllToAll). Only
+  the dims listed in `dims_to_peel` (the batch dim) are modified; the expert dim is left
+  untouched. Avoids needing a separate `activation_batch_no_exp` logical rule that every
+  `custom_mesh_and_rule` set would have to redefine.
+  """
+  return remove_mesh_axes_from_partition_spec(pspec, ("expert",), dims=dims_to_peel)
+
+
+def get_physical_spec_without_axes(full_logical, mesh, axes_to_remove, logical_axis_rules=None):
+  """Resolve `full_logical` to a physical sharding with `axes_to_remove` peeled off.
+
+  Combines the logical-to-physical lookup with an axis peel, producing a target
+  layout for an all-gather over exactly the named mesh axes. Peeling a subset of
+  the FSDP axes (rather than all of them at once) is what lets a 2D-FSDP-sharded
+  weight be gathered in two separate single-axis stages.
+
+  Args:
+    full_logical: A PyTree of logical PartitionSpecs. Note that a bare tuple of
+      logical names is a pytree of strings, not a leaf -- wrap it in a
+      `PartitionSpec` before passing it in.
+    mesh: The JAX device mesh.
+    axes_to_remove: Collection of physical mesh axis names to peel.
+    logical_axis_rules: Rules for converting logical axes to physical mesh axes.
+      Defaults to the ambient rules context.
+
+  Returns:
+    A PyTree of physical `jax.sharding.NamedSharding` objects.
+  """
+  physical = logical_to_mesh_sharding(full_logical, mesh=mesh, rules=logical_axis_rules)
+  return remove_mesh_axes_from_sharding(physical, axes_to_remove)
 
 
 def get_physical_spec_no_fsdp(full_logical, mesh, logical_axis_rules):
@@ -669,11 +1190,7 @@ def get_physical_spec_no_fsdp(full_logical, mesh, logical_axis_rules):
     mesh axis.
   """
 
-  # Convert the high-level logical spec to a physical one using default rules.
-  physical = logical_to_mesh_sharding(full_logical, mesh=mesh, rules=logical_axis_rules)
-  # Apply the function to remove the FSDP sharding, defining our target layout.
-  physical_no_fsdp = remove_fsdp_sharding(physical)
-  return physical_no_fsdp
+  return get_physical_spec_without_axes(full_logical, mesh, FSDP_MESH_AXES, logical_axis_rules)
 
 
 def all_gather_over_fsdp(variables, sharding_info, mesh, logical_axis_rules, shard_mode):

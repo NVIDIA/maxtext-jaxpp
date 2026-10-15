@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" Tests for the standalone_checkpointer.py """
+"""Tests for the standalone_checkpointer.py"""
 import unittest
 import pytest
-from tools.gcs_benchmarks.standalone_checkpointer import main as sckpt_main
-from tools.gcs_benchmarks.standalone_dataloader import main as sdl_main
+from maxtext.utils.standalone_checkpointer import main as sckpt_main
+from maxtext.utils.standalone_dataloader import main as sdl_main
 from maxtext.utils.globals import MAXTEXT_ASSETS_ROOT
 from maxtext.common.gcloud_stub import is_decoupled
 
@@ -50,6 +50,7 @@ class Standalone_DL_CKPT(unittest.TestCase):
 
   @pytest.mark.integration_test
   @pytest.mark.tpu_only
+  @pytest.mark.scheduled_only
   def test_standalone_dataloader(self):
     random_run_name = self._get_random_test_name("standalone_dataloader")
     sdl_main(
@@ -59,7 +60,12 @@ class Standalone_DL_CKPT(unittest.TestCase):
             f"run_name={random_run_name}",
             f"base_output_directory={self.base_output_directory}",
             f"dataset_path={self.dataset_path}",
-            "steps=100",
+            "base_emb_dim=128",
+            "base_num_query_heads=4",
+            "base_num_kv_heads=4",
+            "base_mlp_dim=128",
+            "base_num_decoder_layers=2",
+            "steps=10",
             "enable_checkpointing=false",
             "enable_goodput_recording=False",
             rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}",
@@ -68,6 +74,7 @@ class Standalone_DL_CKPT(unittest.TestCase):
 
   @pytest.mark.integration_test
   @pytest.mark.tpu_only
+  @pytest.mark.scheduled_only
   def test_standalone_checkpointer(self):
     random_run_name = self._get_random_test_name("standalone_checkpointer")
     # checkpoint at 50

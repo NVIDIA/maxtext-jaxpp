@@ -56,13 +56,18 @@ https://docs.docker.com/engine/install/debian/
 
 https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
 
-If you get the NVML Error: Please follow these instructions.
+If you get an NVML error, try the following:
 
-https://stackoverflow.com/questions/72932940/failed-to-initialize-nvml-unknown-error-in-docker-after-few-hours
+1. Edit `/etc/nvidia-container-runtime/config.toml` (e.g., `sudo vim /etc/nvidia-container-runtime/config.toml`), change `no-cgroups = false`, and save.
+2. Restart the Docker daemon: `sudo systemctl restart docker`.
+3. Test by running:
+   ```bash
+   sudo docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi
+   ```
 
 ## Build MaxText Docker image
 
-For instructions on building the MaxText Docker image, please refer to the [official documentation](https://maxtext.readthedocs.io/en/latest/build_maxtext.html).
+For instructions on building the MaxText Docker image, please refer to the [official documentation](build-docker).
 
 ## Test
 
@@ -118,7 +123,7 @@ Hardware: GPU
 ```
 
 ```bash
-python3 -m maxtext.trainers.pre_train.train run_name=gpu01 base_output_directory=/deps/output  \
+python3 -m maxtext.trainers.pre_train.train run_name=gpu01 base_output_directory=/deps/output \
   dataset_type=synthetic enable_checkpointing=True steps=10 attention=cudnn_flash_te scan_layers=False \
   use_iota_embed=True hardware=gpu per_device_batch_size=12
 ```
@@ -134,17 +139,25 @@ https://github.com/AI-Hypercomputer/maxtext/tree/main/src/maxtext/configs/gpu/a3
 ```bash
 echo "Running 1vm.sh"
 
-# Example command to invoke this script via XPK
-# python3 xpk/xpk.py workload create --cluster ${CLUSTER_NAME?} \
-# --workload ${WORKLOAD_NAME?} --docker-image=gcr.io/supercomputer-testing/${LOCAL_IMAGE_NAME?} \
-# --device-type ${DEVICE_TYPE?} --num-slices 1 \
-# --command "bash src/maxtext/configs/gpu/a3/llama_2_7b/1vm.sh"
+# Configure access to the GKE cluster before submitting with Cluster Toolkit:
+# gcloud container clusters get-credentials <CLUSTER_NAME> \
+#   --location <ZONE> --project <PROJECT_ID>
+# gcluster job submit --image=gcr.io/supercomputer-testing/<IMAGE_NAME> \
+#   --name=${RUN_NAME?} --compute-type=<COMPUTE_TYPE> --num-nodes=1 \
+#   --command="bash src/maxtext/configs/gpu/a3/llama_2_7b/1vm.sh"
 
 # Stop execution if any command exits with error
 set -e
 
-export OUTPUT_PATH="provide an output path"
-export RUN_NAME="llama-2-1vm-$(date +%Y-%m-%d-%H-%M)"
+# Use a GCS bucket you own to store logs and checkpoints. Ideally in the same
+# region as your GPUs to minimize latency and costs.
+# You can list your buckets and their locations in the
+# [Cloud Console](https://console.cloud.google.com/storage/browser).
+export BASE_OUTPUT_DIRECTORY=<GCS_BUCKET> # e.g., gs://my-bucket/maxtext-runs
+
+# An arbitrary string to identify this specific run.
+# Note: Kubernetes requires workload names to be valid DNS labels (lowercase, no underscores or periods).
+export RUN_NAME=<RUN_NAME>
 
 # Set environment variables
 for ARGUMENT in "$@"; do
@@ -152,12 +165,12 @@ for ARGUMENT in "$@"; do
     export "$KEY"="$VALUE"
 done
 
-export XLA_FLAGS="--xla_dump_to=${OUTPUT_PATH?}/${RUN_NAME?}/HLO_dumps/
+export XLA_FLAGS="--xla_dump_to=${BASE_OUTPUT_DIRECTORY?}/${RUN_NAME?}/HLO_dumps/
 --xla_gpu_enable_latency_hiding_scheduler=true --xla_gpu_enable_triton_gemm=false
  --xla_gpu_enable_command_buffer='' --xla_gpu_enable_highest_priority_async_stream=true
  --xla_gpu_all_reduce_combine_threshold_bytes=134217728 --xla_gpu_all_gather_combine_threshold_bytes=134217728
- --xla_gpu_reduce_scatter_combine_threshold_bytes=67108864 --xla_gpu_enable_pipelined_all_gather=true
- --xla_gpu_enable_pipelined_reduce_scatter=true --xla_gpu_enable_pipelined_all_reduce=true
+ --xla_gpu_reduce_scatter_combine_threshold_bytes=67108864 --xla_gpu_pipeline_all_gather=on
+ --xla_gpu_pipeline_reduce_scatter=on --xla_gpu_pipeline_all_reduce=on
  --xla_gpu_enable_while_loop_double_buffering=true --xla_gpu_enable_triton_softmax_fusion=false
  --xla_gpu_enable_all_gather_combine_by_dim=false --xla_gpu_enable_reduce_scatter_combine_by_dim=false
  --xla_disable_hlo_passes=rematerialization"
@@ -165,6 +178,6 @@ export XLA_FLAGS="--xla_dump_to=${OUTPUT_PATH?}/${RUN_NAME?}/HLO_dumps/
 
 # 1 node, DATA_DP=1, ICI_FSDP=8
 python3 -m maxtext.trainers.pre_train.train src/maxtext/configs/gpu/models/llama2_7b.yml run_name=${RUN_NAME?} dcn_data_parallelism=1 \
-  ici_fsdp_parallelism=8 base_output_directory=${OUTPUT_PATH?} attention=cudnn_flash_te scan_layers=False \
+  ici_fsdp_parallelism=8 base_output_directory=${BASE_OUTPUT_DIRECTORY?} attention=cudnn_flash_te scan_layers=False \
   use_iota_embed=True hardware=gpu
 ```

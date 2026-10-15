@@ -19,44 +19,50 @@
 # ==================================
 
 # Install dependencies in dependencies/generated_requirements/tpu-requirements.txt
-## bash tools/setup/setup.sh MODE=stable
+## bash src/dependencies/scripts/setup.sh MODE=stable
 
 # Install dependencies in dependencies/generated_requirements/tpu-requirements.txt + specified jax, jaxlib, libtpu
-## bash tools/setup/setup.sh MODE=stable JAX_VERSION=0.8.0
+## bash src/dependencies/scripts/setup.sh MODE=stable JAX_VERSION=0.8.0
 
 # Install dependencies in dependencies/generated_requirements/tpu-requirements.txt + custom libtpu
-## bash tools/setup/setup.sh MODE=stable LIBTPU_GCS_PATH=gs://my_custom_libtpu/libtpu.so
+## bash src/dependencies/scripts/setup.sh MODE=stable LIBTPU_GCS_PATH=gs://my_custom_libtpu/libtpu.so
 
 # Install dependencies in dependencies/generated_requirements/tpu-requirements.txt + jax-nightly, jaxlib-nightly, libtpu-nightly
-## bash tools/setup/setup.sh MODE=nightly
+## bash src/dependencies/scripts/setup.sh MODE=nightly
 
 # Install dependencies in dependencies/generated_requirements/tpu-requirements.txt + specified jax-nightly, jaxlib-nightly + latest libtpu-nightly
-## bash tools/setup/setup.sh MODE=nightly JAX_VERSION=0.8.2.dev20251211
+## bash src/dependencies/scripts/setup.sh MODE=nightly JAX_VERSION=0.8.2.dev20251211
 
 # Install dependencies in dependencies/generated_requirements/tpu-requirements.txt + specified jax-nightly, jaxlib-nightly + specific libtpu-nightly
-## bash tools/setup/setup.sh MODE=nightly JAX_VERSION=0.8.1 LIBTPU_VERSION=0.0.31.dev20251119+nightly
+## bash src/dependencies/scripts/setup.sh MODE=nightly JAX_VERSION=0.8.1 LIBTPU_VERSION=0.0.31.dev20251119+nightly
 
 # Install dependencies in dependencies/generated_requirements/tpu-requirements.txt + jax-nightly, jaxlib-nightly + custom libtpu
-## bash tools/setup/setup.sh MODE=nightly LIBTPU_GCS_PATH=gs://my_custom_libtpu/libtpu.so
+## bash src/dependencies/scripts/setup.sh MODE=nightly LIBTPU_GCS_PATH=gs://my_custom_libtpu/libtpu.so
 
 # Install custom libtpu only
-## bash tools/setup/setup.sh MODE=libtpu-only LIBTPU_GCS_PATH=gs://my_custom_libtpu/libtpu.so
+## bash src/dependencies/scripts/setup.sh MODE=libtpu-only LIBTPU_GCS_PATH=gs://my_custom_libtpu/libtpu.so
+
+# Install dependencies in dependencies/generated_requirements/tpu-requirements.txt + optional TensorFlow/JetStream
+## bash src/dependencies/scripts/setup.sh MODE=stable TF=true
 
 # ==================================
 # GPU EXAMPLES
 # ==================================
 
 # Install dependencies in dependencies/generated_requirements/cuda12-requirements.txt
-## bash tools/setup/setup.sh MODE=stable DEVICE=gpu
+## bash src/dependencies/scripts/setup.sh MODE=stable DEVICE=gpu
+
+# Install dependencies in dependencies/generated_requirements/cuda12-requirements.txt + optional TensorFlow/JetStream
+## bash src/dependencies/scripts/setup.sh MODE=stable DEVICE=gpu TF=true
 
 # Install dependencies in dependencies/generated_requirements/cuda12-requirements.txt + specified jax, jaxlib, jax-cuda12-plugin, jax-cuda12-pjrt
-## bash tools/setup/setup.sh MODE=stable DEVICE=gpu JAX_VERSION=0.4.13
+## bash src/dependencies/scripts/setup.sh MODE=stable DEVICE=gpu JAX_VERSION=0.4.13
 
 # Install dependencies in dependencies/generated_requirements/cuda12-requirements.txt + jax-nightly, jaxlib-nightly
-## bash tools/setup/setup.sh MODE=nightly DEVICE=gpu
+## bash src/dependencies/scripts/setup.sh MODE=nightly DEVICE=gpu
 
 # Install dependencies in dependencies/generated_requirements/cuda12-requirements.txt + specified jax, jaxlib, jax-cuda12-plugin, jax-cuda12-pjrt
-## bash tools/setup/setup.sh MODE=nightly DEVICE=gpu JAX_VERSION=0.4.36.dev20241109
+## bash src/dependencies/scripts/setup.sh MODE=nightly DEVICE=gpu JAX_VERSION=0.4.36.dev20241109
 
 
 # Enable "exit immediately if any command fails" option
@@ -125,18 +131,24 @@ fi
 echo "Python version check passed. Continuing with script."
 echo "--------------------------------------------------"
 
-apt-get update && apt-get install -y sudo
+apt-get update && apt-get upgrade -y && apt-get install -y sudo
 (sudo bash || bash) <<'EOF'
-apt update && \
-apt install -y numactl lsb-release gnupg curl net-tools iproute2 procps lsof git ethtool && \
+# sudo strips the exports set by the parent shell, so re-export them here to
+# keep apt-get non-interactive.
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_SUSPEND=1
+export NEEDRESTART_MODE=l
+apt-get update && \
+apt-get upgrade -y && \
+apt-get install -y numactl lsb-release gnupg curl net-tools iproute2 procps lsof git ethtool && \
 export GCSFUSE_REPO=gcsfuse-`lsb_release -c -s`
 echo "deb https://packages.cloud.google.com/apt $GCSFUSE_REPO main" | tee /etc/apt/sources.list.d/gcsfuse.list
 curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
-apt update -y && apt -y install gcsfuse
+apt-get update -y && apt-get -y install gcsfuse
 rm -rf /var/lib/apt/lists/*
 EOF
 
-python3 -m pip install -U setuptools wheel uv
+python3 -m pip install --no-cache-dir -U pip setuptools wheel uv
 
 # Set environment variables
 for ARGUMENT in "$@"; do
@@ -157,6 +169,11 @@ fi
 # Set default value for $WORKFLOW
 if [[ -z "$WORKFLOW" ]]; then
   export WORKFLOW=pre-training
+fi
+
+# Set default value for $TF (default false for local setups; docker builds pass TF=true)
+if [[ -z "$TF" ]]; then
+  export TF="${tf:-false}"
 fi
 
 # Unset optional variables if set to NONE
@@ -203,6 +220,14 @@ install_maxtext_package_without_deps() {
     fi
 }
 
+cleanup_unneeded_build_artifacts() {
+    echo "Cleaning up build artifacts that trigger security scanners..."
+    # Clean up flaxlib_src Cargo.lock / unneeded source files
+    rm -rf /usr/local/lib/python3*/site-packages/flaxlib_src
+    # Clean up embedded virtualenv seed wheels if virtualenv was installed
+    find /usr/local /root -name "*.whl" -path "*/virtualenv/seed/wheels/embed/*" -delete 2>/dev/null || true
+}
+
 install_maxtext_with_deps() {
     if [[ "$DEVICE" != "tpu" && "$DEVICE" != "gpu" ]]; then
       echo -e "\n\nError: DEVICE must be either 'tpu' or 'gpu'.\n\n"
@@ -215,10 +240,15 @@ install_maxtext_with_deps() {
         dep_name='src/dependencies/requirements/generated_requirements/tpu-requirements.txt'
     fi
     echo "Installing requirements from $dep_name"
-    python3 -m uv pip install --resolution=lowest -r "$dep_name" \
-        -r 'src/dependencies/github_deps/pre_train_deps.txt'
+    python3 -m uv pip install --resolution=lowest -r "$dep_name"
+    if [[ "$TF" == "true" ]]; then
+        python3 -m src.dependencies.scripts.install_pre_train_extra_deps --with-tf
+    else
+        python3 -m src.dependencies.scripts.install_pre_train_extra_deps
+    fi
 
     install_maxtext_package_without_deps
+    cleanup_unneeded_build_artifacts
 }
 
 install_post_training_deps() {
@@ -227,10 +257,23 @@ install_post_training_deps() {
       exit 1
     fi
     echo "Setting up MaxText post-training workflow for $DEVICE device"
+
+    # Install build tools needed to compile vllm from source.
+    if [ -f /etc/os-release ] && grep -q "bullseye" /etc/os-release; then
+        echo "deb http://deb.debian.org/debian bookworm main" > /etc/apt/sources.list.d/bookworm.list
+        apt-get update -y && apt-get install -y --no-install-recommends -t bookworm gcc-12 g++-12 build-essential cmake ninja-build
+        export CC=gcc-12
+        export CXX=g++-12
+    else
+        apt-get update -y && apt-get install -y --no-install-recommends gcc-12 g++-12 build-essential cmake ninja-build || \
+        apt-get install -y --no-install-recommends build-essential cmake ninja-build
+    fi
+
     dep_name='src/dependencies/requirements/generated_requirements/tpu-post-train-requirements.txt'
     echo "Installing requirements from $dep_name"
-    python3 -m uv pip install --resolution=lowest -r "$dep_name"
-    python3 -m src.dependencies.github_deps.install_post_train_deps
+    UV_TORCH_BACKEND=cpu python3 -m uv pip install --resolution=lowest -r "$dep_name"
+    python3 -m src.dependencies.scripts.install_post_train_extra_deps
+    cleanup_unneeded_build_artifacts
 }
 
 # ---------- Post-Training workflow installation ----------
@@ -273,6 +316,9 @@ fi
 # nightly mode installation
 if [[ $MODE == "nightly" ]]; then
     install_maxtext_with_deps
+
+    # Install Flax HEAD to maintain compatibility with JAX nightly
+    python3 -m uv pip install -U --no-deps git+https://github.com/google/flax.git
 
     # Uninstall existing jax, jaxlib and libtpu
     python3 -m uv pip show jax && python3 -m uv pip uninstall jax

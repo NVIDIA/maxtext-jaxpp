@@ -1,4 +1,4 @@
-# Copyright 2023–2025 Google LLC
+# Copyright 2023–2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -59,6 +59,7 @@ from benchmarks.api_server.server_models import (
     ChatMessage,
 )
 from benchmarks.api_server import server_utils
+from benchmarks.api_server.encoding import encoding_dsv32, encoding_dsv4
 
 # ----------------------------
 # Init
@@ -95,10 +96,13 @@ request_queue = queue.Queue()
 response_dict = {}
 response_lock = threading.Lock()
 
-# Batching configuration
-BATCH_TIMEOUT_S = 0.1  # 100ms
+# Batching configuration.
+BATCH_TIMEOUT_S = float(os.environ.get("MAXTEXT_BATCH_TIMEOUT_S", "0.1"))
 # Timeout for a client waiting for a response.
 REQUEST_TIMEOUT_S = int(os.environ.get("MAXTEXT_REQUEST_TIMEOUT_S", "36000"))
+# Define a maximum size for the request payload to be broadcasted.
+# This avoids broadcasting variable-sized arrays, which can be complex.
+MAX_REQUEST_SIZE = int(os.environ.get("MAXTEXT_REQUEST_SIZE", "655360"))
 
 
 async def _queue_and_wait_for_response(request: Union[CompletionRequest, ChatCompletionRequest]):
@@ -165,14 +169,11 @@ def run_server():
   uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
-# Define a maximum size for the request payload to be broadcasted.
-# This avoids broadcasting variable-sized arrays, which can be complex.
-MAX_REQUEST_SIZE = 65536 * 10
-
-
 def _build_chat_completion_response(request, completion_result, llm):
   """Builds a ChatCompletionResponse from a single completion result."""
   text_out = completion_result.text
+  reasoning_out = None
+
   if "gpt-oss" in request.model and harmony_enc:
     try:
       parsed_messages = harmony_enc.parse_messages_from_completion_tokens(completion_result.tokens, role=Role.ASSISTANT)
@@ -185,6 +186,26 @@ def _build_chat_completion_response(request, completion_result, llm):
         )
     except (ValueError, IndexError) as e:
       logger.error("Harmony parsing failed for gpt-oss: %s. Falling back to raw text.", e, exc_info=True)
+
+  t_mode = getattr(request, "thinking_mode", "thinking")
+
+  if server_utils.is_dsv32_encoding_enabled(request.model):
+    try:
+      # DeepSeek-V3.2 models often generate thinking block.
+      parsed = encoding_dsv32.parse_message_from_completion_text(text_out, thinking_mode=t_mode)
+      text_out = parsed.get("content", text_out)
+      reasoning_out = parsed.get("reasoning_content")
+    except (AssertionError, ValueError, IndexError) as e:
+      logger.error("DeepSeek-V3.2 parsing failed: %s. Falling back to raw text.", e, exc_info=True)
+
+  if server_utils.is_dsv4_encoding_enabled(request.model):
+    try:
+      # DeepSeek-V4 models often generate thinking block.
+      parsed = encoding_dsv4.parse_message_from_completion_text(text_out, thinking_mode=t_mode)
+      text_out = parsed.get("content", text_out)
+      reasoning_out = parsed.get("reasoning_content")
+    except (AssertionError, ValueError, IndexError) as e:
+      logger.error("DeepSeek-V4 parsing failed: %s. Falling back to raw text.", e, exc_info=True)
 
   want_top_logprobs = (
       (request.top_logprobs or 0) > 0 if isinstance(request, ChatCompletionRequest) else (request.logprobs or 0) > 0
@@ -206,7 +227,7 @@ def _build_chat_completion_response(request, completion_result, llm):
       choices=[
           ChatCompletionChoice(
               index=0,
-              message=ChatMessage(role="assistant", content=text_out),
+              message=ChatMessage(role="assistant", content=text_out, reasoning_content=reasoning_out),
               finish_reason=finish_reason,
               logprobs=lp_payload,
           )
@@ -269,13 +290,20 @@ def _collect_batched_requests():
   """Waits for and collects a batch of requests from the queue."""
   batched_items = []
   start_time = time.time()
-  while len(batched_items) < LLM.batch_size and (time.time() - start_time) < BATCH_TIMEOUT_S:
+
+  while len(batched_items) < LLM.batch_size:
+    elapsed = time.time() - start_time
+    remaining = BATCH_TIMEOUT_S - elapsed
+
+    if remaining <= 0:
+      break
+
     try:
-      item = request_queue.get(timeout=0.01)
+      item = request_queue.get(timeout=remaining)
       batched_items.append(item)
     except queue.Empty:
-      if batched_items:
-        break  # Process what we have if timeout is reached
+      break  # We hit the full BATCH_TIMEOUT_S
+
   return batched_items
 
 
@@ -305,9 +333,17 @@ def _prepare_batch_for_broadcast(batched_items):
   request_info_map = []
   for req_id, req in batched_items:
     is_chat = isinstance(req, ChatCompletionRequest)
-    prompts_for_req = server_utils.get_prompts_for_request(req, LLM)
-    all_prompts.extend(prompts_for_req)
-    request_info_map.append((req_id, req, is_chat, len(prompts_for_req)))
+    try:
+      prompts_for_req = server_utils.get_prompts_for_request(req, LLM)
+      all_prompts.extend(prompts_for_req)
+      request_info_map.append((req_id, req, is_chat, len(prompts_for_req)))
+    except ValueError as e:
+      logger.error("Failed to parse request %s: %s", req_id, e)
+      with response_lock:
+        response_dict[req_id] = {"error": f"Invalid request format or missing chat template: {e}"}
+
+  if not all_prompts:
+    return 0, b"", []  # Signal other ranks to skip if all requests failed
 
   broadcast_payload = {"prompts": all_prompts, "params": params}
   payload_bytes = json.dumps(broadcast_payload).encode("utf-8")

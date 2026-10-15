@@ -15,7 +15,9 @@
 """Tests for the common MaxText utilities"""
 
 from collections.abc import Callable
-from typing import Any
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+from typing import Any, Sequence
 import unittest
 from unittest.mock import MagicMock, Mock
 
@@ -25,22 +27,23 @@ from flax.core.scope import FrozenVariableDict
 from flax.training import train_state
 import jax
 from jax import random, vmap
+from jax.experimental import mesh_utils
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
+from maxtext.common import train_state_nnx
 from maxtext.configs import pyconfig
-from maxtext.common.common_types import MODEL_MODE_TRAIN
+from maxtext.common.common_types import DecoderBlockType, ShardMode
 from maxtext.inference import inference_utils
-from maxtext.layers import quantizations
-from maxtext.models import models
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
+from maxtext.utils import maxtext_utils_nnx
+from maxtext.utils import model_creation_utils
 from maxtext.utils import sharding
 from maxtext.utils.sharding import assert_params_sufficiently_sharded, get_formatted_sharding_annotations
-from tests.utils.test_helpers import get_test_config_path, get_decoupled_parallelism_overrides
+from tests.utils.test_helpers import get_test_config_path
 import numpy as np
 import optax
-
-Transformer = models.transformer_as_linen
+import pytest
 
 
 class TestGradientClipping(unittest.TestCase):
@@ -100,21 +103,33 @@ class TestIntermediateValueRetrieval(unittest.TestCase):
     # 2. Create the Decoder Mock
     self.mock_decoder = MagicMock(name="Decoder")
     self.mock_model.decoder = self.mock_decoder
-    self.mock_layers = {}
-    self.mock_model.decoder.layers = self.mock_layers
-    self.self_attention = {}
-    self.mock_layers["self_attention"] = self.self_attention
+    self.mock_layer = MagicMock(name="Layer")
+    self.mock_decoder.get_layers.return_value = [self.mock_layer]
+    self.self_attention = MagicMock(name="Attention", spec=[])
+    self.mock_layer.self_attention = self.self_attention
 
   def test_valid_intermediate_key(self):
     expected_sowed_data = [0.1, 0.5, 0.9]
     mock_sowed_variable = Mock(name="out_projection_activations")
     mock_sowed_variable.get_value.return_value = (expected_sowed_data,)
 
-    self.mock_decoder.layers["self_attention"]["out_projection_activations"] = mock_sowed_variable
+    self.self_attention.out_projection_activations = mock_sowed_variable
 
     result = maxtext_utils.get_intermediate_value(self.mock_model, "out_projection_activations")
 
     self.assertEqual(result, expected_sowed_data)
+
+  def test_clear_intermediate_key(self):
+    expected_sowed_data = [0.1, 0.5, 0.9]
+    mock_sowed_variable = Mock(name="out_projection_activations")
+    mock_sowed_variable.get_value.return_value = (expected_sowed_data,)
+
+    self.self_attention.out_projection_activations = mock_sowed_variable
+
+    result = maxtext_utils.get_intermediate_value(self.mock_model, "out_projection_activations", clear=True)
+
+    self.assertEqual(result, expected_sowed_data)
+    self.assertFalse(hasattr(self.self_attention, "out_projection_activations"))
 
   def test_returns_default_if_sow_did_not_happen(self):
     """
@@ -177,11 +192,7 @@ class UpdateStateParamTest(unittest.TestCase):
         "decoder": {"gate": {"bias": jnp.array([0.5, 0.5])}},
     }
     self.state = train_state.TrainState(
-        step=0,
-        apply_fn=self.model.apply,
-        params=self.initial_params,
-        tx=None,
-        opt_state={},
+        step=0, apply_fn=self.model.apply, params=self.initial_params, tx=None, opt_state={}
     )
 
   def test_update_mode_add(self):
@@ -194,10 +205,10 @@ class UpdateStateParamTest(unittest.TestCase):
     self.assertTrue(jnp.allclose(actual, expected))
 
     # Other values are untouched
-    original_layer_0 = self.state.params["layers"]["layer_0"]["bias"]
+    original_layer_0 = self.state.params["layers"]["layer_0"]["bias"]  # pylint: disable=unsubscriptable-object
     new_layer_0 = new_state.params["layers"]["layer_0"]["bias"]
     self.assertTrue(jnp.array_equal(original_layer_0, new_layer_0))
-    original_layer_1 = self.state.params["layers"]["layer_1"]["bias"]
+    original_layer_1 = self.state.params["layers"]["layer_1"]["bias"]  # pylint: disable=unsubscriptable-object
     new_layer_1 = new_state.params["layers"]["layer_1"]["bias"]
     self.assertTrue(jnp.array_equal(original_layer_1, new_layer_1))
 
@@ -262,7 +273,7 @@ class MaxUtilsInitState(unittest.TestCase):
 
 
 @nnx.register_variable_name("special_variables")
-class SpecialVariables(nnx.Variable):
+class SpecialVariables(nnx.Variable):  # pylint: disable=abstract-method
   pass
 
 
@@ -279,7 +290,7 @@ class ModelWithMultipleCollections(nnx.Module):
     return x
 
 
-class TrainState(train_state.TrainState):
+class TrainState(train_state.TrainState):  # pylint: disable=abstract-method
   other_variables: nnx.State
 
 
@@ -345,26 +356,32 @@ class MaxUtilsInitTransformerState(unittest.TestCase):
   """Tests initialization of transformer states in max_utils.py"""
 
   def setUp(self):
-    # Conditionally set ici_fsdp_parallelism to match device count in decoupled mode
-    extra_args = get_decoupled_parallelism_overrides()
-    self.config = pyconfig.initialize([None, get_test_config_path()], enable_checkpointing=False, **extra_args)
+    self.config = pyconfig.initialize([None, get_test_config_path()], enable_checkpointing=False)
     devices_array = maxtext_utils.create_device_mesh(self.config)
     self.mesh = Mesh(devices_array, self.config.mesh_axes)
-    quant = quantizations.configure_quantization(self.config)
-    self.model = Transformer(self.config, mesh=self.mesh, quant=quant, model_mode=MODEL_MODE_TRAIN)
+    self._create_model_partial, self.model = model_creation_utils.create_nnx_abstract_model(self.config, self.mesh)
 
   def test_setup_decode_state(self):
-    rng = random.PRNGKey(0)
-    state, _ = maxtext_utils.setup_decode_state(self.model, self.config, rng, self.mesh, None)
-    self.assertEqual(state.tx, None)
-    self.assertEqual(state.opt_state, {})
+    def create_train_state_fn():
+      nnx_model = self._create_model_partial()
+      return train_state_nnx.TrainStateNNX(nnx_model, None)
+
+    init_state_fn = create_train_state_fn
+    state, _ = maxtext_utils.setup_decode_state(self.config, self.mesh, None, init_state_fn)
+    self.assertNotIn("optimizer", state)
 
   def test_setup_initial_state(self):
-    rng = random.PRNGKey(0)
     tx = optax.adam(learning_rate=0.001)
-    state, _, _, _ = maxtext_utils.setup_initial_state(self.model, None, tx, self.config, rng, self.mesh, None)
-    self.assertEqual(state.tx, tx)
-    self.assertNotEqual(state.opt_state, {})
+
+    def create_train_state_fn():
+      nnx_model = self._create_model_partial()
+      optimizer = nnx.Optimizer(nnx_model, tx, wrt=nnx.Param)
+      return train_state_nnx.TrainStateNNX(nnx_model, optimizer)
+
+    init_state_fn = create_train_state_fn
+    state, _, _, _, was_restored = maxtext_utils.setup_initial_state(None, self.config, self.mesh, None, init_state_fn)
+    self.assertFalse(was_restored)
+    self.assertIsNotNone(state.optimizer)
 
 
 class MaxUtilsPpAsDp(unittest.TestCase):
@@ -908,38 +925,846 @@ class TestLearningRateSchedules(unittest.TestCase):
     self.assertIn("wsd_decay_steps_fraction", str(cm.exception))
 
 
-class TestGetAbstractState(unittest.TestCase):
-  """Test class for get_abstract_state."""
+class TestMeshUtils(unittest.TestCase):
+  """Test suite for the mesh creation utility function."""
+
+  @dataclass
+  class MockConfig:
+    """Minimal mock for pyconfig.HyperParameters."""
+
+    init_weights_seed: int = 42
+    shard_mode: str = ShardMode.EXPLICIT
+    mesh_axes: Sequence[str] = field(default_factory=lambda: ["data", "model"])
 
   def setUp(self):
-    extra_args = get_decoupled_parallelism_overrides()
-    self.config = pyconfig.initialize(
-        [None, get_test_config_path()],
-        **extra_args,
-        enable_checkpointing=False,
-        model_name="llama3.1-8b",
-        per_device_batch_size=1,
-        max_target_length=16,
+    # Setup a dummy device array for the mock to return
+    devices = jax.devices()
+    if len(devices) < 2:
+      mock_devices = []
+      for i in range(2):
+        d = MagicMock(spec=jax.Device)
+        d.id = i
+        d.device_kind = "cpu"
+        d.platform = "cpu"
+        # make it hashable
+        d.__hash__ = lambda self, idx=i: idx
+        d.__eq__ = lambda self, other, idx=i: isinstance(other, MagicMock) and other.id == idx
+        mock_devices.append(d)
+      self.devices_array = np.array(mock_devices)
+    else:
+      self.devices_array = np.array(devices)
+
+  @patch("maxtext.utils.maxtext_utils.create_device_mesh")
+  def test_get_mesh_explicit_mode(self, mock_create_device_mesh):
+    """Tests that ShardMode.EXPLICIT sets axis_types to MANUAL."""
+    # 1. Setup Mock
+    mock_create_device_mesh.return_value = self.devices_array[:1].reshape((1,))
+    config = self.MockConfig(shard_mode=ShardMode.EXPLICIT, mesh_axes=["data"])
+
+    # 2. Run function
+    mesh = maxtext_utils.get_mesh_from_config(config)
+
+    # 3. Assertions
+    # Check that the internal utility was called correctly
+    mock_create_device_mesh.assert_called_once_with(config, None)
+
+    # Verify Mesh properties
+    self.assertEqual(mesh.axis_names, ("data",))
+    # In JAX, AxisType.MANUAL is the equivalent for explicit control
+    self.assertEqual(mesh.axis_types, (AxisType.Explicit,))
+
+  @patch("maxtext.utils.maxtext_utils.create_device_mesh")
+  def test_get_mesh_auto_mode(self, mock_create_device_mesh):
+    """Tests that ShardMode.AUTO sets axis_types to AUTO."""
+    # 1. Setup Mock
+    mock_create_device_mesh.return_value = self.devices_array[:2].reshape((2, 1))
+    config = self.MockConfig(shard_mode=ShardMode.AUTO, mesh_axes=["data", "model"])
+
+    # 2. Run function
+    mesh = maxtext_utils.get_mesh_from_config(config)
+
+    # 3. Assertions
+    self.assertEqual(len(mesh.axis_types), 2)
+    self.assertTrue(all(t == AxisType.Auto for t in mesh.axis_types))
+
+  @patch("maxtext.utils.maxtext_utils.create_device_mesh")
+  def test_get_mesh_with_provided_devices(self, mock_create_device_mesh):
+    """Tests that provided devices are passed through to the mesh creator."""
+    config = self.MockConfig()
+    specific_devices = self.devices_array[:2].reshape((1, 2))
+    mock_create_device_mesh.return_value = specific_devices
+
+    _ = maxtext_utils.get_mesh_from_config(config, devices=specific_devices)
+
+    # Verify the second argument to create_device_mesh was our device list
+    mock_create_device_mesh.assert_called_once_with(config, specific_devices)
+
+  def test_create_device_mesh_honors_non_default_mesh_axes(self):
+    """Tests mesh creation for the vLLM inference axes, which include dcp and pcp."""
+    mesh_axes = ["data", "attn_dp", "model", "expert", "attn_dp_expert", "dcp", "pcp"]
+    config = pyconfig.initialize([None, get_test_config_path()], enable_checkpointing=False, mesh_axes=mesh_axes)
+
+    self.assertEqual(len(config.ici_parallelism), len(mesh_axes))
+    self.assertEqual(len(config.dcn_parallelism), len(mesh_axes))
+
+    devices_array = maxtext_utils.create_device_mesh(config, devices=jax.devices()[:1])
+    self.assertEqual(devices_array.shape, (1,) * len(mesh_axes))
+
+
+class TestGetFunctionalTrainWithSignature(unittest.TestCase):
+  """Tests for get_functional_train_with_signature."""
+
+  def _make_mock_step(self):
+    def train_step(_model, _config, _state_shardings, _params_shardings, state, _batch, _rng=None):
+      return state, {}
+
+    return train_step
+
+  def _make_mock_config(self):
+    cfg = MagicMock()
+    cfg.moe_dropless_fallback = None
+    return cfg
+
+  def test_returns_five_tuple(self):
+    step = self._make_mock_step()
+    result = maxtext_utils.get_functional_train_with_signature(
+        step, "data_sharding", "state_shardings", "model", self._make_mock_config()
     )
+    self.assertEqual(len(result), 5)
+
+  def test_functional_train_has_correct_name(self):
+    step = self._make_mock_step()
+    fn, _, _, _, _ = maxtext_utils.get_functional_train_with_signature(
+        step, "data_sharding", "state_shardings", "model", self._make_mock_config()
+    )
+    self.assertEqual(fn.__name__, "train_step")
+
+  def test_nnx_in_shardings_excludes_rng(self):
+    """in_shardings should be (state, batch) — no rng slot."""
+    step = self._make_mock_step()
+    _, in_shardings, _, _, _ = maxtext_utils.get_functional_train_with_signature(
+        step, "data_sharding", "state_shardings", "model", self._make_mock_config()
+    )
+    self.assertEqual(len(in_shardings), 2)
+
+  def test_donate_argnums_is_zero(self):
+    step = self._make_mock_step()
+    _, _, _, _, donate_argnums = maxtext_utils.get_functional_train_with_signature(
+        step, "data_sharding", "state_shardings", "model", self._make_mock_config()
+    )
+    self.assertEqual(donate_argnums, 0)
+
+  def test_donate_argnums_is_zero_with_step_dropless_fallback(self):
+    step = self._make_mock_step()
+    cfg = self._make_mock_config()
+    cfg.moe_dropless_fallback = "step"
+    _, _, _, _, donate_argnums = maxtext_utils.get_functional_train_with_signature(
+        step, "data_sharding", "state_shardings", "model", cfg
+    )
+    self.assertEqual(donate_argnums, 0)
+
+  def test_functional_train_is_partial(self):
+    """functional_train should partially apply model and config."""
+    received = {}
+    cfg = self._make_mock_config()
+
+    def train_step(model, config, _state_shardings, _params_shardings, state, _batch, _rng=None):
+      received["model"] = model
+      received["config"] = config
+      return state, {}
+
+    fn, _, _, _, _ = maxtext_utils.get_functional_train_with_signature(train_step, "ds", "ss", "my_model", cfg)
+    fn("state", "batch")
+    self.assertEqual(received["model"], "my_model")
+    self.assertEqual(received["config"], cfg)
+
+
+class TestGetFunctionalEvalWithSignature(unittest.TestCase):
+  """Tests for get_functional_eval_with_signature."""
+
+  def _make_mock_eval_step(self):
+    def eval_step(_model, _config, _state, _batch, _rng=None):
+      return {}
+
+    return eval_step
+
+  def _make_mock_config(self):
+    cfg = MagicMock()
+    return cfg
+
+  def test_returns_five_tuple(self):
+    step = self._make_mock_eval_step()
+    result = maxtext_utils.get_functional_eval_with_signature(step, "ds", "ss", "model", self._make_mock_config())
+    self.assertEqual(len(result), 5)
+
+  def test_functional_eval_has_correct_name(self):
+    step = self._make_mock_eval_step()
+    fn, _, _, _, _ = maxtext_utils.get_functional_eval_with_signature(step, "ds", "ss", "model", self._make_mock_config())
+    self.assertEqual(fn.__name__, "eval_step")
+
+  def test_out_shardings_is_none(self):
+    step = self._make_mock_eval_step()
+    _, _, out_shardings, _, _ = maxtext_utils.get_functional_eval_with_signature(
+        step, "ds", "ss", "model", self._make_mock_config()
+    )
+    self.assertIsNone(out_shardings)
+
+  def test_donate_argnums_is_empty(self):
+    step = self._make_mock_eval_step()
+    _, _, _, _, donate_argnums = maxtext_utils.get_functional_eval_with_signature(
+        step, "ds", "ss", "model", self._make_mock_config()
+    )
+    self.assertEqual(donate_argnums, ())
+
+  def test_nnx_in_shardings_excludes_rng(self):
+    """in_shardings should be (state, batch) — no rng slot."""
+    step = self._make_mock_eval_step()
+    _, in_shardings, _, _, _ = maxtext_utils.get_functional_eval_with_signature(
+        step, "batch_sharding", "state_sharding", "model", self._make_mock_config()
+    )
+    self.assertEqual(len(in_shardings), 2)
+
+
+class TestGetShapedBatch(unittest.TestCase):
+  """Tests for get_shaped_batch."""
+
+  def _make_cfg(
+      self,
+      *,
+      enable_diloco=False,
+      use_multimodal=False,
+      use_audio=False,
+      use_mrope=False,
+      model_name="llama3.1-8b",
+      training_objective="causal_lm",
+  ):
+    """Builds the config subset consumed by get_shaped_batch."""
+    cfg = MagicMock()
+    cfg.enable_diloco = enable_diloco
+    cfg.global_batch_size_to_load = 4
+    cfg.max_target_length = 16
+    cfg.use_multimodal = use_multimodal
+    cfg.use_audio = use_audio
+    cfg.use_mrope = use_mrope
+    cfg.model_name = model_name
+    cfg.training_objective = training_objective
+    cfg.video_max_grid_t = None
+    cfg.video_max_grid_h = None
+    cfg.video_max_grid_w = None
+    if enable_diloco:
+      cfg.num_diloco_replicas = 2
+    return cfg
+
+  def test_standard_keys_present(self):
+    batch = maxtext_utils.get_shaped_batch(self._make_cfg())
+    for key in (
+        "inputs",
+        "inputs_position",
+        "inputs_segmentation",
+        "targets",
+        "targets_position",
+        "targets_segmentation",
+    ):
+      self.assertIn(key, batch)
+
+  def test_standard_shape(self):
+    cfg = self._make_cfg()
+    batch = maxtext_utils.get_shaped_batch(cfg)
+    expected_shape = (cfg.global_batch_size_to_load, cfg.max_target_length)
+    self.assertEqual(batch["inputs"].shape, expected_shape)
+
+  def test_block_diffusion_masks_are_in_shaped_batch(self):
+    cfg = self._make_cfg(training_objective="block_diffusion")
+
+    batch = maxtext_utils.get_shaped_batch(cfg)
+
+    self.assertEqual(batch["corruption_mask"].shape, batch["inputs"].shape)
+    self.assertEqual(batch["targets_loss_mask"].shape, batch["inputs"].shape)
+    self.assertEqual(batch["targets_loss_mask"].dtype, jnp.int32)
+
+  def test_causal_shaped_batch_has_no_diffusion_masks(self):
+    batch = maxtext_utils.get_shaped_batch(self._make_cfg())
+
+    self.assertNotIn("corruption_mask", batch)
+    self.assertNotIn("targets_loss_mask", batch)
+
+  def test_diloco_shape(self):
+    cfg = self._make_cfg(enable_diloco=True)
+    batch = maxtext_utils.get_shaped_batch(cfg)
+    expected_shape = (
+        cfg.num_diloco_replicas,
+        cfg.global_batch_size_to_load // cfg.num_diloco_replicas,
+        cfg.max_target_length,
+    )
+    self.assertEqual(batch["inputs"].shape, expected_shape)
+
+  def test_no_image_key_without_multimodal(self):
+    batch = maxtext_utils.get_shaped_batch(self._make_cfg(use_multimodal=False))
+    self.assertNotIn("images", batch)
+
+  def test_no_audio_key_without_audio(self):
+    batch = maxtext_utils.get_shaped_batch(self._make_cfg(use_audio=False))
+    self.assertNotIn("audios", batch)
+
+  def test_llama4_includes_image_masks(self):
+    """Llama4 uses tile masks shaped as image_shape[:2] = (B*N, num_tiles)."""
+    batch = maxtext_utils.get_shaped_batch(self._make_cfg(use_multimodal=True, model_name="llama4-17b-16e"))
+    self.assertIn("images", batch)
+    self.assertIn("image_masks", batch)
+    self.assertEqual(batch["image_masks"].shape, batch["images"].shape[:2])
+
+  def test_qwen_and_gemma_omit_image_masks(self):
+    """Non-tiled VLMs must not treat image_shape[:2] (e.g. channels) as masks."""
+    for model_name in ("qwen3-vl-2b", "gemma3-4b", "gemma4-e2b"):
+      batch = maxtext_utils.get_shaped_batch(self._make_cfg(use_multimodal=True, model_name=model_name))
+      self.assertIn("images", batch)
+      self.assertNotIn("image_masks", batch, msg=f"{model_name} should omit image_masks")
+
+  def test_mrope_inputs_position_shape(self):
+    """inputs_position is (B, S, 3) only for multimodal + MRoPE; else (B, S)."""
+    cases = (
+        # text-only + MRoPE → still (B, S)
+        ({"use_mrope": True, "use_multimodal": False}, (4, 16)),
+        # multimodal SFT + MRoPE → (B, S, 3)
+        ({"use_mrope": True, "use_multimodal": True, "model_name": "qwen3-vl-2b"}, (4, 16, 3)),
+        # multimodal SFT without MRoPE → (B, S)
+        ({"use_mrope": False, "use_multimodal": True, "model_name": "qwen3-vl-2b"}, (4, 16)),
+    )
+    for cfg_kwargs, expected_inputs_position_shape in cases:
+      with self.subTest(**cfg_kwargs):
+        batch = maxtext_utils.get_shaped_batch(self._make_cfg(**cfg_kwargs))
+        self.assertEqual(batch["inputs_position"].shape, expected_inputs_position_shape)
+        self.assertEqual(batch["targets_position"].shape, (4, 16))
+
+  def test_all_values_are_shape_dtype_struct(self):
+    batch = maxtext_utils.get_shaped_batch(self._make_cfg())
+    for v in batch.values():
+      self.assertIsInstance(v, jax.ShapeDtypeStruct)
+
+  def test_get_shaped_batch_unsharded(self):
+    """Verify that get_shaped_batch returns unsharded ShapeDtypeStructs by default."""
+    cfg = self._make_cfg()
+    shaped_batch = maxtext_utils.get_shaped_batch(cfg)
+    self.assertIn("inputs", shaped_batch)
+    self.assertIsNone(shaped_batch["inputs"].sharding)
+
+  def test_get_shaped_batch_sharded(self):
+    """Verify that get_shaped_batch applies the passed sharding to ShapeDtypeStructs."""
+    cfg = self._make_cfg()
+    devices = np.array(jax.local_devices()[:1]).reshape(
+        1,
+    )
+    mesh = Mesh(devices, ("x",))
+    sharding_spec = NamedSharding(mesh, PartitionSpec("x"))
+    shaped_batch = maxtext_utils.get_shaped_batch(cfg, batch_sharding=sharding_spec)
+    self.assertIn("inputs", shaped_batch)
+    self.assertEqual(shaped_batch["inputs"].sharding, sharding_spec)
+
+
+class TestShouldPreventCseInRemat(unittest.TestCase):
+  """Tests for should_prevent_cse_in_remat."""
+
+  def _make_cfg(self, scan_layers=False, gradient_accumulation_steps=1, hardware="tpu"):
+    cfg = MagicMock()
+    cfg.scan_layers = scan_layers
+    cfg.gradient_accumulation_steps = gradient_accumulation_steps
+    cfg.hardware = hardware
+    return cfg
+
+  def test_scan_layers_returns_false(self):
+    self.assertFalse(maxtext_utils.should_prevent_cse_in_remat(self._make_cfg(scan_layers=True)))
+
+  def test_gpu_with_grad_accum_returns_false(self):
+    cfg = self._make_cfg(scan_layers=False, gradient_accumulation_steps=4, hardware="gpu")
+    self.assertFalse(maxtext_utils.should_prevent_cse_in_remat(cfg))
+
+  def test_gpu_multiprocess_with_grad_accum_returns_false(self):
+    cfg = self._make_cfg(scan_layers=False, gradient_accumulation_steps=4, hardware="gpu_multiprocess")
+    self.assertFalse(maxtext_utils.should_prevent_cse_in_remat(cfg))
+
+  def test_tpu_with_grad_accum_returns_true(self):
+    cfg = self._make_cfg(scan_layers=False, gradient_accumulation_steps=4, hardware="tpu")
+    self.assertTrue(maxtext_utils.should_prevent_cse_in_remat(cfg))
+
+  def test_default_case_returns_true(self):
+    self.assertTrue(maxtext_utils.should_prevent_cse_in_remat(self._make_cfg()))
+
+
+class TestCalculateTokensTrainingPerDevice(unittest.TestCase):
+  """Tests for calculate_tokens_training_per_device."""
+
+  def test_basic_calculation(self):
+    cfg = MagicMock()
+    cfg.max_target_length = 128
+    cfg.per_device_batch_size = 2
+    cfg.gradient_accumulation_steps = 4
+    result = maxtext_utils.calculate_tokens_training_per_device(cfg)
+    self.assertEqual(result, 128 * 2 * 4)
+
+
+class TestCalculateIndexerMaskRatio(unittest.TestCase):
+  """Tests for calculate_indexer_mask_ratio."""
+
+  def test_half_topk(self):
+    # K=T/2: ratio=0.5, mask = 0.5 - 0.5*0.25 = 0.375
+    result = maxtext_utils.calculate_indexer_mask_ratio(indexer_topk=4, max_target_length=8)
+    self.assertAlmostEqual(result, 0.375, places=6)
+
+  def test_full_topk_equals_dense(self):
+    # K=T: ratio=1, mask = 1 - 0.5 = 0.5 (same as causal)
+    result = maxtext_utils.calculate_indexer_mask_ratio(indexer_topk=8, max_target_length=8)
+    self.assertAlmostEqual(result, 0.5, places=6)
+
+  def test_small_topk(self):
+    # K=1, T=100: ratio=0.01, mask ≈ 0.01 - 0.5*0.0001 ≈ 0.00995
+    result = maxtext_utils.calculate_indexer_mask_ratio(indexer_topk=1, max_target_length=100)
+    expected = 0.01 - 0.5 * (0.01**2)
+    self.assertAlmostEqual(result, expected, places=8)
+
+
+class TestCalculateFfnMatmulTflops(unittest.TestCase):
+  """Tests for calculate_ffn_mamtul_tflops_per_device."""
+
+  def _make_cfg(self, num_activations=2):
+    cfg = MagicMock()
+    cfg.per_device_batch_size = 1
+    cfg.max_target_length = 64
+    cfg.emb_dim = 512
+    cfg.mlp_activations = ["silu"] * num_activations
+    return cfg
+
+  def test_total_flops_positive(self):
+    result = maxtext_utils.calculate_ffn_mamtul_tflops_per_device(self._make_cfg(), mlp_dim=2048)
+    self.assertGreater(result, 0)
+
+  def test_scales_with_mlp_dim(self):
+    cfg = self._make_cfg()
+    small = maxtext_utils.calculate_ffn_mamtul_tflops_per_device(cfg, mlp_dim=1024)
+    large = maxtext_utils.calculate_ffn_mamtul_tflops_per_device(cfg, mlp_dim=4096)
+    self.assertGreater(large, small)
+
+  def test_single_activation(self):
+    """With one activation, ffn1 uses 1x mlp_dim."""
+    cfg = self._make_cfg(num_activations=1)
+    result = maxtext_utils.calculate_ffn_mamtul_tflops_per_device(cfg, mlp_dim=2048)
+    expected_ffn1 = 2 * 1 * 64 * 2048 * 512 * 1
+    expected_ffn2 = 2 * 1 * 64 * 2048 * 512
+    self.assertEqual(result, expected_ffn1 + expected_ffn2)
+
+
+class TestGetDenseMoeLayers(unittest.TestCase):
+  """Tests for get_dense_moe_layers."""
+
+  def _make_cfg(self, decoder_block, num_decoder_layers=32, first_num_dense_layers=3, interleave_moe_layer_step=4):
+    cfg = MagicMock()
+    cfg.decoder_block = decoder_block
+    cfg.num_decoder_layers = num_decoder_layers
+    cfg.first_num_dense_layers = first_num_dense_layers
+    cfg.interleave_moe_layer_step = interleave_moe_layer_step
+    return cfg
+
+  def test_deepseek_block(self):
+    cfg = self._make_cfg(DecoderBlockType.DEEPSEEK, num_decoder_layers=32, first_num_dense_layers=3)
+    dense, moe = maxtext_utils.get_dense_moe_layers(cfg)
+    self.assertEqual(dense, 3)
+    self.assertEqual(moe, 29)
+
+  def test_llama4_block(self):
+    cfg = self._make_cfg(DecoderBlockType.LLAMA4, num_decoder_layers=16, interleave_moe_layer_step=4)
+    dense, moe = maxtext_utils.get_dense_moe_layers(cfg)
+    self.assertEqual(moe, 4)  # 16 // 4
+    self.assertEqual(dense, 12)  # 16 - 4
+
+  def test_qwen3_next_block(self):
+    cfg = self._make_cfg(DecoderBlockType.QWEN3_NEXT, num_decoder_layers=8)
+    dense, moe = maxtext_utils.get_dense_moe_layers(cfg)
+    self.assertEqual(dense, 0)
+    self.assertEqual(moe, 8)
+
+  def test_qwen3_5_block(self):
+    cfg = self._make_cfg(DecoderBlockType.QWEN3_5, num_decoder_layers=8)
+    dense, moe = maxtext_utils.get_dense_moe_layers(cfg)
+    self.assertEqual(dense, 0)
+    self.assertEqual(moe, 8)
+
+  def test_unsupported_block_raises(self):
+    cfg = self._make_cfg(DecoderBlockType.DEFAULT)
+    with self.assertRaises(ValueError):
+      maxtext_utils.get_dense_moe_layers(cfg)
+
+
+class TestCalculatePrefillTflops(unittest.TestCase):
+  """Tests for calculate_prefill_tflops_per_device."""
+
+  def _make_cfg(self, num_query_heads=8, num_decoder_layers=2, head_dim=64):
+    cfg = MagicMock()
+    cfg.num_query_heads = num_query_heads
+    cfg.num_decoder_layers = num_decoder_layers
+    cfg.head_dim = head_dim
+    return cfg
+
+  def test_returns_three_positive_values(self):
+    cfg = self._make_cfg()
+    total, lw, attn = maxtext_utils.calculate_prefill_tflops_per_device(
+        num_model_parameters=1_000_000, prefill_length=128, config=cfg, log=False
+    )
+    self.assertGreater(total, 0)
+    self.assertGreater(lw, 0)
+    self.assertGreater(attn, 0)
+
+  def test_total_is_sum_of_parts(self):
+    cfg = self._make_cfg()
+    total, lw, attn = maxtext_utils.calculate_prefill_tflops_per_device(
+        num_model_parameters=500_000, prefill_length=64, config=cfg, log=False
+    )
+    self.assertAlmostEqual(total, lw + attn, places=10)
+
+  def test_scales_with_prefill_length(self):
+    cfg = self._make_cfg()
+    _, _, attn_short = maxtext_utils.calculate_prefill_tflops_per_device(
+        num_model_parameters=1_000_000, prefill_length=64, config=cfg, log=False
+    )
+    _, _, attn_long = maxtext_utils.calculate_prefill_tflops_per_device(
+        num_model_parameters=1_000_000, prefill_length=128, config=cfg, log=False
+    )
+    # Attention scales quadratically with prefill length
+    self.assertGreater(attn_long, attn_short * 3)
+
+
+class TestSetupTrainingState(unittest.TestCase):
+  """Tests for setup_training_state (thin wrapper over setup_initial_state)."""
+
+  def setUp(self):
+    self.config = pyconfig.initialize([None, get_test_config_path()], enable_checkpointing=False)
     devices_array = maxtext_utils.create_device_mesh(self.config)
     self.mesh = Mesh(devices_array, self.config.mesh_axes)
-    quant = quantizations.configure_quantization(self.config)
-    self.model = Transformer(self.config, mesh=self.mesh, quant=quant, model_mode=MODEL_MODE_TRAIN)
-    self.rng = jax.random.PRNGKey(0)
-    self.tx = optax.adam(learning_rate=0.001)
+    self._create_model_partial, self.model = model_creation_utils.create_nnx_abstract_model(self.config, self.mesh)
 
-  def test_get_abstract_state(self):
-    """Tests that get_abstract_state returns abstract arrays."""
-    # get_abstract_state returns a tuple, the first element is the abstract state.
-    abstract_state, _, _ = maxtext_utils.get_abstract_state(self.model, self.tx, self.config, self.rng, self.mesh, None)
+  def test_setup_training_state_returns_train_state(self):
+    tx = optax.adam(learning_rate=0.001)
 
-    # Check that params are abstract
-    param_leaves = jax.tree_util.tree_leaves(abstract_state.params)
-    self.assertTrue(all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in param_leaves))
+    def create_train_state_fn():
+      nnx_model = self._create_model_partial()
+      optimizer = nnx.Optimizer(nnx_model, tx, wrt=nnx.Param)
+      return train_state_nnx.TrainStateNNX(nnx_model, optimizer)
 
-    # Check that opt_state is abstract
-    opt_state_leaves = jax.tree_util.tree_leaves(abstract_state.opt_state)
-    self.assertTrue(all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in opt_state_leaves))
+    init_state_fn = create_train_state_fn
+    state, _, _, _, was_restored = maxtext_utils.setup_training_state(None, self.config, self.mesh, None, init_state_fn)
+    self.assertFalse(was_restored)
+    self.assertIsNotNone(state.optimizer)
+
+
+class TestSaveQuantizedCheckpoint(unittest.TestCase):
+  """Tests for save_quantized_checkpoint_if_configured."""
+
+  def test_raises_when_no_quantization(self):
+    cfg = MagicMock()
+    cfg.quantization = ""
+    with self.assertRaises(AssertionError):
+      maxtext_utils.save_quantized_checkpoint_if_configured(cfg, params={})
+
+  @unittest.mock.patch("maxtext.utils.maxtext_utils.checkpointing")
+  def test_skips_save_when_path_empty(self, mock_ckpt):
+    cfg = MagicMock()
+    cfg.quantization = "int8"
+    cfg.save_quantized_params_path = ""
+    maxtext_utils.save_quantized_checkpoint_if_configured(cfg, params={})
+    mock_ckpt.save_params_to_path.assert_not_called()
+
+  @unittest.mock.patch("maxtext.utils.maxtext_utils.checkpointing")
+  def test_calls_save_when_path_set(self, mock_ckpt):
+    cfg = MagicMock()
+    cfg.quantization = "int8"
+    cfg.save_quantized_params_path = "/tmp/quantized"
+    cfg.checkpoint_storage_use_ocdbt = True
+    cfg.checkpoint_storage_use_zarr3 = True
+    maxtext_utils.save_quantized_checkpoint_if_configured(cfg, params={"w": jnp.ones((2,))})
+    mock_ckpt.save_params_to_path.assert_called_once()
+
+
+class TestAddConfigToSummaryWriter(unittest.TestCase):
+  """Tests for add_config_to_summary_writer."""
+
+  def test_calls_add_text_for_each_key(self):
+    cfg = MagicMock()
+    cfg.get_keys.return_value = {"learning_rate": 0.001, "steps": 100}
+    mock_writer = MagicMock()
+
+    with unittest.mock.patch("maxtext.utils.max_utils.add_text_to_summary_writer") as mock_add:
+      maxtext_utils.add_config_to_summary_writer(cfg, mock_writer)
+      # Should have been called once per config key (process_index==0 in tests)
+      if jax.process_index() == 0:
+        self.assertEqual(mock_add.call_count, 2)
+
+
+class TestMaybeDumpJaxpr(unittest.TestCase):
+  """Tests for maybe_dump_jaxpr."""
+
+  def test_early_return_when_disabled(self):
+    cfg = MagicMock()
+    cfg.dump_jaxpr = False
+    # Should return immediately without calling any JAX tracing (no exception raised)
+    maxtext_utils.maybe_dump_jaxpr(cfg, p_train_step=None, train_step_inputs=None)
+
+  @pytest.mark.tpu_only
+  def test_traces_with_abstract_inputs_and_unwrapped_function(self):
+    cfg = MagicMock()
+    cfg.dump_jaxpr = True
+    cfg.dump_jaxpr_local_dir = "/tmp/nonexistent_jaxpr_test_dir"
+    cfg.dump_jaxpr_gcs_dir = ""
+
+    @jax.jit
+    def dummy_func(x):
+      return x * 2
+
+    with (
+        unittest.mock.patch("builtins.open", unittest.mock.mock_open()),
+        unittest.mock.patch("os.makedirs"),
+        unittest.mock.patch("jax.make_jaxpr") as mock_make_jaxpr,
+    ):
+
+      mock_tracer = MagicMock()
+      mock_make_jaxpr.return_value = mock_tracer
+      mock_tracer.return_value = MagicMock()
+
+      input_array = jnp.ones((4, 5), dtype=jnp.float32)
+      maxtext_utils.maybe_dump_jaxpr(cfg, dummy_func, (input_array,))
+
+      # 1. Verify make_jaxpr was called with the underlying unwrapped function
+      mock_make_jaxpr.assert_called_once_with(dummy_func.__wrapped__)
+
+      # 2. Verify the input arguments passed to the tracer were mapped to abstract ShapeDtypeStruct
+      called_args, _ = mock_tracer.call_args
+      self.assertEqual(len(called_args), 1)
+      self.assertIsInstance(called_args[0], jax.ShapeDtypeStruct)
+      self.assertEqual(called_args[0].shape, (4, 5))
+      self.assertEqual(called_args[0].dtype, jnp.float32)
+
+
+class TestPrintShardingsParams(unittest.TestCase):
+  """Tests for print_shardings_params — normalization branches."""
+
+  def setUp(self):
+    """Build a minimal mesh and sharded param for testing."""
+    self.mesh = Mesh(np.array(jax.devices()), ("data",))
+
+  def _make_simple_params(self):
+    """Return (params, param_sharding, logical) without a .params attribute."""
+    params = {"w": jnp.ones((4,))}
+    param_sharding = {"w": NamedSharding(self.mesh, PartitionSpec(None))}
+    logical = {"w": PartitionSpec(None)}
+    return params, param_sharding, logical
+
+  def test_runs_with_dict_inputs_and_logical(self):
+    """Linen-style dict inputs get wrapped in {"params": ...} before traversal."""
+    params, param_sharding, logical = self._make_simple_params()
+    maxtext_utils.print_shardings_params(params, param_sharding, mesh=self.mesh, logical_annotations=logical)
+
+  def test_runs_without_logical_annotations(self):
+    """logical_annotations=None should be handled (no logical column)."""
+    params, param_sharding, _ = self._make_simple_params()
+    maxtext_utils.print_shardings_params(params, param_sharding, mesh=self.mesh, logical_annotations=None)
+
+  def test_runs_with_nnx_state_input(self):
+    """nnx.State input bypasses the {"params": ...} wrapping path."""
+    params = nnx.State({"w": nnx.Param(jnp.ones((4,)))})
+    param_sharding = nnx.State({"w": nnx.Param(NamedSharding(self.mesh, PartitionSpec(None)))})
+    maxtext_utils.print_shardings_params(params, param_sharding, mesh=self.mesh, logical_annotations=None)
+
+
+class TestNNXAbstractState(unittest.TestCase):
+  """Test the get_abstract_state_nnx func."""
+
+  @dataclass
+  class MockConfig:
+    init_weights_seed: int = 42
+    shard_optimizer_over_data: bool = False
+    optimizer_memory_host_offload: bool = False
+    parameter_memory_host_offload: bool = False
+    param_scan_axis: int = 0
+    logical_axis_rules: list = field(default_factory=lambda: [["data", ["data"]], ["model", ["model"]]])
+
+  class MockTrainState(nnx.Module):
+    """Simulates a TrainState with params and optimizer state."""
+
+    def __init__(self, rngs: nnx.Rngs):
+      # Model parameters
+      device_num = len(jax.local_devices())
+      self.params = nnx.Linear(
+          2, 4, kernel_init=nnx.with_partitioning(nnx.initializers.ones, sharding=("model",)), rngs=rngs
+      )
+      # Simulated optimizer state
+      self.optimizer = nnx.Variable(jnp.zeros((device_num,)), sharding=("model",))
+
+  def setUp(self):
+    # Create a real 1D mesh on local devices
+    devices = jax.local_devices()
+    self.mesh = Mesh(mesh_utils.create_device_mesh((len(devices), 1)), axis_names=("model", "data"))
+    self.config = self.MockConfig()
+    # Stub remove_size_one_mesh_axis so that resolved specs are returned unreduced,
+    # allowing verification of naming resolution without being stripped by size-one mesh dims.
+    self._old_remove_size_one_mesh_axis = sharding.remove_size_one_mesh_axis
+    sharding.remove_size_one_mesh_axis = lambda spec, mesh: spec
+
+  def tearDown(self):
+    sharding.remove_size_one_mesh_axis = self._old_remove_size_one_mesh_axis
+
+  def nnx_init_trainstate_wrapper(self):
+    """Wrapper to initialize the mock NNX model."""
+    rngs = maxtext_utils_nnx.create_nnx_rngs(self.config)
+    return self.MockTrainState(rngs)
+
+  def test_basic_abstraction(self):
+    """Verifies the basic return structure and partition spec extraction."""
+    abstract_state, annotations, shardings = maxtext_utils.get_abstract_state_nnx(
+        self.config, self.mesh, self.nnx_init_trainstate_wrapper
+    )
+
+    # Check return types
+    self.assertIsInstance(abstract_state, nnx.State)
+    self.assertIsInstance(annotations, nnx.State)
+    self.assertIsInstance(shardings, nnx.State)
+
+    # Verify PartitionSpec was extracted correctly from the mock model's annotations
+    # Path: params -> kernel -> spec
+    self.assertEqual(
+        annotations.params.kernel.get_value(),
+        PartitionSpec(
+            "model",
+        ),
+    )
+
+  def test_shard_optimizer_over_data(self):
+    """Verifies that 'data' is added to optimizer sharding using the real utility."""
+    self.config.shard_optimizer_over_data = True
+
+    _, annotations, _ = maxtext_utils.get_abstract_state_nnx(self.config, self.mesh, self.nnx_init_trainstate_wrapper)
+
+    # Original Pspec for optimizer was PartitionSpec(None).
+    # add_data_to_sharding should find that dim 0 is compatible with mesh 'data'
+    # and update it to PartitionSpec(('data',)).
+    opt_spec = annotations.optimizer.get_value()
+
+    # Verify 'data' is now in the spec
+    self.assertEqual(opt_spec, PartitionSpec(("data", "model")))
+
+  def test_optimizer_host_offload(self):
+    """Verifies that optimizer memory is moved to host when configured."""
+    self.config.optimizer_memory_host_offload = True
+
+    _, _, shardings = maxtext_utils.get_abstract_state_nnx(self.config, self.mesh, self.nnx_init_trainstate_wrapper)
+
+    # Optimizer state should be pinned to host
+    opt_sharding = shardings.optimizer.get_value()
+    self.assertEqual(opt_sharding.memory_kind, "pinned_host")
+
+    # Params should still be on default memory (usually device)
+    param_sharding = shardings.params.kernel.get_value()
+    self.assertNotEqual(param_sharding.memory_kind, "pinned_host")
+
+  def test_parameter_host_offload(self):
+    """Verifies that parameter memory is moved to host when configured."""
+    self.config.parameter_memory_host_offload = True
+    self.config.param_scan_axis = 0
+
+    _, _, shardings = maxtext_utils.get_abstract_state_nnx(self.config, self.mesh, self.nnx_init_trainstate_wrapper)
+
+    # Parameters should be pinned to host
+    param_sharding = shardings.params.kernel.get_value()
+    self.assertEqual(param_sharding.memory_kind, "pinned_host")
+
+  def test_invalid_init_fn(self):
+    """Ensures function raises error if no init function is provided."""
+    with self.assertRaises(AssertionError):
+      maxtext_utils.get_abstract_state_nnx(self.config, self.mesh, None)
+
+
+class TestKVCacheScanHelpers(unittest.TestCase):
+  """Tests for KV cache scan helper functions."""
+
+  def test_prepare_kv_caches_for_scan_valid(self):
+    kv_caches = [jnp.array([1.0]), jnp.array([2.0]), jnp.array([3.0]), jnp.array([4.0])]
+    # scan_length = 2, block_len = 2
+    grouped = maxtext_utils.prepare_kv_caches_for_scan(kv_caches, scan_length=2, block_len=2, stack=False)
+    self.assertEqual(len(grouped), 2)
+    self.assertEqual(grouped[0], (kv_caches[0], kv_caches[1]))
+    self.assertEqual(grouped[1], (kv_caches[2], kv_caches[3]))
+
+  def test_prepare_kv_caches_for_scan_invalid_type(self):
+    kv_caches_tuple = (jnp.array([1.0]), jnp.array([2.0]))
+    with self.assertRaises(TypeError):
+      maxtext_utils.prepare_kv_caches_for_scan(kv_caches_tuple, scan_length=1, block_len=2)
+
+    kv_caches_array = jnp.array([1.0, 2.0])
+    with self.assertRaises(TypeError):
+      maxtext_utils.prepare_kv_caches_for_scan(kv_caches_array, scan_length=1, block_len=2)
+
+  def test_update_kv_caches_after_scan_valid(self):
+    kv_caches = [jnp.array([1.0]), jnp.array([2.0]), jnp.array([3.0]), jnp.array([4.0])]
+    returned_kv_cache = [(jnp.array([10.0]), jnp.array([20.0])), (jnp.array([30.0]), jnp.array([40.0]))]
+
+    maxtext_utils.update_kv_caches_after_scan(kv_caches, returned_kv_cache, scan_length=2, block_len=2, stacked=False)
+
+    self.assertTrue(jnp.array_equal(kv_caches[0], jnp.array([10.0])))
+    self.assertTrue(jnp.array_equal(kv_caches[1], jnp.array([20.0])))
+    self.assertTrue(jnp.array_equal(kv_caches[2], jnp.array([30.0])))
+    self.assertTrue(jnp.array_equal(kv_caches[3], jnp.array([40.0])))
+
+  def test_update_kv_caches_after_scan_invalid_type(self):
+    kv_caches_tuple = (jnp.array([1.0]), jnp.array([2.0]))
+    returned_kv_cache = [(jnp.array([10.0]), jnp.array([20.0]))]
+    with self.assertRaises(TypeError):
+      maxtext_utils.update_kv_caches_after_scan(kv_caches_tuple, returned_kv_cache, scan_length=1, block_len=2)
+
+
+class TestGetSaveAndOffloadNames(unittest.TestCase):
+  """Tests for maxtext_utils.get_save_and_offload_names (pure config logic, no device needed)."""
+
+  @staticmethod
+  def _cfg(remat_policy, tensors_on_device=None, tensors_to_offload=None):
+    return SimpleNamespace(
+        remat_policy=remat_policy,
+        tensors_on_device=tensors_on_device,
+        tensors_to_offload=tensors_to_offload,
+    )
+
+  def test_named_preset_matches_equivalent_custom(self):
+    """qkv_proj_offloaded's offload names resolve identically to an equivalent custom config.
+
+    A real custom config keeps decoder_layer_input on device by default, so its full tuple
+    differs from the preset by that (benign, boundary) save entry -- assert only the offload halves.
+    """
+    _, preset_offload = maxtext_utils.get_save_and_offload_names(self._cfg("qkv_proj_offloaded"))
+    _, custom_offload = maxtext_utils.get_save_and_offload_names(
+        self._cfg(
+            "custom",
+            tensors_on_device=["decoder_layer_input"],
+            tensors_to_offload=["query_proj", "value_proj", "key_proj", "kv_proj"],
+        )
+    )
+    self.assertEqual(custom_offload, preset_offload)
+
+  def test_kv_proj_retained_in_offload_presets(self):
+    """Regression guard: kv_proj must stay in the offload presets (it is a real checkpoint name)."""
+    _, qkv_offload = maxtext_utils.get_save_and_offload_names(self._cfg("qkv_proj_offloaded"))
+    _, minimal_offload = maxtext_utils.get_save_and_offload_names(self._cfg("minimal_offloaded"))
+    self.assertIn("kv_proj", qkv_offload)
+    self.assertIn("kv_proj", minimal_offload)
+
+  def test_custom_reads_config_lists(self):
+    save, offload = maxtext_utils.get_save_and_offload_names(
+        self._cfg("custom", tensors_on_device=["context"], tensors_to_offload=["out_proj"])
+    )
+    self.assertEqual(save, ["context"])
+    self.assertEqual(offload, ["out_proj"])
+
+  def test_custom_handles_none_lists(self):
+    self.assertEqual(maxtext_utils.get_save_and_offload_names(self._cfg("custom")), ([], []))
+
+  def test_non_offloading_policies_return_empty(self):
+    """Policies that don't use the save/offload split contribute no names to it."""
+    for policy in ("full", "minimal", "save_out_proj", "save_qkv_proj", "none"):
+      self.assertEqual(maxtext_utils.get_save_and_offload_names(self._cfg(policy)), ([], []))
 
 
 if __name__ == "__main__":

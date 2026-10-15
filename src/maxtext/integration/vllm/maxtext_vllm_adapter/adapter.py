@@ -15,17 +15,30 @@
 """vLLM adapter for MaxText models."""
 
 import os
-import jax
-
 from flax import nnx
-import flax.linen as nn
+from flax.core.spmd import logical_axis_rules
+import jax
 from jax import numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
-from maxtext.configs import pyconfig
-from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR
+import numpy as np
 from maxtext.common.common_types import MODEL_MODE_AUTOREGRESSIVE
+from maxtext.configs import pyconfig
+from maxtext.integration.vllm.convert_utils import DEFAULT_TPU_NUM_LANES, compute_padded_moe_mlp_dim
+from maxtext.integration.vllm.hybrid_cache_utils import (
+    build_qwen_gdn_cache_layout,
+    call_with_supported_kwargs,
+    gather_layer_kv_caches,
+    normalize_vllm_input_positions,
+    resolve_layer_kv_cache_indices,
+    scatter_layer_kv_caches,
+)
+from maxtext.utils import lora_utils
 from maxtext.utils import max_logging
 from maxtext.utils import model_creation_utils
+from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR
+from tpu_inference.models.jax.utils.multi_modal_utils import merge_multimodal_embeddings
+from .multimodal import get_multimodal_handler
 
 
 try:
@@ -37,6 +50,26 @@ except ImportError:
 
 
 from vllm.config import VllmConfig
+
+# Threshold to determine if the ratio of attention to mamba layers is highly imbalanced.
+# If max_count / min_count >= this threshold, we group KV cache allocations by the
+# smaller count to prevent excessive memory padding for the minority layer type.
+_HYBRID_LAYER_IMBALANCE_THRESHOLD = 1.5
+
+
+def next_power_of_two(x: int) -> int:
+  """Finds the smallest power of 2 >= x using bit manipulation.
+
+  Args:
+    x: The input number (should be an integer).
+
+  Returns:
+    The smallest integer power of 2 that is >= x.
+  """
+  assert x > 0
+  if x == 1:
+    return 1
+  return 1 << (x - 1).bit_length()
 
 
 def generate_maxtext_config(vllm_config: VllmConfig) -> pyconfig.HyperParameters:
@@ -69,9 +102,101 @@ def generate_maxtext_config(vllm_config: VllmConfig) -> pyconfig.HyperParameters
       )
       overrides["load_parameters_path"] = None
 
+  if overrides.get("attention") == "vllm_batched_rpa" or overrides.get("use_batched_rpa", False):
+    os.environ["USE_BATCHED_RPA_KERNEL"] = "1"
+
   # Add base config path to positional args
   base_config_path = os.path.join(MAXTEXT_CONFIGS_DIR, "inference", "vllm.yml")
   argv_list = ["", str(base_config_path)]
+
+  # Gather sharding information from vLLM config to determine transformations to apply
+  sharding_config = vllm_config.sharding_config
+  tp = sharding_config.tp_size
+  ep = sharding_config.expert_size
+  attn_dp = sharding_config.attn_dp_size
+
+  # Calculate the maximum TP size across attention and MLP dimensions
+  kv_tp_size = tp * ep
+  moe_mlp_tp_size = tp * attn_dp
+
+  # Gather information on the hidden size of MoE models to determine if padding is needed
+  # to meet MLP MoE requirements for tpu-inference GMM_v2 kernel.
+  hf_config = (
+      vllm_config.model_config.hf_config.text_config
+      if hasattr(vllm_config.model_config.hf_config, "text_config")
+      else vllm_config.model_config.hf_config
+  )
+  hidden_size = getattr(hf_config, "moe_intermediate_size", None)
+  try:
+    num_lanes = pltpu.get_tpu_info().num_lanes
+  except Exception:  # pylint: disable=broad-exception-caught
+    num_lanes = DEFAULT_TPU_NUM_LANES
+  num_kv_heads = hf_config.num_key_value_heads
+
+  # Number of KV heads in global attention layers (None if the field is absent or unset).
+  num_global_kv_heads = getattr(hf_config, "num_global_key_value_heads", None)
+  use_global_kv_heads = num_global_kv_heads is not None
+
+  max_logging.log(
+      f"vLLM sharding config: hidden_size={hidden_size}, kv_heads={num_kv_heads}, global_kv_heads={num_global_kv_heads}, "
+      f"num_lanes={num_lanes}, tp={tp}, attn_dp={attn_dp}, ep={ep}, moe_mlp_tp_size={moe_mlp_tp_size}"
+  )
+
+  # The native tpu-inference model paths derive use_ep from
+  # parallel_config.enable_expert_parallel, but the mesh built by
+  # ShardingConfigManager.from_vllm_config takes expert parallelism only from
+  # additional_config's sharding_strategy. MaxText derives use_ep from the mesh, so
+  # --enable-expert-parallel alone leaves the experts unsharded here while the native
+  # implementation of the same model runs expert-parallel. Warn rather than fail, since
+  # the run is still correct, only sharded differently than the flag suggests.
+  expert_shard_degree = ep * sharding_config.attn_dp_expert_size
+  if vllm_config.parallel_config.enable_expert_parallel and expert_shard_degree == 1:
+    max_logging.warning(
+        "--enable-expert-parallel was requested but the mesh has no expert shards "
+        f"(expert={ep}, attn_dp_expert={sharding_config.attn_dp_expert_size}), so MaxText will shard the MoE over "
+        "the MLP dimension instead of the expert dimension. The vLLM flag does not reach the JAX mesh; set "
+        'expert_parallelism in the vLLM additional_config sharding_strategy, e.g. \'{"sharding": '
+        '{"sharding_strategy": {"expert_parallelism": <num_devices>}}}\', to actually shard experts.'
+    )
+
+  # Replicate the number of KV heads if its less than the total degree of model parallelism
+  if kv_tp_size % num_kv_heads == 0 and num_kv_heads < kv_tp_size:
+    max_logging.log(
+        f"Padding num_kv_heads from {num_kv_heads} to {kv_tp_size} to match the degree of tensor parallelism."
+    )
+    overrides["base_num_kv_heads"] = kv_tp_size
+
+  # Replicate the number of global KV heads if its less than the total degree of model parallelism
+  if use_global_kv_heads and kv_tp_size % num_global_kv_heads == 0 and num_global_kv_heads < kv_tp_size:
+    max_logging.log(
+        f"Padding num_global_kv_heads from {num_global_kv_heads} "
+        f"to {kv_tp_size} to match the degree of tensor parallelism."
+    )
+    overrides["global_num_kv_heads"] = kv_tp_size
+
+  # Pad the hidden size of MoE models if the MLP dimension is less than expected by the GMM_v2 kernel in tpu-inference.
+  # The GMM_v2 kernel requires the MLP dimension per expert to be at least 2x the number of TPU lanes
+  # to ensure efficient execution. See the validate_inputs() method in the following file for more details:
+  # https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/kernels/megablox/gmm_v2.py
+  padded_hidden_size = compute_padded_moe_mlp_dim(hidden_size, moe_mlp_tp_size, num_lanes)
+  if padded_hidden_size is not None and padded_hidden_size != hidden_size:
+
+    # This inflates every expert weight, so it is a real memory/FLOP cost rather than a
+    # cosmetic reshape: at moe_mlp_tp_size=4 a 512-wide MoE is padded to 1024 (2x the MoE
+    # weights), and at moe_mlp_tp_size=8 to 2048 (4x). Log it at WARNING so it is visible
+    # under vLLM's logging configuration, which does not surface absl INFO records.
+    max_logging.warning(
+        f"Padding moe_intermediate_size from {hidden_size} to {padded_hidden_size} to match MLP MoE requirements "
+        f"(moe_mlp_tp_size={moe_mlp_tp_size}, 2*num_lanes={2 * num_lanes}). This multiplies the MoE weights and "
+        f"MoE FLOPs by {padded_hidden_size / hidden_size:g}x. Consider sharding the MoE over the expert axis "
+        f"instead, by setting expert_parallelism in the vLLM additional_config sharding_strategy."
+    )
+    overrides["padded_base_moe_mlp_dim"] = padded_hidden_size
+
+  # Align mode pins the mamba block size to the attention one.
+  cache_config = vllm_config.cache_config
+  if getattr(cache_config, "mamba_cache_mode", "none") == "align":
+    overrides["gdn_mamba_block_size"] = cache_config.block_size
 
   maxtext_config = pyconfig.initialize(argv_list, **overrides)
   return maxtext_config
@@ -86,6 +211,12 @@ class MaxTextForCausalLM(nnx.Module):
   of the decoding step.
   """
 
+  # Signal to tpu-inference model_loader that this class manages its own
+  # JIT-sharded initialization (via create_nnx_model with out_shardings).
+  # When True, model_loader skips wrapping __init__ in an outer bare @jax.jit,
+  _self_manages_sharding: bool = True
+  supports_multimodal: bool = False
+
   def __init__(self, vllm_config: VllmConfig, rng_key: jax.Array, mesh: Mesh):
     """Initializes the MaxTextForCausalLM model.
 
@@ -97,6 +228,7 @@ class MaxTextForCausalLM(nnx.Module):
     self.vllm_config = vllm_config
     self.cfg = vllm_config.model_config
     self.maxtext_config = generate_maxtext_config(vllm_config)
+    self.multimodal_handler = get_multimodal_handler(self.maxtext_config.model_name)
 
     # Model configuration
     self.mesh = mesh
@@ -106,6 +238,9 @@ class MaxTextForCausalLM(nnx.Module):
     # Model creation
     self.model: nnx.Module | None = None
 
+    # Indicates that the model handles its own sharding logic
+    self._self_manages_sharding = True
+
     # Handle dummy weight loading during initialization
     if vllm_config.load_config.load_format == "dummy":
       self.load_weights(rng_key)
@@ -113,21 +248,43 @@ class MaxTextForCausalLM(nnx.Module):
     elif self.maxtext_config.load_parameters_path is None:
       max_logging.log("Warning: No load_parameters_path provided. The model will be initialized with random weights.")
 
+  def modules(self):
+    """Dummy method to satisfy vLLM's internal cleanup logic."""
+    return []
+
+  # pylint: disable=keyword-arg-before-vararg
   def __call__(
       self,
       kv_caches: list[jax.Array],
       input_ids: jax.Array,
       attention_metadata: AttentionMetadata,
+      inputs_embeds: jax.Array | None = None,
+      _input_positions=None,
+      _layer_name_to_kvcache_index=None,
       *args,
       **kwargs,
-  ) -> tuple[list[jax.Array], jax.Array, list[jax.Array]]:
+  ) -> tuple[list[jax.Array], jax.Array, list[jax.Array], list[jax.Array] | None]:
     """Performs a forward pass through the causal language model.
 
+    The positional layout mirrors the tpu-inference runner's model call
+    (``kv_caches, input_ids, attention_metadata, inputs_embeds, input_positions,
+    layer_name_to_kvcache_index, lora_metadata, ...``), the same contract the
+    native JAX models such as Gemma4 consume.
+
     Args:
-      kv_caches: A list of JAX arrays representing the KV caches.
+      kv_caches: The physical KV caches allocated by tpu-inference, in the
+        runner's slot order. This is not necessarily layer order (see
+        ``_layer_name_to_kvcache_index``).
       input_ids: A JAX array of input token IDs.
       attention_metadata: Attention metadata for the decoding process.
-      *args: Variable length argument list.
+      inputs_embeds: Optional precomputed input embeddings.
+      _input_positions: Unused; positions are read from ``attention_metadata``.
+      _layer_name_to_kvcache_index: ``layer.{i} -> index into kv_caches``, as a
+        static tuple of pairs (or dict). MaxText decoders index caches by layer
+        (``kv_caches[lyr]``), so the list is re-ordered by this map before the
+        forward pass and scattered back afterwards. ``None`` keeps the
+        positional interpretation.
+      *args: Remaining positional runner arguments (unused).
       **kwargs: Arbitrary keyword arguments.
 
     Returns:
@@ -135,6 +292,7 @@ class MaxTextForCausalLM(nnx.Module):
         - updated_kv_caches: A list of updated KV caches.
         - hidden: The hidden states.
         - aux_hidden_states: A list of auxiliary hidden states.
+        - expert_indices: A list of expert indices or None.
 
     Raises:
       ValueError: If the model is not an instance of `nnx.Module`.
@@ -142,25 +300,84 @@ class MaxTextForCausalLM(nnx.Module):
     if not isinstance(self.model, nnx.Module):
       raise ValueError("Model must be an instance of type nnx.Module.")
 
-    # Ensure inputs are at least 2D with a batch dimension
-    input_ids = jnp.atleast_2d(input_ids)
-    input_positions = jnp.atleast_2d(attention_metadata.input_positions)
+    # For hybrid models, attention_metadata can arrive as a GroupedAttentionMetadata
+    # (a mapping from layer names like "layer.0" to per-group AttentionMetadata).
+    # Keep the mapping so each decoder layer (GDN or full attention) receives its
+    # own group's block tables and state indices.
 
-    with self.mesh, nn.logical_axis_rules(self.maxtext_config.logical_axis_rules):
+    # Present the decoder a layer-ordered view of the physical cache list. With
+    # the vLLM hybrid layout all Mamba/GDN caches precede the attention caches,
+    # so kv_caches[lyr] would otherwise hand an attention layer a 3D conv state.
+    if kv_caches is not None:
+      physical_indices = resolve_layer_kv_cache_indices(_layer_name_to_kvcache_index, len(kv_caches))
+      layer_kv_caches = gather_layer_kv_caches(kv_caches, physical_indices)
+    else:
+      physical_indices = None
+      layer_kv_caches = None
+
+    # MaxText decode treats vLLM's flattened tokens as a batch with seq_len=1.
+    # MRoPE positions arrive channel-first and must also move their 3 channels
+    # to MaxText's trailing dimension.
+    if inputs_embeds is not None:
+      decoder_input_embeddings = inputs_embeds[:, None, :].astype(self.maxtext_config.dtype)
+      # tpu-inference passes input_ids=None with precomputed embeddings. The
+      # decoder still requires a shape-compatible token array, but does not use
+      # its values when decoder_input_embeddings is present.
+      input_ids = jnp.zeros((inputs_embeds.shape[0], 1), dtype=jnp.int32)
+    else:
+      decoder_input_embeddings = None
+      input_ids = jnp.expand_dims(input_ids, axis=1)
+
+    if isinstance(attention_metadata, dict):
+      first_meta = next(iter(attention_metadata.values()))
+      positions = getattr(first_meta, "input_positions", None)
+    else:
+      positions = getattr(attention_metadata, "input_positions", None)
+    if positions is None:
+      positions = _input_positions
+    input_positions = normalize_vllm_input_positions(positions)
+
+    # Filter kwargs to only those accepted by self.model.
+    model_kwargs = dict(kwargs)
+    for extra_key in (
+        "inputs_embeds",
+        "input_positions",
+        "layer_name_to_kvcache_index",
+        "_layer_name_to_kv_cache",
+        "shared_attention_metadata",
+        "intermediate_tensors",
+        "lora_metadata",
+        "is_first_rank",
+        "is_last_rank",
+    ):
+      model_kwargs.pop(extra_key, None)
+
+    with self.mesh, logical_axis_rules(self.maxtext_config.logical_axis_rules):
       aux_hidden_states = []
-      hidden, kv_caches = self.model(
+      expert_indices = None
+      res = self.model(
           decoder_input_tokens=input_ids,
+          decoder_input_embeddings=decoder_input_embeddings,
           decoder_positions=input_positions,
-          kv_caches=kv_caches,
+          kv_caches=layer_kv_caches,
           attention_metadata=attention_metadata,
           model_mode=self.model_mode,
-          **kwargs,
+          **model_kwargs,
       )
+
+      if isinstance(res, tuple) and len(res) == 3:
+        hidden, layer_kv_caches, expert_indices = res
+      else:
+        hidden, layer_kv_caches = res
+
+      # Hand the updated caches back in the runner's physical order.
+      if kv_caches is not None:
+        kv_caches = scatter_layer_kv_caches(kv_caches, layer_kv_caches, physical_indices)
 
       # To be compatible with vLLM, we reshape to (batch * seq, dim).
       hidden = hidden.reshape((-1, hidden.shape[-1]))
 
-    return kv_caches, hidden, aux_hidden_states
+    return kv_caches, hidden, aux_hidden_states, expert_indices
 
   def forward(self, *args, **kwargs):
     """Alias for __call__ for compatibility.
@@ -183,14 +400,29 @@ class MaxTextForCausalLM(nnx.Module):
     if not isinstance(self.model, nnx.Module):
       raise ValueError("Model is not initialized.")
 
-    with self.mesh, nn.logical_axis_rules(self.maxtext_config.logical_axis_rules):
+    with self.mesh, logical_axis_rules(self.maxtext_config.logical_axis_rules):
       return self.model.token_embedder.embedding
 
-  def embed_input_ids(self, input_ids: jax.Array) -> jax.Array:
+  def embed_multimodal(self, **kwargs) -> list[jax.Array]:
+    """Computes embeddings using the configured model family's handler."""
+    if not isinstance(self.model, nnx.Module):
+      raise ValueError("Model is not initialized.")
+    if self.multimodal_handler is None:
+      raise ValueError(f"No vLLM multimodal handler is registered for {self.maxtext_config.model_name!r}.")
+    return self.multimodal_handler.embed_multimodal(self.model, self.maxtext_config, self.mesh, **kwargs)
+
+  def embed_input_ids(
+      self,
+      input_ids: jax.Array,
+      multimodal_embeddings: jax.Array | None = None,
+      is_multimodal: jax.Array | None = None,
+  ) -> jax.Array:
     """Embeds the input token IDs using the model's token embedder.
 
     Args:
       input_ids: A JAX array of input token IDs.
+      multimodal_embeddings: Optional modality embeddings to merge.
+      is_multimodal: Optional mask identifying multimodal inputs.
 
     Returns:
       A JAX array of embedded input tokens.
@@ -198,8 +430,21 @@ class MaxTextForCausalLM(nnx.Module):
     if not isinstance(self.model, nnx.Module):
       raise ValueError("Model is not initialized.")
 
-    with self.mesh, nn.logical_axis_rules(self.maxtext_config.logical_axis_rules):
-      return self.model.token_embedder(input_ids)
+    with self.mesh, logical_axis_rules(self.maxtext_config.logical_axis_rules):
+      inputs_embeds = self.model.token_embedder(input_ids)
+
+      if multimodal_embeddings is not None:
+        if self.multimodal_handler is None:
+          raise ValueError(f"No vLLM multimodal handler is registered for {self.maxtext_config.model_name!r}.")
+        placeholder_ids = self.multimodal_handler.placeholder_token_ids(self.cfg.hf_config)
+
+        inputs_embeds = merge_multimodal_embeddings(
+            input_ids,
+            inputs_embeds,
+            multimodal_embeddings,
+            placeholder_ids,
+        )
+      return inputs_embeds
 
   def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
     """Computes the logits from the hidden states using the underlying decoder model.
@@ -213,9 +458,9 @@ class MaxTextForCausalLM(nnx.Module):
     if not isinstance(self.model, nnx.Module):
       raise ValueError("Model is not initialized.")
 
-    with self.mesh, nn.logical_axis_rules(self.maxtext_config.logical_axis_rules):
+    with self.mesh, logical_axis_rules(self.maxtext_config.logical_axis_rules):
       # Reshape to (num_tokens, 1, hidden_dim) for decoder output head
-      y = hidden_states[:, jnp.newaxis, :]
+      y = jnp.expand_dims(hidden_states, axis=1)
 
       # Compute logits using the MaxText decoder's output head
       logits = self.model.decoder.apply_output_head(self.model.token_embedder, y, True, self.model_mode)
@@ -232,8 +477,178 @@ class MaxTextForCausalLM(nnx.Module):
     if self.model is not None:
       return
 
-    with self.mesh, nn.logical_axis_rules(""):
-      model, _ = model_creation_utils.create_nnx_model(
+    with self.mesh, logical_axis_rules(self.maxtext_config.logical_axis_rules):
+      model = model_creation_utils.from_pretrained(
           self.maxtext_config, mesh=self.mesh, model_mode=self.model_mode, rng_key=rng_key
       )
+      if self.maxtext_config.lora.enable_lora:
+        model = lora_utils.apply_lora_to_model(model, self.mesh, self.maxtext_config)
+        if self.maxtext_config.lora.lora_restore_path:
+          lora_utils.restore_lora_from_path(model, self.maxtext_config)
       self.model = nnx.data(model)
+    patch_raiden_worker_h2d()
+
+  def get_mrope_input_positions(
+      self,
+      input_tokens: list[int],
+      mm_features: list = None,
+  ) -> tuple[np.ndarray, int]:
+    """Get dummy mrope input positions and delta value for text-only MaxText."""
+    seq_len = len(input_tokens)
+    # Use NumPy rather than JAX (jnp) to avoid triggering XLA compilations on every distinct seq_len.
+    pos_range = np.arange(seq_len, dtype=np.int32)
+    # M-RoPE expects 3D position vectors (3, seq_len) and position_delta (int)
+    positions = np.stack([pos_range, pos_range, pos_range], axis=0)
+    return positions, 0
+
+
+# Monkey-patch KVCacheManager.get_kv_cache_spec to support GDN/Mamba layers in Pure JAX path.
+def patch_kv_cache_manager():
+  """Monkey-patches KVCacheManager to support hybrid Attention + GDN/Mamba models."""
+  # pylint: disable=import-outside-toplevel,protected-access
+  try:
+    from tpu_inference.runner.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import MambaSpec
+    import torch
+  except ImportError as e:
+    # Gracefully handle missing imports in standard JAX environments (e.g. unit tests on CPU)
+    max_logging.log(f"Skipping KVCacheManager patch (tpu_inference or dependencies not installed): {e}")
+    return
+
+  try:
+    original_get_kv_cache_spec = KVCacheManager.get_kv_cache_spec
+  except AttributeError as e:
+    # Raise a clear error if packages exist but patch target is missing (indicating API change or mismatch)
+    raise RuntimeError(
+        "Failed to apply KVCacheManager patch: KVCacheManager.get_kv_cache_spec not found. "
+        "This usually indicates a vLLM / tpu-inference API change or version mismatch."
+    ) from e
+
+  def patched_get_kv_cache_spec(self):
+    runner = self.runner
+    if not hasattr(runner, "model"):
+      return original_get_kv_cache_spec(self)
+
+    model = runner.model
+    if not hasattr(model, "maxtext_config"):
+      return original_get_kv_cache_spec(self)
+
+    cfg = model.maxtext_config
+    decoder_block = getattr(cfg, "decoder_block", "")
+
+    decoder_block_str = ""
+    if isinstance(decoder_block, str):
+      decoder_block_str = decoder_block
+    elif hasattr(decoder_block, "value"):
+      decoder_block_str = decoder_block.value
+
+    if decoder_block_str in ("qwen3_next", "qwen3_5"):
+      mamba_cache_mode = getattr(self.runner.cache_config, "mamba_cache_mode", "none")
+      interval = cfg.inhomogeneous_layer_cycle_interval
+
+      # Qwen GDN keeps its short convolution history in BF16, but recurrence is
+      # accumulated and persisted in FP32. Declaring both caches as the model
+      # dtype silently quantizes the recurrent state after every generated token.
+      mamba_shapes, mamba_dtypes, unpadded_mamba_page_size = build_qwen_gdn_cache_layout(cfg, torch)
+
+      # Calculate attn_page_size_bytes
+      from tpu_inference.layers.common.sharding import ShardingAxisName
+      from tpu_inference import utils as common_utils
+
+      tp_axis_name = ShardingAxisName.ATTN_HEAD
+      model_cnt = common_utils.get_mesh_shape_product(self.runner.mesh, tp_axis_name)
+
+      model_config = self.runner.model_config
+      text_config = getattr(model_config, "hf_text_config", getattr(model_config, "hf_config", None))
+      base_num_kv_heads = model_config.get_total_num_kv_heads()
+      base_head_size = model_config.get_head_size()
+
+      num_kv_heads = getattr(text_config, "num_global_key_value_heads", None) or base_num_kv_heads
+      head_size = getattr(text_config, "global_head_dim", None) or base_head_size
+
+      num_kv_heads = common_utils.get_padded_num_heads(num_kv_heads, model_cnt)
+      head_size = common_utils.get_padded_head_dim(head_size)
+
+      from tpu_inference.runner.kv_cache import get_attention_page_size_bytes
+
+      block_size = self.runner.cache_config.block_size
+
+      attn_page_size_bytes = get_attention_page_size_bytes(
+          self.runner.mesh, block_size, num_kv_heads, head_size, self.runner.kv_cache_dtype, False
+      )
+
+      # Calculate groups
+      num_layers = cfg.base_num_decoder_layers
+      num_attn = num_layers // interval
+      num_mamba = num_layers - num_attn
+
+      # To allocate memory uniformly for a hybrid model's KV/recurrent cache page table,
+      # we group layers together. The uniform page size must support both attention and
+      # mamba layers.
+      # If the ratio of attention to mamba layers is relatively balanced (less than _HYBRID_LAYER_IMBALANCE_THRESHOLD),
+      # we use the larger count as the group size to minimize the total number of groups.
+      # If they are highly imbalanced (>= _HYBRID_LAYER_IMBALANCE_THRESHOLD), we group by the smaller count to prevent
+      # the page size from being inflated by excessive padding for the minority layer type.
+      min_count = min(num_attn, num_mamba)
+      max_count = max(num_attn, num_mamba)
+      if max_count < min_count * _HYBRID_LAYER_IMBALANCE_THRESHOLD:
+        group_size = max_count
+      else:
+        group_size = min_count
+      num_attn_groups = (num_attn + group_size - 1) // group_size
+      num_mamba_groups = (num_mamba + group_size - 1) // group_size
+
+      uniform_page_size_bytes = num_attn_groups * attn_page_size_bytes + num_mamba_groups * unpadded_mamba_page_size
+
+      # Set the padded page size on manager and config
+      self._hybrid_uniform_page_size_bytes = int(uniform_page_size_bytes)
+      self.runner.cache_config.mamba_page_size_padded = int(uniform_page_size_bytes)
+
+      # Size the mamba/attention block pools. The signature of this
+      # tpu-inference private helper has changed across versions: older
+      # revisions also take the vLLM kv-cache group layout
+      # (`num_attn_groups`, `num_mamba_groups`, `group_size`), newer ones
+      # re-derive it internally and only take the page sizes and layer
+      # counts. Pass by keyword and keep only the parameters the installed
+      # version declares, so the adapter works with either revision instead
+      # of dying with a TypeError before the KV cache spec is built.
+      call_with_supported_kwargs(
+          self._maybe_set_compact_mamba_num_blocks_override,
+          attn_page_size_bytes=attn_page_size_bytes,
+          unpadded_mamba_page_size_bytes=int(unpadded_mamba_page_size),
+          num_attn_groups=num_attn_groups,
+          num_mamba_groups=num_mamba_groups,
+          num_attn_layers=num_attn,
+          num_mamba_layers=num_mamba,
+          group_size=group_size,
+      )
+
+    kv_cache_spec = original_get_kv_cache_spec(self)
+
+    if decoder_block_str in ("qwen3_next", "qwen3_5"):
+      for i in range(cfg.base_num_decoder_layers):
+        if (i + 1) % interval != 0:
+          layer_name = f"layer.{i}"
+          if layer_name in kv_cache_spec:
+            kv_cache_spec[layer_name] = MambaSpec(
+                block_size=kv_cache_spec[layer_name].block_size,
+                shapes=mamba_shapes,
+                dtypes=mamba_dtypes,
+                page_size_padded=self._hybrid_uniform_page_size_bytes,
+                mamba_cache_mode=mamba_cache_mode,
+            )
+
+    return kv_cache_spec
+
+  KVCacheManager.get_kv_cache_spec = patched_get_kv_cache_spec
+  max_logging.log("Successfully applied KVCacheManager patch for hybrid GDN models.")
+
+
+def patch_raiden_worker_h2d():
+  """Monkey-patches TPUWorker.raiden_h2d and RaidenWorkerSync to apply Raiden weights to runner."""
+  try:
+    from tunix.experimental.weight_sync.raiden_synchronizer import patch_raiden_worker_sync  # pylint: disable=import-outside-toplevel
+
+    patch_raiden_worker_sync()
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    max_logging.log(f"Skipping raiden worker sync patch: {e}")

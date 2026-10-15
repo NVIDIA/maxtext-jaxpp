@@ -12,21 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Input pipeline for a LM1B dataset."""
+"""DEPRECATED: Input pipeline for TFDS dataset."""
 
-import warnings
 import functools
+import math
 
 import ml_collections
 
-import tensorflow as tf
-import tensorflow_datasets as tfds
+try:
+  import tensorflow as tf
+  import tensorflow_datasets as tfds
+except ImportError as error:
+  raise ImportError(
+      "The deprecated TFDS pipeline requires TensorFlow and tensorflow-datasets.\n\n"
+      "Recommended: migrate to Grain by setting dataset_type=grain and grain_file_type=tfrecord. Existing "
+      "dataset_path, dataset_name, train_split, eval_dataset_name, and eval_split settings will be used to "
+      "automatically construct file paths when grain_train_files or grain_eval_files are not provided. Set the "
+      "grain_train_files or grain_eval_files explicitly for a custom path.\n\n"
+      "To continue using the deprecated TFDS pipeline, run: `pip install tensorflow tensorflow-datasets`."
+  ) from error
 
 import jax
 
 from maxtext.input_pipeline import multihost_dataloading
 from maxtext.input_pipeline.packing import sequence_packing
 from maxtext.input_pipeline import input_pipeline_utils
+from maxtext.utils import max_logging
 
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 
@@ -54,21 +65,31 @@ def get_datasets(
   else:
     read_config = tfds.ReadConfig()
 
-  if ds_builder.info.splits[data_split].num_shards >= dataloading_host_count:
-    read_config.input_context = tf.distribute.InputContext(
-        input_pipeline_id=dataloading_host_index,
-        num_input_pipelines=dataloading_host_count,
-    )
-    ds = ds_builder.as_dataset(split=data_split, read_config=read_config, shuffle_files=shuffle_files)
+  num_shards = ds_builder.info.splits[data_split].num_shards
+  _, _, row_shard = input_pipeline_utils.compute_file_sharding(num_shards, dataloading_host_index, dataloading_host_count)
+  if num_shards >= dataloading_host_count:
+    input_pipeline_id = dataloading_host_index
+    num_input_pipelines = dataloading_host_count
   else:
-    warnings.warn(
-        f"WARNING: Inefficient dataloading. Your {dataset_name} contains {ds_builder.info.splits[data_split].num_shards}"
-        f"shards, smaller than {dataloading_host_count=}. This is known to lead to inefficient dataloading."
-        "see https://github.com/google/maxtext/blob/main/getting_started/Data_Input_Pipeline.md"
-        "#multihost-dataloading-best-practice"
+    # When `num_shards < dataloading_host_count`, falls back to hybrid sharding: each TFDS
+    # shard is read by a `ceil(host_count/num_shards)` group of hosts, and within that group
+    # hosts split records via `Dataset.shard`. This bounds concurrent readers per shard,
+    # avoiding the thundering-herd I/O pattern of a "every host reads all shards" fallback.
+    input_pipeline_id = dataloading_host_index % num_shards
+    num_input_pipelines = num_shards
+    max_logging.warning(
+        f"{dataset_name}: shard count ({num_shards}) < host count ({dataloading_host_count}). "
+        f"Each shard will be read by at most {math.ceil(dataloading_host_count / num_shards)} hosts. "
+        f"Concurrent reading by multiple hosts may cause slow down."
     )
-    ds = ds_builder.as_dataset(split=data_split, read_config=read_config, shuffle_files=shuffle_files)
-    ds = ds.shard(num_shards=dataloading_host_count, index=dataloading_host_index)
+
+  read_config.input_context = tf.distribute.InputContext(
+      input_pipeline_id=input_pipeline_id,
+      num_input_pipelines=num_input_pipelines,
+  )
+  ds = ds_builder.as_dataset(split=data_split, read_config=read_config, shuffle_files=shuffle_files)
+  if row_shard is not None:
+    ds = ds.shard(num_shards=row_shard[1], index=row_shard[0])
 
   return ds
 
@@ -91,19 +112,34 @@ def preprocessing_pipeline(
     shift: bool = True,
     drop_remainder: bool = True,
     prefetch_size=tf.data.experimental.AUTOTUNE,
-    use_dpo: bool = False,
     hf_access_token: str = "",
 ):
   """pipeline for preprocessing TFDS dataset."""
-  if not use_dpo:
-    assert len(data_column_names) == 1
-    dataset = dataset.map(
-        lambda x: input_pipeline_utils.normalize_features(x, data_column_names[0]), num_parallel_calls=AUTOTUNE
+  missing = [c for c in data_column_names if c not in dataset.element_spec]
+  if missing:
+    raise ValueError(
+        f"Column {missing} not found in dataset. Available columns: {sorted(dataset.element_spec.keys())}. "
+        "Please set train_data_columns or eval_data_columns accordingly."
     )
-  else:
-    dataset = dataset.map(lambda x: {col: x[col] for col in data_column_names}, num_parallel_calls=AUTOTUNE)
 
-  data_column_names = data_column_names if use_dpo else ("inputs", "targets")
+  for col in data_column_names:
+    col_dtype = dataset.element_spec[col].dtype
+    if tokenize and col_dtype != tf.string:
+      raise ValueError(
+          f"tokenize_data=True but column '{col}' has dtype {col_dtype} (expected tf.string). "
+          "Set tokenize_train_data or tokenize_eval_data to False if your dataset is already tokenized."
+      )
+    if not tokenize and col_dtype == tf.string:
+      raise ValueError(
+          f"tokenize_data=False but column '{col}' has dtype tf.string (expected integer). "
+          "Set tokenize_train_data or tokenize_eval_data to True if your dataset needs tokenization."
+      )
+
+  assert len(data_column_names) == 1
+  dataset = dataset.map(
+      lambda x: input_pipeline_utils.normalize_features(x, data_column_names[0]), num_parallel_calls=AUTOTUNE
+  )
+  data_column_names = ("inputs", "targets")
 
   tokenizer_model = input_pipeline_utils.get_tokenizer(tokenizer_path, tokenizer_type, add_bos, add_eos, hf_access_token)
   if tokenizer_model.pad_id is not None:
@@ -124,7 +160,7 @@ def preprocessing_pipeline(
   if max_target_length > 0:
     # in pre-training we can take upto max_length+1 because there would be truncation by
     # 1 token for both inputs and targets
-    extra_tokens = 1 if not use_dpo else 0
+    extra_tokens = 1
     dataset = dataset.map(
         lambda x: input_pipeline_utils.truncate_to_max_allowable_length(x, max_target_length + extra_tokens),
         num_parallel_calls=AUTOTUNE,
@@ -137,13 +173,13 @@ def preprocessing_pipeline(
   dataset = dataset.repeat(num_epochs)
 
   # Shift inputs for teacher-forced training
-  if shift and not use_dpo:
+  if shift:
     dataset = dataset.map(
         input_pipeline_utils.shift_data_by_truncation, num_parallel_calls=tf.data.AUTOTUNE, deterministic=True
     )
 
   # Perform greedy sequence packing and batching
-  if pack_examples and not use_dpo:
+  if pack_examples:
     dataset = sequence_packing.pack_dataset(dataset, max_target_length, pad_id)
     dataset = dataset.batch(global_batch_size // jax.process_count(), drop_remainder=drop_remainder)
   else:
@@ -203,7 +239,6 @@ def make_tfds_train_iterator(
         add_eos=config.add_eos,
         num_epochs=config.num_epoch,
         pack_examples=config.packing,
-        use_dpo=config.use_dpo,
         hf_access_token=config.hf_access_token,
     )
     return multihost_dataloading.MultiHostDataLoadIterator(
@@ -228,11 +263,12 @@ def make_tfds_train_iterator(
         add_eos=config.add_eos,
         num_epochs=config.num_epoch,
         pack_examples=config.packing,
-        use_dpo=config.use_dpo,
         hf_access_token=config.hf_access_token,
     )
     global_shape = (config.global_batch_size_to_load, config.max_target_length)
-    return multihost_dataloading.RemoteIterator(get_ds_fn, preprocessing_fn, global_mesh, global_shape)
+    return multihost_dataloading.RemoteIteratorWrapper(
+        get_ds_fn, preprocessing_fn, global_mesh, global_shape, checkpoint_path=config.checkpoint_dir
+    )
 
 
 def make_tfds_eval_iterator(
@@ -247,6 +283,7 @@ def make_tfds_eval_iterator(
   if not config.colocated_python_data_input:
     eval_ds = get_datasets(
         dataset_name=config.eval_dataset_name,
+        dataset_path=config.dataset_path,
         data_split=config.eval_split,
         shuffle_files=False,
         shuffle_seed=config.data_shuffle_seed,
@@ -266,7 +303,6 @@ def make_tfds_eval_iterator(
         add_bos=config.add_bos,
         add_eos=config.add_eos,
         pack_examples=config.packing,
-        use_dpo=config.use_dpo,
         hf_access_token=config.hf_access_token,
     )
     return multihost_dataloading.MultiHostDataLoadIterator(
@@ -276,6 +312,7 @@ def make_tfds_eval_iterator(
     get_ds_fn = functools.partial(
         get_datasets,
         dataset_name=config.eval_dataset_name,
+        dataset_path=config.dataset_path,
         data_split=config.eval_split,
         shuffle_files=False,
         shuffle_seed=config.data_shuffle_seed,
@@ -293,7 +330,9 @@ def make_tfds_eval_iterator(
         add_bos=config.add_bos,
         add_eos=config.add_eos,
         pack_examples=config.packing,
-        use_dpo=config.use_dpo,
         hf_access_token=config.hf_access_token,
     )
-    return multihost_dataloading.RemoteIterator(get_ds_fn, preprocessing_fn, config, global_mesh)
+    global_shape = (config.global_batch_size_to_load_eval, config.max_target_length)
+    return multihost_dataloading.RemoteIteratorWrapper(
+        get_ds_fn, preprocessing_fn, global_mesh, global_shape, checkpoint_path=config.checkpoint_dir
+    )

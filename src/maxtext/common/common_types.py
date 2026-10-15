@@ -14,11 +14,13 @@
 
 """Common types."""
 import enum
+import fnmatch
 from typing import Any, Sequence
 
 import numpy as np
 
 import jax.numpy as jnp
+from flax import struct
 
 Config = Any
 
@@ -27,29 +29,50 @@ PRNGKey = jnp.ndarray
 DType = jnp.dtype
 Shape = Sequence[int]
 
+
+def is_fp8_dtype(dtype: Any) -> bool:
+  """Checks whether a dtype is FP8."""
+  return dtype in (
+      "float8_e4m3fn",
+      "float8_e5m2",
+      jnp.float8_e4m3fn,
+      jnp.float8_e5m2,
+  )
+
+
+def get_weight_dtype(config: Config, module_name: str) -> DType:
+  """Resolves parameter storage dtype for a submodule, honoring unquantized_modules."""
+  if not is_fp8_dtype(config.weight_dtype):
+    return config.weight_dtype
+  unquantized = getattr(config, "unquantized_modules", None) or ()
+  leaf_name = module_name.rsplit(".", 1)[-1]
+  if any(fnmatch.fnmatch(module_name, p) or fnmatch.fnmatch(leaf_name, p) for p in unquantized):
+    return config.dtype
+  return config.weight_dtype
+
+
 AxisNames = tuple[str, ...]
 AxisIdxes = tuple[int, ...]
 
-BATCH = "activation_batch"
-BATCH_NO_EXP = "activation_batch_no_exp"
+SEGMENT_ID_BATCH = "segment_ids_batch"
 
-ATTN_LENGTH = "activation_attn_length"
-ATTN_LENGTH_NO_EXP = "activation_attn_length_no_exp"
+BATCH = "activation_batch"
+BATCH_ATTN = "activation_batch_attn"
+
+ATTN_LENGTH = "activation_length_attn"
+ATTN_INPUT_LENGTH = "activation_input_length_attn"
 
 LENGTH = "activation_length"
-LENGTH_NO_EXP = "activation_length_no_exp"
 PREFILL_LENGTH = "prefill_activation_length"
 Q_LENGTH = "activation_q_length"
-Q_LENGTH_NO_EXP = "activation_q_length_no_exp"
 Q_LORA_UP_PROJ = "q_lora_up_proj"
 KV_LENGTH = "activation_kv_length"
 KV_LORA_UP_PROJ = "kv_lora_up_proj"
-ATTN_EMBED = "activation_attn_embed"
+ATTN_EMBED = "activation_embed_attn"
 EMBED = "activation_embed"
 HEAD = "activation_heads"
 PREFILL_KV_BATCH = "activation_prefill_kv_batch"
 KV_BATCH = "activation_kv_batch"
-KV_BATCH_NO_EXP = "activation_kv_batch_no_exp"
 KV_HEAD = "activation_kv_heads"
 KV_HEAD_DIM = "activation_kv_head_dim"
 D_KV = "activation_kv"
@@ -70,15 +93,25 @@ MODEL_MODE_AUTOREGRESSIVE = "autoregressive"
 MODEL_MODE_PREFILL = "prefill"
 MODEL_MODE_TRAIN = "train"
 
-# expert_shard_attention_option
-EP_AS_CONTEXT = "context"
-EP_AS_FSDP = "fsdp"
-
 DECODING_ACTIVE_SEQUENCE_INDICATOR = 1
 
 # A large negative mask value is used for masking to ensure that the
 # softmax function assigns an extremely low probability to the masked positions.
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
+
+
+@struct.dataclass
+class MultimodalInput:
+  """Multimodal inputs for encoder processing."""
+
+  image_embeddings: Array | None = None
+  image_masks: Array | None = None
+  video_embeddings: Array | None = None
+  video_masks: Array | None = None
+  audio_embeddings: Array | None = None
+  audio_masks: Array | None = None
+  bidirectional_mask: Array | None = None
+  bidirectional_mask_video: Array | None = None
 
 
 class DecoderBlockType(enum.Enum):
@@ -92,16 +125,34 @@ class DecoderBlockType(enum.Enum):
   GEMMA = "gemma"
   GEMMA2 = "gemma2"
   GEMMA3 = "gemma3"
+  GEMMA4 = "gemma4"
+  GEMMA4_SMALL = "gemma4_small"
   QWEN2 = "qwen2"
   QWEN3 = "qwen3"
   QWEN3_MOE = "qwen3_moe"
+  QWEN3_CUSTOM_MOE = "qwen3_custom_moe"
   QWEN3_NEXT = "qwen3_next"
+  QWEN3_5 = "qwen3_5"
   GPT3 = "gpt3"
   GPT_OSS = "gpt_oss"
   SIMPLE = "simple"
   SIMPLE_MLP = "simple_mlp"
   LLAMA4 = "llama4"
   OLMO3 = "olmo3"
+  DEEPSEEK4 = "deepseek4"
+  ENVY = "envy"
+
+
+class VisionEncoderBlockType(enum.Enum):
+  """Vision encoder block types."""
+
+  NONE = "none"
+  GEMMA3 = "gemma3"
+  LLAMA4 = "llama4"
+  QWEN3_OMNI = "qwen3_omni"
+  GEMMA4 = "gemma4"
+  QWEN3_5 = "qwen3_5"
+  QWEN3_VL = "qwen3_vl"
 
 
 class AttentionType(enum.Enum):
@@ -109,7 +160,9 @@ class AttentionType(enum.Enum):
   LOCAL_SLIDING = "local_sliding"
   CHUNK = "chunk"
   MLA = "mla"
+  COMPRESSED = "compressed"
   FULL = "full"
+  BLOCK_DIFFUSION = "block_diffusion"
 
 
 class ShardMode(enum.Enum):
@@ -117,7 +170,31 @@ class ShardMode(enum.Enum):
   EXPLICIT = "explicit"
 
 
+class ReorderStrategy(enum.Enum):
+  """Reorder strategies for load-balanced context parallelism.
+  Maps to transformer_engine.jax.attention.ReorderStrategy at runtime.
+  """
+
+  AUTO = "auto"
+  DUAL_CHUNK_SWAP = "dual_chunk_swap"
+  STRIPED = "striped"
+
+
 class HyperConnectionType(enum.Enum):
   ATTENTION = "attention"
   MLP_MOE = "mlp_moe"
   MLP_DENSE = "mlp_dense"
+
+
+class CustomRule(enum.Enum):
+  """Custom mesh and logical axis rule sets, each backed by a yml in configs/custom_mesh_and_rule."""
+
+  DEFAULT = ""
+  PURE_FSDP = "pure-fsdp"
+  CP_AS_EP = "cp-as-ep"  # Support CP and EP together
+  EP_AS_CP = "ep-as-cp"  # Support EP only
+  PIPELINE_LARGE_MOE = "pipeline-large-moe"
+  FSDP_2D = "2d-fsdp"
+  EP_AS_DP = "ep-as-dp"
+  SHARD_EXP_ON_FSDP = "shard-exp-on-fsdp"
+  FSDP_AS_DP_FOR_ATTN = "fsdp-as-dp-for-attn"

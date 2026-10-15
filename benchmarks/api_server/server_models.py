@@ -172,10 +172,12 @@ class ChatMessage(BaseModel):
   Attributes:
       role: The role of the message's author (e.g., 'user', 'assistant').
       content: The text content of the message.
+      reasoning_content: The text content for reasoning/thinking.
   """
 
   role: str
   content: str
+  reasoning_content: Optional[str] = None
 
 
 class ChatCompletionRequest(SamplingParams):
@@ -188,12 +190,14 @@ class ChatCompletionRequest(SamplingParams):
       messages: A list of `ChatMessage` objects representing the conversation history.
       logprobs: Whether to return log probabilities.
       top_logprobs: The number of top log probabilities to return if `logprobs` is true.
+      thinking_mode: Optional flag to toggle thinking mode ("thinking" or "chat").
   """
 
   model: str
   messages: List[ChatMessage]
   logprobs: Optional[bool] = False
   top_logprobs: Optional[int] = None
+  thinking_mode: Optional[str] = "thinking"
 
 
 class ChatCompletionChoice(BaseModel):
